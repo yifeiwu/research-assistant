@@ -169,6 +169,14 @@ export async function POST(req: Request) {
     experimental_repairToolCall: repairMangledToolCall,
     // Let the model search, crawl multiple pages, then synthesize.
     stopWhen: stepCountIs(10),
+    // Prevent the request from hanging forever when the model stalls after
+    // tool calls complete. stepMs caps each model call (catches a stalled final
+    // synthesis); totalMs caps the whole request, kept under `maxDuration`.
+    // (chunkMs is intentionally omitted: tool execution makes the model stream
+    // go quiet for a while, which would otherwise trip a chunk-gap timeout.)
+    timeout: { totalMs: 55_000, stepMs: 45_000 },
+    // Abort if the client disconnects (e.g. user hits Stop or navigates away).
+    abortSignal: req.signal,
     onStepFinish: ({ toolCalls, finishReason, usage }) => {
       logDebug("step", {
         requestId,
@@ -176,6 +184,10 @@ export async function POST(req: Request) {
         toolCalls: toolCalls?.map((c) => c.toolName),
         usage,
       });
+    },
+    onAbort: async () => {
+      logInfo("abort", { requestId, model: modelInfo });
+      await mcpClient.close();
     },
     onError: async ({ error }) => {
       logError("streamText", error, { requestId, model: modelInfo });

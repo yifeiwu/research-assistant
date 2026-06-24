@@ -69,6 +69,11 @@ async function condense(
       model: opts.model,
       system: SUMMARY_SYSTEM_PROMPT,
       maxOutputTokens: 700,
+      // Bound the map step so a stalled/rate-limited summary can't block the
+      // tool call (and therefore the whole agent loop). On timeout we fall back
+      // to a hard truncation below.
+      timeout: { totalMs: 25_000 },
+      maxRetries: 1,
       prompt: `Research question:\n${opts.query || "(not provided)"}\n\nWeb content to condense:\n"""\n${input}\n"""\n\nWrite concise research notes (bullet points). Preserve all source URLs.`,
     });
     const trimmed = text.trim();

@@ -88,3 +88,4 @@ Browser (useChat)  ──POST /api/chat──▶  Groq model
 > fallback. Any model used must support native function/tool calling, since the
 > agent relies on tool calls to search and crawl.
 # research-assistant
+# research-assistant

@@ -9,24 +9,48 @@ search the web (`web_search_exa`), reads the most relevant pages
 (`web_fetch_exa`), and then answers with inline citations — and you can watch
 each search/crawl step stream live.
 
-You can pick the Groq model from the dropdown in the header. The list is limited
-to free-tier Groq models that support tool calling, and your choice is
-remembered in the browser. The server validates the selection against this
-allowlist (`lib/models.ts`) on every request.
+Open the settings (gear) menu in the header to choose your model provider:
+
+- **Groq (free tier):** pick from a curated list of free-tier Groq models that
+  support tool calling (`lib/models.ts`), validated server-side on every request.
+- **Custom (OpenAI-compatible):** enter your own base URL, API key, and model
+  id to use any OpenAI Chat Completions-compatible endpoint that supports tool
+  calling (OpenAI, OpenRouter, a local LLM server, a proxy, etc.). The key is
+  stored only in your browser and sent to this app's own server to make the
+  request on your behalf. When a custom provider is used, no `GROQ_API_KEY` is
+  required.
+
+Your selection is remembered in the browser.
 
 ## How it works
 
 ```
-Browser (useChat)  ──POST /api/chat──▶  Groq model
-                                          │  tool calls
-                                          ▼
-                                   Exa MCP server
-                              (web_search_exa / web_fetch_exa)
+Browser (useChat) ─POST /api/chat─▶ Main model (reduce)
+                                      │ tool calls
+                                      ▼
+                               Exa MCP server
+                          (web_search_exa / web_fetch_exa)
+                                      │ large raw results
+                                      ▼
+                          Summarizer model (map)  ──▶ compact notes back to main model
 ```
 
+To cope with free-tier context and tokens-per-minute limits, the app uses a
+two-stage (map-reduce) pipeline:
+
+- **Map:** every large search/crawl result is condensed by a cheap, fast model
+  (`llama-3.1-8b-instant` by default) into short, query-focused notes with
+  source URLs preserved — before it ever enters the main model's context.
+- **Reduce:** the model you pick in the UI synthesizes those notes into the
+  final cited answer.
+
+Files:
+
 - `app/page.tsx` — homepage prompt box + streaming chat UI.
-- `app/api/chat/route.ts` — runs `streamText` with the Groq model and the Exa
-  MCP tools in a multi-step agent loop.
+- `app/api/chat/route.ts` — runs `streamText` (reduce) with the Exa MCP tools in
+  a multi-step agent loop.
+- `lib/pipeline.ts` — wraps the MCP tools so large results are summarized (map)
+  before re-entering context.
 - `lib/exa-mcp.ts` — connects to `https://mcp.exa.ai/mcp` over HTTP, passing the
   Exa key as an `x-api-key` header (the key never reaches the browser).
 
@@ -79,15 +103,13 @@ Browser (useChat)  ──POST /api/chat──▶  Groq model
 
 | Variable        | Required | Description                                            |
 | --------------- | -------- | ------------------------------------------------------ |
-| `GROQ_API_KEY`  | yes      | Groq API key used for LLM inference.                   |
+| `GROQ_API_KEY`  | conditional | Groq API key for LLM inference. Required unless you use a custom OpenAI-compatible provider in Settings. |
 | `EXA_API_KEY`   | yes      | Exa API key used for the hosted Exa MCP server.        |
 | `GROQ_MODEL`    | no       | Fallback Groq model id when the UI doesn't send one. Defaults to `llama-3.3-70b-versatile`. |
+| `GROQ_SUMMARY_MODEL` | no  | Cheap/fast model for the map (summarization) step. Defaults to `llama-3.1-8b-instant`. |
 
-> The model is normally chosen from the in-app dropdown (free-tier, tool-calling
-> models defined in `lib/models.ts`). `GROQ_MODEL` only acts as a server-side
-> fallback. Any model used must support native function/tool calling, since the
-> agent relies on tool calls to search and crawl.
-# research-assistant
-# research-assistant
-# research-assistant
-# research-assistant
+> The model is normally chosen from the in-app settings menu (Groq free-tier
+> models in `lib/models.ts`, or a custom OpenAI-compatible endpoint).
+> `GROQ_MODEL` only acts as a server-side fallback. Any model used must support
+> native function/tool calling, since the agent relies on tool calls to search
+> and crawl.

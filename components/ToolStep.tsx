@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { Markdown } from "./Markdown";
 
 type ToolState =
   | "input-streaming"
@@ -125,9 +126,11 @@ export function ToolStep({ part }: { part: DynamicToolPart }) {
       )}
 
       {open && outputText && (
-        <pre className="max-h-72 overflow-auto border-t border-border px-3 py-2 text-xs whitespace-pre-wrap text-muted">
-          {outputText}
-        </pre>
+        <div className="max-h-72 overflow-auto border-t border-border px-3 py-2 text-muted">
+          <Markdown className="prose-chat text-xs leading-relaxed">
+            {outputText}
+          </Markdown>
+        </div>
       )}
     </div>
   );

@@ -4,9 +4,14 @@ import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
 import { useEffect, useRef, useState } from "react";
 import { Message } from "@/components/Message";
-import { GROQ_MODELS, DEFAULT_GROQ_MODEL, isValidGroqModel } from "@/lib/models";
+import { GROQ_MODELS } from "@/lib/models";
+import {
+  DEFAULT_PROVIDER_SETTINGS,
+  type ProviderSettings,
+} from "@/lib/provider";
+import { SettingsPanel } from "@/components/SettingsPanel";
 
-const MODEL_STORAGE_KEY = "groq-model";
+const SETTINGS_STORAGE_KEY = "research-assistant-settings";
 
 const EXAMPLE_PROMPTS = [
   "What are the most significant AI model releases this month?",
@@ -15,25 +20,34 @@ const EXAMPLE_PROMPTS = [
 ];
 
 export default function Home() {
-  const { messages, sendMessage, status, error, stop } = useChat({
+  const { messages, sendMessage, status, error, stop, setMessages } = useChat({
     transport: new DefaultChatTransport({ api: "/api/chat" }),
   });
 
   const [input, setInput] = useState("");
-  const [model, setModel] = useState(DEFAULT_GROQ_MODEL);
+  const [settings, setSettings] = useState<ProviderSettings>(
+    DEFAULT_PROVIDER_SETTINGS,
+  );
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const isBusy = status === "submitted" || status === "streaming";
   const hasMessages = messages.length > 0;
 
   useEffect(() => {
-    const saved = window.localStorage.getItem(MODEL_STORAGE_KEY);
-    if (isValidGroqModel(saved)) setModel(saved);
+    try {
+      const saved = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
+      if (saved) {
+        setSettings({ ...DEFAULT_PROVIDER_SETTINGS, ...JSON.parse(saved) });
+      }
+    } catch {
+      // ignore malformed storage
+    }
   }, []);
 
-  function changeModel(next: string) {
-    setModel(next);
-    window.localStorage.setItem(MODEL_STORAGE_KEY, next);
+  function updateSettings(next: ProviderSettings) {
+    setSettings(next);
+    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(next));
   }
 
   useEffect(() => {
@@ -43,10 +57,30 @@ export default function Home() {
     });
   }, [messages]);
 
+  function requestBody() {
+    if (settings.provider === "custom") {
+      return {
+        provider: {
+          type: "custom" as const,
+          baseURL: settings.customBaseURL.trim(),
+          apiKey: settings.customApiKey.trim(),
+          model: settings.customModel.trim(),
+        },
+      };
+    }
+    return { model: settings.groqModel };
+  }
+
   function submit(text: string) {
     const trimmed = text.trim();
     if (!trimmed || isBusy) return;
-    sendMessage({ text: trimmed }, { body: { model } });
+    sendMessage({ text: trimmed }, { body: requestBody() });
+    setInput("");
+  }
+
+  function newChat() {
+    if (isBusy) stop();
+    setMessages([]);
     setInput("");
   }
 
@@ -60,8 +94,37 @@ export default function Home() {
         <span className="ml-2 hidden text-xs text-muted sm:inline">
           powered by Groq + Exa
         </span>
-        <div className="ml-auto">
-          <ModelSelector value={model} onChange={changeModel} />
+        <div className="ml-auto flex items-center gap-2">
+          {hasMessages && (
+            <button
+              type="button"
+              onClick={newChat}
+              className="rounded-lg border border-border bg-surface px-3 py-1.5 text-xs text-foreground transition hover:border-accent"
+            >
+              + New chat
+            </button>
+          )}
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setSettingsOpen((o) => !o)}
+              className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3 py-1.5 text-xs text-foreground transition hover:border-accent"
+              aria-haspopup="dialog"
+              aria-expanded={settingsOpen}
+            >
+              <span aria-hidden>⚙</span>
+              <span className="max-w-[40vw] truncate sm:max-w-[16rem]">
+                {currentModelLabel(settings)}
+              </span>
+            </button>
+            {settingsOpen && (
+              <SettingsPanel
+                settings={settings}
+                onChange={updateSettings}
+                onClose={() => setSettingsOpen(false)}
+              />
+            )}
+          </div>
         </div>
       </header>
 
@@ -142,31 +205,12 @@ export default function Home() {
   );
 }
 
-function ModelSelector({
-  value,
-  onChange,
-}: {
-  value: string;
-  onChange: (v: string) => void;
-}) {
-  return (
-    <label className="flex items-center gap-2 text-xs text-muted">
-      <span className="hidden sm:inline">Model</span>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="cursor-pointer rounded-lg border border-border bg-surface px-2.5 py-1.5 text-foreground outline-none transition hover:border-accent focus:border-accent"
-        title="Free-tier Groq model"
-      >
-        {GROQ_MODELS.map((m) => (
-          <option key={m.id} value={m.id} className="bg-surface">
-            {m.label}
-            {m.hint ? ` — ${m.hint}` : ""}
-          </option>
-        ))}
-      </select>
-    </label>
-  );
+function currentModelLabel(settings: ProviderSettings): string {
+  if (settings.provider === "custom") {
+    return settings.customModel.trim() || "Custom endpoint";
+  }
+  const found = GROQ_MODELS.find((m) => m.id === settings.groqModel);
+  return found?.label ?? settings.groqModel;
 }
 
 function PromptBox({

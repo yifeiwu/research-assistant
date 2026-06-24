@@ -5,22 +5,19 @@ export type GroqModel = {
 };
 
 /**
- * Curated list of Groq models that are available on the free tier AND support
- * tool calling (required for the search/crawl agent loop).
- *
- * Groq's free tier grants access to all supported models; these are the
- * production/function-calling-capable ones suitable for this assistant.
+ * Curated list of Groq models that are available on the free tier AND are
+ * reliable at function/tool calling (required for the search/crawl agent loop).
+ * Models that are weak at tool calls are intentionally excluded.
  */
 export const GROQ_MODELS: GroqModel[] = [
   {
-    id: "llama-3.3-70b-versatile",
-    label: "Llama 3.3 70B",
+    id: "qwen/qwen3.6-27b",
+    label: "Qwen 3.6 27B",
     hint: "Balanced default",
   },
   {
-    id: "llama-3.1-8b-instant",
-    label: "Llama 3.1 8B",
-    hint: "Fastest",
+    id: "qwen/qwen3-32b",
+    label: "Qwen 3 32B",
   },
   {
     id: "openai/gpt-oss-120b",
@@ -36,22 +33,9 @@ export const GROQ_MODELS: GroqModel[] = [
     id: "meta-llama/llama-4-scout-17b-16e-instruct",
     label: "Llama 4 Scout 17B",
   },
-  {
-    id: "meta-llama/llama-4-maverick-17b-128e-instruct",
-    label: "Llama 4 Maverick 17B",
-  },
-  {
-    id: "qwen/qwen3-32b",
-    label: "Qwen 3 32B",
-  },
-  {
-    id: "moonshotai/kimi-k2-instruct",
-    label: "Kimi K2",
-    hint: "Strong tool use",
-  },
 ];
 
-export const DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile";
+export const DEFAULT_GROQ_MODEL = "qwen/qwen3.6-27b";
 
 export function isValidGroqModel(id: string | undefined | null): id is string {
   return !!id && GROQ_MODELS.some((m) => m.id === id);

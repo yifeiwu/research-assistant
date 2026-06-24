@@ -78,7 +78,7 @@ Files:
    GROQ_API_KEY=...
    EXA_API_KEY=...
    # optional
-   # GROQ_MODEL=llama-3.3-70b-versatile
+   # GROQ_MODEL=qwen/qwen3.6-27b
    ```
 
 3. Run the dev server:
@@ -105,7 +105,7 @@ Files:
 | --------------- | -------- | ------------------------------------------------------ |
 | `GROQ_API_KEY`  | conditional | Groq API key for LLM inference. Required unless you use a custom OpenAI-compatible provider in Settings. |
 | `EXA_API_KEY`   | yes      | Exa API key used for the hosted Exa MCP server.        |
-| `GROQ_MODEL`    | no       | Fallback Groq model id when the UI doesn't send one. Defaults to `llama-3.3-70b-versatile`. |
+| `GROQ_MODEL`    | no       | Fallback Groq model id when the UI doesn't send one. Defaults to `qwen/qwen3.6-27b`. |
 | `GROQ_SUMMARY_MODEL` | no  | Cheap/fast model for the map (summarization) step. Defaults to `llama-3.1-8b-instant`. |
 
 > The model is normally chosen from the in-app settings menu (Groq free-tier

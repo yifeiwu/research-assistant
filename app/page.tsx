@@ -180,8 +180,15 @@ export default function Home() {
 
               {error && (
                 <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-300">
-                  Something went wrong: {error.message}. Make sure
-                  GROQ_API_KEY and EXA_API_KEY are set.
+                  <div className="font-medium">Something went wrong</div>
+                  <div className="mt-1 break-words text-red-300/90">
+                    {error.message}
+                  </div>
+                  <div className="mt-2 text-xs text-red-300/70">
+                    This can happen intermittently with some models. Try sending
+                    the message again, or switch models in Settings. If it
+                    persists, check that your API keys are set.
+                  </div>
                 </div>
               )}
             </div>

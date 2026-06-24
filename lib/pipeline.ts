@@ -1,4 +1,5 @@
 import { generateText, type LanguageModel, type ToolSet } from "ai";
+import { logDebug, logError } from "./logger";
 
 // If a tool result is at or below this size, pass it through untouched
 // (small results / errors don't need summarizing).
@@ -59,7 +60,7 @@ Rules:
  */
 async function condense(
   rawText: string,
-  opts: { model: LanguageModel; query: string },
+  opts: { model: LanguageModel; query: string; requestId?: string },
 ): Promise<string> {
   const input = rawText.slice(0, SUMMARY_INPUT_CHAR_CAP);
 
@@ -71,10 +72,19 @@ async function condense(
       prompt: `Research question:\n${opts.query || "(not provided)"}\n\nWeb content to condense:\n"""\n${input}\n"""\n\nWrite concise research notes (bullet points). Preserve all source URLs.`,
     });
     const trimmed = text.trim();
-    return trimmed.length > 0 ? trimmed : input.slice(0, FALLBACK_CHAR_CAP);
-  } catch {
+    if (trimmed.length > 0) {
+      logDebug("summarize", {
+        requestId: opts.requestId,
+        rawChars: rawText.length,
+        notesChars: trimmed.length,
+      });
+      return trimmed;
+    }
+    return input.slice(0, FALLBACK_CHAR_CAP);
+  } catch (error) {
     // If summarization fails (e.g. rate limited), fall back to a hard truncation
     // so the main loop still receives a bounded amount of context.
+    logError("summarize", error, { requestId: opts.requestId });
     return input.slice(0, FALLBACK_CHAR_CAP);
   }
 }
@@ -86,7 +96,7 @@ async function condense(
  */
 export function wrapToolsWithSummarizer(
   tools: ToolSet,
-  opts: { model: LanguageModel; query: string },
+  opts: { model: LanguageModel; query: string; requestId?: string },
 ): ToolSet {
   const wrapped: Record<string, unknown> = {};
 

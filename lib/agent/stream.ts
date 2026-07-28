@@ -1,10 +1,13 @@
 import "server-only";
 import {
+  APICallError,
+  RetryError,
   createUIMessageStream,
   createUIMessageStreamResponse,
   streamText,
 } from "ai";
 import { logInfo, logError, extractFailedGeneration } from "@/lib/logger";
+import { groqModelLabel } from "@/lib/models";
 
 /** The parts of a `streamText` result this module consumes. */
 type StreamResult = Pick<
@@ -12,8 +15,55 @@ type StreamResult = Pick<
   "toUIMessageStream" | "finishReason"
 >;
 
+/**
+ * Unwrap the most relevant underlying error. `streamText` retries transient
+ * failures and, when they all fail, surfaces a `RetryError` whose `lastError`
+ * holds the actual provider error (e.g. the 429 from Groq).
+ */
+function rootError(error: unknown): unknown {
+  return RetryError.isInstance(error) ? error.lastError : error;
+}
+
+/**
+ * Detect a provider rate-limit (HTTP 429 / "rate limit reached") and, if found,
+ * return a friendly message that tells the user to wait or switch models. The
+ * raw provider text leaks internal org ids and upgrade URLs, so we never show it
+ * verbatim. Returns `undefined` when the error isn't a rate limit.
+ */
+export function rateLimitMessage(
+  error: unknown,
+  modelInfo?: string,
+): string | undefined {
+  const root = rootError(error);
+  const rawMessage =
+    root instanceof Error ? root.message : typeof root === "string" ? root : "";
+
+  const isRateLimit =
+    (APICallError.isInstance(root) && root.statusCode === 429) ||
+    /rate limit reached|rate limit exceeded|too many requests/i.test(rawMessage);
+  if (!isRateLimit) return undefined;
+
+  // Prefer the model named in the request (`groq <id>`); otherwise pull the id
+  // out of the provider message (e.g. ...for model `openai/gpt-oss-120b`...).
+  const idFromInfo = modelInfo?.replace(/^groq\s+/, "");
+  const idFromMessage = rawMessage.match(/model `([^`]+)`/)?.[1];
+  const label = groqModelLabel(idFromInfo ?? idFromMessage);
+
+  // Surface the provider's suggested wait time when it gives one.
+  const retryIn = rawMessage.match(/try again in ([^.]+?)\./i)?.[1]?.trim();
+  const waitHint = retryIn ? ` You can try again in about ${retryIn}, or` : " You can wait a bit, or";
+
+  return (
+    `You've hit the rate limit for ${label}.` +
+    `${waitHint} switch to a different model in Settings and send your message again.`
+  );
+}
+
 /** Turn an error into a user-facing message, including Groq's failed_generation. */
-export function clientErrorMessage(error: unknown): string {
+export function clientErrorMessage(error: unknown, modelInfo?: string): string {
+  const rateLimited = rateLimitMessage(error, modelInfo);
+  if (rateLimited) return rateLimited;
+
   let message = "Unknown error";
   if (typeof error === "string") message = error;
   else if (error instanceof Error) message = error.message;
@@ -82,7 +132,7 @@ export function streamWithEmptyAnswerFallback(
     },
     onError: (error) => {
       logError("stream", error, ctx);
-      return clientErrorMessage(error);
+      return clientErrorMessage(error, ctx.modelInfo);
     },
   });
 

@@ -48,6 +48,16 @@ export function isValidGroqModel(id: string | undefined | null): id is string {
 }
 
 /**
+ * Human-friendly label for a Groq model id (e.g. "GPT-OSS 120B"). Falls back to
+ * the raw id for unknown models (e.g. a custom `GROQ_MODEL` env override) so the
+ * caller always has something presentable to show the user.
+ */
+export function groqModelLabel(id: string | undefined | null): string {
+  const known = id ? GROQ_MODELS.find((m) => m.id === id) : undefined;
+  return known?.label ?? id ?? "the selected model";
+}
+
+/**
  * Whether a Groq model accepts the `reasoning_format` provider option. Unknown
  * model ids (e.g. a custom `GROQ_MODEL` env override) default to `false` so we
  * never send a parameter the model might reject.

@@ -1,0 +1,33 @@
+{
+  "name": "web-seek",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@ai-sdk/groq": "^3.0.42",
+    "@ai-sdk/mcp": "^1.0.52",
+    "@ai-sdk/openai-compatible": "^2.0.51",
+    "@ai-sdk/react": "^3.0.211",
+    "ai": "^6.0.209",
+    "lucide-react": "^1.27.0",
+    "next": "^16.2.9",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "server-only": "^0.0.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.1",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "tailwindcss": "^4.3.1",
+    "typescript": "^5.7.0"
+  }
+}

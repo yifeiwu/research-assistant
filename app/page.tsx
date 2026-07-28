@@ -186,7 +186,7 @@ export default function Home() {
               </div>
             </main>
 
-            <div className="relative border-t border-border bg-background px-4 py-3">
+            <div className="relative border-t border-border bg-background px-4 pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))]">
               {!atBottom && (
                 <button
                   type="button"

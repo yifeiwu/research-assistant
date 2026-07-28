@@ -16,7 +16,7 @@ export function Header({
         type="button"
         onClick={onToggleSidebar}
         aria-label="Toggle conversation history"
-        className="flex h-8 w-8 items-center justify-center rounded-lg border border-border bg-surface text-muted transition hover:border-accent hover:text-foreground"
+        className="flex h-10 w-10 items-center justify-center rounded-lg border border-border bg-surface text-muted transition hover:border-accent hover:text-foreground md:h-8 md:w-8"
       >
         <PanelLeft className="h-4 w-4" aria-hidden />
       </button>

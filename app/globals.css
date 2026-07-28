@@ -87,7 +87,8 @@ body {
 .prose-chat table {
   border-collapse: collapse;
   margin: 0.75rem 0;
-  width: 100%;
+  width: max-content;
+  min-width: 100%;
 }
 .prose-chat th,
 .prose-chat td {

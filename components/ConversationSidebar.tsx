@@ -54,7 +54,7 @@ export function ConversationSidebar({
             type="button"
             onClick={onClose}
             aria-label="Close history"
-            className="flex h-7 w-7 items-center justify-center rounded-lg text-muted transition hover:bg-surface-2 hover:text-foreground md:hidden"
+            className="flex h-10 w-10 items-center justify-center rounded-lg text-muted transition hover:bg-surface-2 hover:text-foreground md:hidden"
           >
             <X className="h-4 w-4" aria-hidden />
           </button>
@@ -107,7 +107,7 @@ export function ConversationSidebar({
                         type="button"
                         onClick={() => onDelete(conv.id)}
                         aria-label={`Delete "${conv.title}"`}
-                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted opacity-0 transition hover:bg-border hover:text-red-400 focus:opacity-100 group-hover:opacity-100"
+                        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-muted opacity-100 transition hover:bg-border hover:text-red-400 focus:opacity-100 md:h-7 md:w-7 md:opacity-0 md:group-hover:opacity-100"
                       >
                         <Trash2 className="h-3.5 w-3.5" aria-hidden />
                       </button>
@@ -119,7 +119,7 @@ export function ConversationSidebar({
           )}
         </nav>
 
-        <div className="border-t border-border p-2">
+        <div className="border-t border-border p-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))]">
           <button
             type="button"
             onClick={onOpenSettings}

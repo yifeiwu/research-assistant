@@ -54,7 +54,7 @@ export function SettingsPanel({
           <button
             type="button"
             onClick={onClose}
-            className="flex h-6 w-6 items-center justify-center rounded-md text-muted hover:text-foreground"
+            className="flex h-9 w-9 items-center justify-center rounded-md text-muted hover:text-foreground md:h-6 md:w-6"
             aria-label="Close settings"
           >
             <X className="h-4 w-4" aria-hidden />

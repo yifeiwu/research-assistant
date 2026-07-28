@@ -14,6 +14,15 @@ const components: Components = {
       </a>
     );
   },
+  // Wrap tables so wide ones scroll horizontally instead of overflowing the
+  // viewport (which the body clips on narrow screens).
+  table({ children }) {
+    return (
+      <div className="-mx-1 overflow-x-auto">
+        <table>{children}</table>
+      </div>
+    );
+  },
 };
 
 // Memoized so already-rendered messages don't re-parse their markdown on every

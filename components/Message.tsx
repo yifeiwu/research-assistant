@@ -114,7 +114,7 @@ export const Message = memo(function Message({
 
         {/* Row of message actions, revealed on hover. */}
         {isUser && onEdit && (
-          <div className="mt-1 flex justify-end opacity-0 transition group-hover:opacity-100 focus-within:opacity-100">
+          <div className="mt-1 flex justify-end opacity-100 transition md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100">
             <ActionButton
               label="Edit"
               icon={<Pencil className="h-3.5 w-3.5" aria-hidden />}
@@ -124,7 +124,7 @@ export const Message = memo(function Message({
         )}
 
         {!isUser && !streaming && answerText.length > 0 && (
-          <div className="mt-2 flex items-center justify-end gap-1 opacity-0 transition group-hover:opacity-100 focus-within:opacity-100">
+          <div className="mt-2 flex items-center justify-end gap-1 opacity-100 transition md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100">
             <CopyButton text={answerText} />
             {onRegenerate && (
               <ActionButton

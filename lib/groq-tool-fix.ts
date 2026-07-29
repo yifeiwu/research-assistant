@@ -14,6 +14,67 @@ import { logInfo } from "@/lib/logger";
 const MAX_TOOL_USE_RETRIES = 2;
 
 /**
+ * Backoff bounds for the `tool_use_failed` retry loop. Retrying instantly tends
+ * to reproduce the same bad generation, so we wait a short, jittered interval to
+ * let Groq's sampling vary and to avoid hammering the endpoint. Kept small
+ * (sub-second range) since each retry also has to fit inside the surrounding
+ * step timeout.
+ *
+ * Note: transient 429/5xx/network errors are NOT handled here — the AI SDK
+ * already retries those with exponential backoff while honoring `retry-after` /
+ * `retry-after-ms` headers. Groq's `tool_use_failed` is a 400 the SDK treats as
+ * non-retryable, so this loop is the only place that backs off for it.
+ */
+const BASE_BACKOFF_MS = 400;
+const MAX_BACKOFF_MS = 4000;
+
+/** Jittered exponential backoff: 50–100% of the (capped) exponential delay. */
+function backoffDelayMs(attempt: number): number {
+  const exp = Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** (attempt - 1));
+  return Math.round(exp * (0.5 + Math.random() * 0.5));
+}
+
+/**
+ * Parse a `retry-after-ms` / `retry-after` response header into milliseconds, if
+ * present. Groq rarely sends these on a 400, but honoring them when it does is
+ * strictly better than a blind backoff. Capped at `MAX_BACKOFF_MS` so a stray
+ * long value can't stall the step.
+ */
+function retryAfterMs(response: Response): number | undefined {
+  const ms = response.headers.get("retry-after-ms");
+  if (ms) {
+    const n = Number.parseFloat(ms);
+    if (Number.isFinite(n)) return Math.min(MAX_BACKOFF_MS, n);
+  }
+  const after = response.headers.get("retry-after");
+  if (after) {
+    const secs = Number.parseFloat(after);
+    if (Number.isFinite(secs)) return Math.min(MAX_BACKOFF_MS, secs * 1000);
+    const date = Date.parse(after);
+    if (!Number.isNaN(date)) {
+      return Math.min(MAX_BACKOFF_MS, Math.max(0, date - Date.now()));
+    }
+  }
+  return undefined;
+}
+
+/** Sleep for `ms`, resolving early if the request's abort signal fires. */
+function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+}
+
+/**
  * Return the request init with Groq's `disable_tool_validation` flag set, but
  * only for tool-calling requests whose body is JSON we can safely amend.
  *
@@ -65,7 +126,15 @@ export const groqToolValidationFetch: typeof fetch = async (input, init) => {
     // on 400, and we only reach here when the status is 400.
     const bodyText = await response.clone().text();
     if (!isToolUseFailed(response.status, bodyText)) break;
-    logInfo("groq-tool-use-retry", { attempt, of: MAX_TOOL_USE_RETRIES });
+
+    const waitMs = retryAfterMs(response) ?? backoffDelayMs(attempt);
+    logInfo("groq-tool-use-retry", {
+      attempt,
+      of: MAX_TOOL_USE_RETRIES,
+      waitMs,
+    });
+    await sleep(waitMs, nextInit?.signal);
+
     response = await fetch(input, nextInit);
   }
   return response;

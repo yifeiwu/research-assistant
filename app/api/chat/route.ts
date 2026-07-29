@@ -15,6 +15,7 @@ import { resolveModels, isResolutionError } from "@/lib/agent/models";
 import { createMcpSession, type McpSession } from "@/lib/agent/mcp-lifecycle";
 import { budgetMiddleware } from "@/lib/agent/tool-budget";
 import { wrapToolExecute } from "@/lib/agent/tool-middleware";
+import { resilientToolMiddleware } from "@/lib/agent/tool-resilience";
 import { summarizeMiddleware } from "@/lib/pipeline";
 import { streamWithEmptyAnswerFallback } from "@/lib/agent/stream";
 
@@ -111,6 +112,10 @@ export async function POST(req: Request) {
         toolCallsUsed += 1;
       },
     }),
+    // Sits between the budget and summarizer so it catches BOTH raw MCP failures
+    // and the per-tool timeout the summarizer throws, turning either into a tool
+    // result the model can recover from instead of a turn-ending error.
+    resilientToolMiddleware({ requestId }),
     summarizeMiddleware({ model: summaryModel, query, requestId }),
   );
 

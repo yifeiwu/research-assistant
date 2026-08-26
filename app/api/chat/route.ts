@@ -18,6 +18,12 @@ import { wrapToolExecute } from "@/lib/agent/tool-middleware";
 import { resilientToolMiddleware } from "@/lib/agent/tool-resilience";
 import { summarizeMiddleware } from "@/lib/pipeline";
 import { streamWithEmptyAnswerFallback } from "@/lib/agent/stream";
+import {
+  startChatStream,
+  ingestSseStream,
+  isChatId,
+} from "@/lib/agent/in-memory-stream";
+import { after } from "next/server";
 
 // Allow the agentic search/crawl loop enough time to run. Vercel Functions on
 // Fluid compute (default) allow up to 300s on all plans, and active-CPU billing
@@ -47,8 +53,9 @@ export async function POST(req: Request) {
     );
   }
 
-  const { model, provider, effort } = parsed.data;
+  const { model, provider, effort, id: rawChatId } = parsed.data;
   const messages = parsed.data.messages as unknown as UIMessage[];
+  const chatId = rawChatId && isChatId(rawChatId) ? rawChatId : undefined;
 
   const requestId = crypto.randomUUID().slice(0, 8);
   const query = latestUserText(messages);
@@ -161,8 +168,9 @@ export async function POST(req: Request) {
     // (chunkMs is intentionally omitted: tool execution makes the model stream
     // go quiet for a while, which would otherwise trip a chunk-gap timeout.)
     timeout: { totalMs: 290_000, stepMs: 120_000 },
-    // Abort if the client disconnects (e.g. user hits Stop or navigates away).
-    abortSignal: req.signal,
+    // Do not abort on client disconnect (tab switch drops the fetch). Only an
+    // explicit Stop via `/api/chat/:id/stop` cancels generation.
+    abortSignal: chatId ? startChatStream(chatId) : undefined,
     onStepFinish: ({ toolCalls, finishReason, usage }) => {
       logDebug("step", {
         requestId,
@@ -190,5 +198,16 @@ export async function POST(req: Request) {
     },
   });
 
-  return streamWithEmptyAnswerFallback(result, { requestId, modelInfo });
+  return streamWithEmptyAnswerFallback(
+    result,
+    { requestId, modelInfo },
+    chatId
+      ? {
+          consumeSseStream: ({ stream }) => {
+            const done = ingestSseStream(chatId, stream);
+            after(() => done);
+          },
+        }
+      : undefined,
+  );
 }

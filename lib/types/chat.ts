@@ -9,6 +9,8 @@ import type { EffortLevel } from "@/lib/effort";
  */
 export type ChatRequest = {
   messages: UIMessage[];
+  /** Conversation id; used to resume a generation after the client disconnects. */
+  id?: string;
   model?: string;
   provider?: CustomProviderPayload;
   effort?: EffortLevel;
@@ -58,6 +60,7 @@ const uiMessageSchema = z.looseObject({
 export const chatRequestSchema = z
   .object({
     messages: z.array(uiMessageSchema).min(1).max(MAX_MESSAGES),
+    id: z.string().min(8).max(80).optional(),
     model: z.string().optional(),
     provider: z.unknown().optional(),
     effort: z.unknown().optional(),

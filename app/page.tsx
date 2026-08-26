@@ -2,7 +2,7 @@
 
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowDown, RotateCw } from "lucide-react";
 import { Message } from "@/components/Message";
 import { Header } from "@/components/Header";
@@ -15,10 +15,24 @@ import { useChatSettings } from "@/lib/hooks/useChatSettings";
 import { useScrollAnchor } from "@/lib/hooks/useScrollAnchor";
 import { useHeartbeat } from "@/lib/hooks/useHeartbeat";
 import { useChatActions } from "@/lib/hooks/useChatActions";
+import { useResumeOnVisible } from "@/lib/hooks/useResumeOnVisible";
 import { busyLabel, formatDuration } from "@/lib/format";
+import { createConversationId } from "@/lib/conversations";
 
 export default function Home() {
-  const { messages, sendMessage, status, error, stop, setMessages } = useChat({
+  const [chatId, setChatId] = useState(createConversationId);
+  const userStoppedRef = useRef(false);
+
+  const {
+    messages,
+    sendMessage,
+    status,
+    error,
+    stop,
+    setMessages,
+    resumeStream,
+  } = useChat({
+    id: chatId,
     transport: new DefaultChatTransport({ api: "/api/chat" }),
   });
 
@@ -33,13 +47,35 @@ export default function Home() {
 
   const { settings, updateSettings, requestBody } = useChatSettings();
 
+  const stopGeneration = useCallback(() => {
+    userStoppedRef.current = true;
+    void fetch(`/api/chat/${chatId}/stop`, { method: "POST" });
+    stop();
+  }, [chatId, stop]);
+
   const {
     conversations,
     activeId,
     selectConversation,
     newConversation,
     deleteConversation,
-  } = useConversations({ messages, setMessages, isBusy, stop });
+  } = useConversations({
+    chatId,
+    setChatId,
+    messages,
+    setMessages,
+    isBusy,
+    stop: stopGeneration,
+  });
+
+  useResumeOnVisible({
+    chatId,
+    status,
+    messages,
+    setMessages,
+    resumeStream,
+    userStoppedRef,
+  });
 
   const { scrollRef, atBottom, handleScroll, scrollToBottom } = useScrollAnchor(
     messages,
@@ -73,6 +109,7 @@ export default function Home() {
   function submit(text: string) {
     const trimmed = text.trim();
     if (!trimmed || isBusy) return;
+    userStoppedRef.current = false;
     sendMessage({ text: trimmed }, { body: requestBody() });
     setInput("");
   }
@@ -203,7 +240,7 @@ export default function Home() {
                   input={input}
                   setInput={setInput}
                   onSubmit={() => submit(input)}
-                  onStop={stop}
+                  onStop={stopGeneration}
                   disabled={false}
                   busy={isBusy}
                   settings={settings}

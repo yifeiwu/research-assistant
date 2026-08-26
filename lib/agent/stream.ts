@@ -103,6 +103,11 @@ export function noAnswerMessage(finishReason: string | undefined): string {
 export function streamWithEmptyAnswerFallback(
   result: StreamResult,
   ctx: { requestId: string; modelInfo: string },
+  options?: {
+    consumeSseStream?: (options: {
+      stream: ReadableStream<string>;
+    }) => void | PromiseLike<void>;
+  },
 ): Response {
   const stream = createUIMessageStream({
     execute: async ({ writer }) => {
@@ -136,5 +141,8 @@ export function streamWithEmptyAnswerFallback(
     },
   });
 
-  return createUIMessageStreamResponse({ stream });
+  return createUIMessageStreamResponse({
+    stream,
+    consumeSseStream: options?.consumeSseStream,
+  });
 }

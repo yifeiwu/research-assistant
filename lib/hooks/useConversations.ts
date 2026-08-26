@@ -14,6 +14,8 @@ import {
 } from "@/lib/conversations";
 
 type UseConversationsArgs = {
+  chatId: string;
+  setChatId: (id: string) => void;
   messages: UIMessage[];
   setMessages: (messages: UIMessage[]) => void;
   isBusy: boolean;
@@ -22,7 +24,7 @@ type UseConversationsArgs = {
 
 export type UseConversations = {
   conversations: Conversation[];
-  activeId: string | null;
+  activeId: string;
   restored: boolean;
   selectConversation: (id: string) => void;
   newConversation: () => void;
@@ -33,25 +35,34 @@ export type UseConversations = {
  * Manages multiple chat threads persisted in localStorage on top of the live
  * `useChat` message state. The active thread's messages live in `useChat`; this
  * hook mirrors them into the saved conversation list (debounced, once settled).
+ *
+ * `chatId` is owned by the page so `useChat({ id })` and the resume GET
+ * (`/api/chat/:id/stream`) share the same key.
  */
 export function useConversations({
+  chatId,
+  setChatId,
   messages,
   setMessages,
   isBusy,
   stop,
 }: UseConversationsArgs): UseConversations {
   const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
   const [restored, setRestored] = useState(false);
 
-  // Ref mirror so the debounced persist callback always sees the latest id
-  // without needing to be torn down/recreated on every change.
-  const activeIdRef = useRef<string | null>(null);
-  const setActive = useCallback((id: string | null) => {
-    activeIdRef.current = id;
-    setActiveId(id);
-    saveActiveConversationId(id);
-  }, []);
+  const chatIdRef = useRef(chatId);
+  useEffect(() => {
+    chatIdRef.current = chatId;
+  }, [chatId]);
+
+  const setActive = useCallback(
+    (id: string) => {
+      chatIdRef.current = id;
+      setChatId(id);
+      saveActiveConversationId(id);
+    },
+    [setChatId],
+  );
 
   // Restore saved conversations (migrating any legacy single-thread state).
   useEffect(() => {
@@ -72,13 +83,26 @@ export function useConversations({
 
     const activeConv = active ? list.find((c) => c.id === active) : undefined;
     if (activeConv) {
-      activeIdRef.current = activeConv.id;
-      setActiveId(activeConv.id);
-      if (activeConv.messages.length > 0) setMessages(activeConv.messages);
+      setActive(activeConv.id);
+    } else {
+      saveActiveConversationId(chatIdRef.current);
     }
 
     setRestored(true);
-  }, [setMessages]);
+    // Only on mount: `setActive` is stable enough, and re-running would clobber
+    // the live thread.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // When the active thread changes (restore / sidebar), seed useChat from the
+  // saved copy. Intentionally not dependent on `conversations` so a persist
+  // write cannot overwrite an in-progress turn.
+  useEffect(() => {
+    if (!restored) return;
+    const conv = conversations.find((c) => c.id === chatId);
+    setMessages(conv?.messages ?? []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [restored, chatId, setMessages]);
 
   // Persist the active thread once it's settled (not mid-stream). Debounced so a
   // burst of state updates only serializes the history once.
@@ -87,42 +111,34 @@ export function useConversations({
     const handle = window.setTimeout(() => {
       if (messages.length === 0) return;
 
-      let id = activeIdRef.current;
-      if (!id) {
-        id = createConversationId();
-        setActive(id);
-      }
-
+      const id = chatIdRef.current;
       const now = Date.now();
       setConversations((prev) => {
         const existing = prev.find((c) => c.id === id);
         const title = existing?.title ?? deriveTitle(messages);
         const updated: Conversation = existing
           ? { ...existing, messages, title, updatedAt: now }
-          : { id: id!, title, messages, createdAt: now, updatedAt: now };
+          : { id, title, messages, createdAt: now, updatedAt: now };
         const next = [updated, ...prev.filter((c) => c.id !== id)];
         return saveConversations(next);
       });
     }, 500);
     return () => window.clearTimeout(handle);
-  }, [messages, isBusy, restored, setActive]);
+  }, [messages, isBusy, restored]);
 
   const selectConversation = useCallback(
     (id: string) => {
-      if (id === activeIdRef.current) return;
+      if (id === chatIdRef.current) return;
       if (isBusy) stop();
-      const conv = conversations.find((c) => c.id === id);
       setActive(id);
-      setMessages(conv?.messages ?? []);
     },
-    [conversations, isBusy, stop, setActive, setMessages],
+    [isBusy, stop, setActive],
   );
 
   const newConversation = useCallback(() => {
     if (isBusy) stop();
-    setActive(null);
-    setMessages([]);
-  }, [isBusy, stop, setActive, setMessages]);
+    setActive(createConversationId());
+  }, [isBusy, stop, setActive]);
 
   const deleteConversation = useCallback(
     (id: string) => {
@@ -131,18 +147,17 @@ export function useConversations({
         saveConversations(next);
         return next;
       });
-      if (activeIdRef.current === id) {
+      if (chatIdRef.current === id) {
         if (isBusy) stop();
-        setActive(null);
-        setMessages([]);
+        setActive(createConversationId());
       }
     },
-    [isBusy, stop, setActive, setMessages],
+    [isBusy, stop, setActive],
   );
 
   return {
     conversations,
-    activeId,
+    activeId: chatId,
     restored,
     selectConversation,
     newConversation,

@@ -4,14 +4,18 @@ import { redis } from "./redis";
 import { logDebug, logError } from "./logger";
 
 export type CacheStore = {
-  get: (key: string) => Promise<string | null>;
+  /** May return a raw string or an already-deserialized value (see below). */
+  get: (key: string) => Promise<unknown>;
   set: (key: string, value: string, ttlSeconds: number) => Promise<unknown>;
 };
 
 function defaultStore(): CacheStore {
   const db = redis();
   return {
-    get: (key) => db.get<string>(key),
+    // Upstash's client auto-deserializes JSON on read: a stored JSON object
+    // or array comes back as an object/array, and a stored JSON string comes
+    // back as the plain string — not as raw JSON text.
+    get: (key) => db.get(key),
     set: (key, value, ttlSeconds) => db.set(key, value, { ex: ttlSeconds }),
   };
 }
@@ -93,7 +97,15 @@ export function createRequestCache(store?: CacheStore): RequestCache {
           const hit = await cache.get(key);
           if (hit != null) {
             logDebug("cache-hit", { requestId: opts?.requestId, namespace });
-            return JSON.parse(hit) as Awaited<ReturnType<typeof loader>>;
+            // Already-deserialized values (objects/arrays/plain strings from
+            // Upstash) are used as-is; only a raw JSON string needs parsing,
+            // and a plain non-JSON string is the value itself.
+            if (typeof hit !== "string") return hit as Awaited<ReturnType<typeof loader>>;
+            try {
+              return JSON.parse(hit) as Awaited<ReturnType<typeof loader>>;
+            } catch {
+              return hit as Awaited<ReturnType<typeof loader>>;
+            }
           }
         } catch (error) {
           logError("cache-get", error, { requestId: opts?.requestId, namespace });

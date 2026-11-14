@@ -88,7 +88,7 @@ function buildBatchPrompt(
   return [
     `Research question:\n${query || "(not provided)"}`,
     "",
-    `Condense EACH of the ${entries.length} sources below into concise research notes (bullet points). Attribute claims to the source, distinguish fact from opinion, and flag any reliability concerns. Keep each source's notes brief — a few bullets at most.`,
+    `Condense EACH of the ${entries.length} sources below into concise research notes (bullet points). Attribute claims to the source, distinguish fact from opinion, and flag any reliability concerns. Keep each source's notes very brief — at most 3 short bullets, prioritising concrete facts (names, numbers, dates) over commentary.`,
     `Output exactly one section per source, in order, headed "### Source N" (N = the source number), with no introduction or conclusion.`,
     "",
     ...blocks,

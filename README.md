@@ -39,6 +39,13 @@ client. Partial retrieval or condensation failures surface as a visible
 "degraded research" warning on the research card and are disclosed to the
 synthesis model.
 
+Model-call token budgets (`lib/config.ts`) are sized to share Groq's
+per-minute windows: the batched summarizer reserves ≤350 output tokens per
+round (against a 1k OTPM cap), planner/gap-check calls use small output caps
+and a 1k-token cap on the notes they inspect, rounds stop early once the
+3k-token synthesis evidence budget is full, and synthesis itself is capped
+at 2,500 output tokens — so research stages can't starve the final answer.
+
 Research depth is controlled by the **Effort** selector (`lib/effort.ts`).
 Retrieval is narrow-but-deep: at most 2 parallel searches in any round, with
 depth from extra sequential, gap-checked rounds — keeping bursts well under

@@ -43,6 +43,40 @@ describe("request cache", () => {
     expect(b).toBe(42);
     expect(loader).toHaveBeenCalledTimes(1);
   });
+  it("serves hits when the store returns already-deserialized values (Upstash behaviour)", async () => {
+    // Mimics @upstash/redis: values are stored as JSON text but `get`
+    // auto-deserializes them back to objects/arrays/plain strings.
+    const data = new Map<string, string>();
+    const store: CacheStore = {
+      get: async (k) => {
+        const raw = data.get(k);
+        if (raw == null) return null;
+        try {
+          return JSON.parse(raw) as unknown;
+        } catch {
+          return raw;
+        }
+      },
+      set: async (k, v) => {
+        data.set(k, v);
+      },
+    };
+    const cache = createRequestCache(store);
+    const objLoader = vi.fn(async () => ({ docs: [1, 2] }));
+    expect(await cache.wrap("search", { q: "obj" }, 60, objLoader)).toEqual({ docs: [1, 2] });
+    expect(await cache.wrap("search", { q: "obj" }, 60, objLoader)).toEqual({ docs: [1, 2] });
+    expect(objLoader).toHaveBeenCalledTimes(1);
+
+    const arrLoader = vi.fn(async () => ["note", null] as (string | null)[]);
+    expect(await cache.wrap("notes-batch", { q: "arr" }, 60, arrLoader)).toEqual(["note", null]);
+    expect(await cache.wrap("notes-batch", { q: "arr" }, 60, arrLoader)).toEqual(["note", null]);
+    expect(arrLoader).toHaveBeenCalledTimes(1);
+
+    const strLoader = vi.fn(async () => "plain note text");
+    expect(await cache.wrap("notes", { q: "str" }, 60, strLoader)).toBe("plain note text");
+    expect(await cache.wrap("notes", { q: "str" }, 60, strLoader)).toBe("plain note text");
+    expect(strLoader).toHaveBeenCalledTimes(1);
+  });
   it("fails open when Redis errors", async () => {
     const cache = createRequestCache(fakeStore(true));
     await expect(cache.wrap("search", { q: "z" }, 60, async () => "live")).resolves.toBe("live");

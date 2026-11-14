@@ -168,6 +168,10 @@ export async function POST(req: Request) {
                 } satisfies GroqProviderOptions,
               }
             : undefined,
+          // Bounded output so Groq's TPM reservation for the synthesis call
+          // stays predictable alongside the planner/gap-check calls that
+          // share the same main-model per-minute budget.
+          maxOutputTokens: serverConfig.synthesis.maxOutputTokens,
           timeout: {
             totalMs: serverConfig.synthesis.totalTimeoutMs,
             stepMs: serverConfig.synthesis.stepTimeoutMs,

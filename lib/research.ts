@@ -291,6 +291,7 @@ export async function runResearchPipeline(opts: {
   // decides whether another, narrower round is worth running — rather than
   // widening any single round's parallel burst.
   const allQueries: string[] = [];
+  const evidenceBudget = serverConfig.synthesis.evidenceTokenBudget;
   let nextQueries = round1Queries;
 
   for (let round = 1; round <= effort.rounds; round++) {
@@ -361,7 +362,11 @@ export async function runResearchPipeline(opts: {
     totalSources += roundDocs.length;
     const notesText = condensed.notes.join("\n\n");
 
-    const isLastRound = round >= effort.rounds || totalSources >= effort.maxSources;
+    // Once the gathered notes already fill the synthesis evidence budget,
+    // further rounds cannot be used by the answer anyway — stop instead of
+    // spending more planner/summarizer calls (and TPM) on trimmed evidence.
+    const evidenceFull = estimateTokens(allNotes.join("\n\n")) >= evidenceBudget;
+    const isLastRound = round >= effort.rounds || totalSources >= effort.maxSources || evidenceFull;
     if (isLastRound || effort.followUpQueries <= 0) {
       emitStep(roundId, { round, phase: "done", queries, sources: roundSources, notes: notesText, degraded: currentDegraded() });
       break;
@@ -382,7 +387,7 @@ export async function runResearchPipeline(opts: {
       const parsedGap = await planner.planFollowUps({
         query,
         priorQueries: allQueries,
-        notes: truncateToTokenBudget(allNotes.join("\n\n"), serverConfig.synthesis.evidenceTokenBudget),
+        notes: truncateToTokenBudget(allNotes.join("\n\n"), serverConfig.gapCheck.notesTokenBudget),
         maxQueries: effort.followUpQueries,
         signal,
         requestId,
@@ -410,7 +415,6 @@ export async function runResearchPipeline(opts: {
   // included in source order until the budget is hit, the note that crosses
   // it is truncated, and any remaining notes are dropped. Trimming is
   // disclosed via the degraded channel so synthesis can say evidence was cut.
-  const evidenceBudget = serverConfig.synthesis.evidenceTokenBudget;
   const evidenceParts: string[] = [];
   let usedTokens = 0;
   let trimmedNotes = 0;

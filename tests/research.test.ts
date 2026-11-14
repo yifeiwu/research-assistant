@@ -5,6 +5,7 @@ import {
   selectDeduplicatedDocs,
 } from "@/lib/research";
 import { effortConfig } from "@/lib/effort";
+import { serverConfig } from "@/lib/config";
 import type { ExaDocument } from "@/lib/exa";
 
 const doc = (url: string): ExaDocument => ({ url, title: url, text: "x" });
@@ -25,6 +26,17 @@ describe("effortConfig parallelism vs rounds", () => {
     const high = effortConfig("high");
     expect(medium).toMatchObject({ rounds: 2, queriesPerRound: 2, followUpQueries: 2, sourcesPerRound: 4, maxSources: 8 });
     expect(high).toMatchObject({ rounds: 4, queriesPerRound: 2, followUpQueries: 2, sourcesPerRound: 4, maxSources: 14 });
+  });
+
+  it("keeps model-call token budgets small enough to share Groq per-minute windows", () => {
+    // Summarizer: Groq reserves the full output cap against a 1k OTPM limit,
+    // so one round's batch must leave room for the next round's.
+    expect(serverConfig.summary.batchMaxOutputTokens).toBeLessThanOrEqual(350);
+    // Planner/gap/synthesis share the main model's 8k TPM.
+    expect(serverConfig.planner.maxOutputTokens).toBeLessThanOrEqual(800);
+    expect(serverConfig.gapCheck.maxOutputTokens).toBeLessThanOrEqual(600);
+    expect(serverConfig.gapCheck.notesTokenBudget).toBeLessThanOrEqual(1_000);
+    expect(serverConfig.synthesis.maxOutputTokens).toBeLessThanOrEqual(2_500);
   });
 });
 
@@ -212,6 +224,69 @@ describe("runResearchPipeline degraded reporting", () => {
     expect(outcome.totalSources).toBe(4);
     const doneRounds = chunks.filter((c) => c.data?.phase === "done").map((c) => c.data?.round);
     expect(doneRounds).toEqual([1, 2, 3]);
+  });
+
+  it("stops before the gap check once notes already fill the synthesis evidence budget", async () => {
+    const writer = { write: () => {} } as never;
+    let gapCalls = 0;
+    const outcome = await runResearchPipeline({
+      messages: [],
+      query: "q",
+      effort: effortConfig("high"),
+      mainModel: {} as never,
+      summaryModel: {} as never,
+      supportsReasoning: false,
+      writer,
+      requestId: "test1234",
+      deps: {
+        planner: {
+          planQueries: async () => ({ stopped: false, queries: ["q1"] }),
+          planFollowUps: async () => {
+            gapCalls += 1;
+            return { stopped: false, queries: ["f1"] };
+          },
+        },
+        search: {
+          search: async () => ({ docs: [doc("https://a.com/1")] }),
+          fetchContents: async () => ({ docs: [] }),
+        },
+        // ~7,500 tokens of notes, over the 3,000-token evidence budget.
+        condenser: { condense: async () => ({ notes: ["x".repeat(30_000)], fallbackCount: 0 }) },
+      },
+    });
+    expect(gapCalls).toBe(0);
+    expect(outcome.totalSources).toBe(1);
+  });
+
+  it("trims the notes sent to the gap check to the gap-check budget", async () => {
+    const writer = { write: () => {} } as never;
+    let gapNotes = "";
+    await runResearchPipeline({
+      messages: [],
+      query: "q",
+      effort: effortConfig("medium"),
+      mainModel: {} as never,
+      summaryModel: {} as never,
+      supportsReasoning: false,
+      writer,
+      requestId: "test1234",
+      deps: {
+        planner: {
+          planQueries: async () => ({ stopped: false, queries: ["q1"] }),
+          planFollowUps: async ({ notes }: { notes: string }) => {
+            gapNotes = notes;
+            return { stopped: true, queries: [] };
+          },
+        },
+        search: {
+          search: async () => ({ docs: [doc("https://a.com/1")] }),
+          fetchContents: async () => ({ docs: [] }),
+        },
+        // ~2,000 tokens: under the evidence budget, over the 1,000-token gap budget.
+        condenser: { condense: async () => ({ notes: ["x".repeat(8_000)], fallbackCount: 0 }) },
+      },
+    });
+    expect(gapNotes.length).toBe(4_000);
   });
 
   it("uses all available rounds on high effort when gaps keep coming", async () => {

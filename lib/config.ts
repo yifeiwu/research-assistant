@@ -34,14 +34,23 @@ export const serverConfig = {
     batchInputCharCap: 20_000,
     perSourceInputCharCap: 6_000,
     fallbackCharCap: 4_000,
-    batchMaxOutputTokens: 900,
+    // Groq reserves the full max-output budget against the summary model's
+    // 1k OTPM, so one round's batch must leave room for the next round's:
+    // ~350 lets 2-3 sequential rounds' batches fit inside one minute.
+    batchMaxOutputTokens: 350,
     timeoutMs: 25_000,
   },
-  planner: { timeoutMs: 30_000, maxOutputTokens: 1_500 },
-  gapCheck: { timeoutMs: 25_000, maxOutputTokens: 1_500 },
+  // Planner/gap-check outputs are a handful of short query lines (or DONE /
+  // NO_SEARCH); their output caps are kept small because every planner,
+  // gap-check, and synthesis call draws on the same main-model TPM budget,
+  // and Groq reserves the full max-output budget against it. Oversized caps
+  // here starved the final synthesis call in production.
+  planner: { timeoutMs: 30_000, maxOutputTokens: 800 },
+  gapCheck: { timeoutMs: 25_000, maxOutputTokens: 600, notesTokenBudget: 1_000 },
   synthesis: {
     totalTimeoutMs: 180_000,
     stepTimeoutMs: 120_000,
+    maxOutputTokens: 2_500,
     // Cap on the assembled research-notes evidence injected into synthesis.
     // Groq's free tier rejects requests over ~8k TPM in one shot (observed
     // 413s in production), so the evidence is trimmed to fit, leaving room

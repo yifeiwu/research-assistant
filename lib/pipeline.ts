@@ -1,4 +1,5 @@
 import "server-only";
+import { isAbortError } from "./errors";
 import { generateText, type LanguageModel } from "ai";
 import { createConcurrencyLimiter, type ExaDocument } from "./exa";
 import { logDebug, logError } from "./logger";
@@ -27,9 +28,6 @@ function formatSourceHeader(doc: ExaDocument): string {
   return lines.join("\n");
 }
 
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && error.name === "AbortError";
-}
 
 const SUMMARY_SYSTEM_PROMPT = `You compress raw web content into concise, factual research notes while critically evaluating the source.
 

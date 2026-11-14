@@ -18,6 +18,16 @@ export function getMessageText(message: UIMessage, separator = "\n\n"): string {
     .join(separator);
 }
 
+/** Id of the most recent user message (identifies the current turn for Stop). */
+export function findLastUserMessageId(messages: UIMessage[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user" && typeof messages[i].id === "string") {
+      return messages[i].id;
+    }
+  }
+  return undefined;
+}
+
 /** Text of the most recent user message (used to focus research queries & summaries). */
 export function latestUserText(messages: UIMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {

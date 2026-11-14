@@ -21,6 +21,7 @@ import {
 } from "@/lib/hooks/useResumeOnVisible";
 import { useTurnMachine } from "@/lib/hooks/turnMachine";
 import { busyLabel, formatDuration } from "@/lib/format";
+import { findLastUserMessageId } from "@/lib/messages";
 import { createConversationId } from "@/lib/conversations";
 
 function isNetworkDisconnectError(err: unknown): boolean {
@@ -28,15 +29,6 @@ function isNetworkDisconnectError(err: unknown): boolean {
     err instanceof TypeError &&
     /fetch|network|load failed/i.test(err.message)
   );
-}
-
-function findLastUserMessageId(messages: UIMessage[]): string | undefined {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user" && typeof messages[i].id === "string") {
-      return messages[i].id;
-    }
-  }
-  return undefined;
 }
 
 export default function Home() {

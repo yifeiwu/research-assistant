@@ -18,6 +18,7 @@ import {
   saveActiveConversationId,
   saveConversations,
 } from "@/lib/conversations";
+import { findLastUserMessageId } from "@/lib/messages";
 
 const BG_POLL_INTERVAL_MS = 3_000;
 
@@ -38,22 +39,12 @@ export type UseConversations = {
   conversations: Conversation[];
   activeId: string;
   activePending: boolean;
-  restored: boolean;
   isSeeded: boolean;
   selectConversation: (id: string) => void;
   newConversation: () => void;
   deleteConversation: (id: string) => void;
   settleConversation: (id: string, finalMessages?: UIMessage[]) => void;
 };
-
-function findLastUserMessageId(messages: UIMessage[]): string | undefined {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user" && typeof messages[i].id === "string") {
-      return messages[i].id;
-    }
-  }
-  return undefined;
-}
 
 type BackgroundPollResult =
   | { state: "running" }
@@ -443,7 +434,6 @@ export function useConversations({
     conversations,
     activeId: chatId,
     activePending,
-    restored,
     isSeeded,
     selectConversation,
     newConversation,

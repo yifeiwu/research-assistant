@@ -1,4 +1,5 @@
 import "server-only";
+import { isAbortError } from "@/lib/errors";
 import {
   APICallError,
   RetryError,
@@ -19,9 +20,6 @@ export type StreamResult = Pick<
   "toUIMessageStream" | "finishReason"
 >;
 
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && error.name === "AbortError";
-}
 
 /**
  * Unwrap the most relevant underlying error. `streamText` retries transient

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useReducer, useRef } from "react";
+import { useCallback, useRef } from "react";
 
 type TurnStatus =
   | "idle"
@@ -15,8 +15,6 @@ type TurnStatus =
 export type TurnState = {
   status: TurnStatus;
   chatId: string | null;
-  /** Active chat whose stream the UI is currently attached to. */
-  activeChatId: string | null;
   userStopped: boolean;
   stoppedChatId: string | null;
   lastErrorWasNetwork: boolean;
@@ -39,7 +37,6 @@ export type TurnEvent =
 export const initialTurnState: TurnState = {
   status: "idle",
   chatId: null,
-  activeChatId: null,
   userStopped: false,
   stoppedChatId: null,
   lastErrorWasNetwork: false,
@@ -51,7 +48,6 @@ export function turnReducer(state: TurnState, event: TurnEvent): TurnState {
       return {
         status: "submitted",
         chatId: event.chatId,
-        activeChatId: event.chatId,
         userStopped: false,
         stoppedChatId: null,
         lastErrorWasNetwork: false,
@@ -63,11 +59,7 @@ export function turnReducer(state: TurnState, event: TurnEvent): TurnState {
           : { ...state, status: "settling" };
       }
       if (event.status === "error") return { ...state, status: "error" };
-      return {
-        ...state,
-        status: event.status,
-        activeChatId: event.chatId ?? state.activeChatId ?? state.chatId,
-      };
+      return { ...state, status: event.status };
     }
     case "STOP":
       return {
@@ -86,18 +78,17 @@ export function turnReducer(state: TurnState, event: TurnEvent): TurnState {
     case "FINISH_DETACHED":
       return { ...state, status: "detached", chatId: event.chatId };
     case "DETACH":
-      return { ...state, status: "detached", activeChatId: event.chatId };
+      return { ...state, status: "detached" };
     case "THREAD_SWITCH":
       return {
         status: state.status === "streaming" || state.status === "submitted" ? "detached" : "idle",
         chatId: event.chatId,
-        activeChatId: event.chatId,
         userStopped: state.stoppedChatId === event.chatId,
         stoppedChatId: state.stoppedChatId,
         lastErrorWasNetwork: false,
       };
     case "RESUME_START":
-      return { ...state, status: "resuming", chatId: event.chatId, activeChatId: event.chatId };
+      return { ...state, status: "resuming", chatId: event.chatId };
     case "RESUME_EMPTY":
       return { ...state, status: "settling", chatId: event.chatId };
     case "SETTLE":
@@ -108,38 +99,24 @@ export function turnReducer(state: TurnState, event: TurnEvent): TurnState {
 }
 
 export type TurnMachine = {
-  state: TurnState;
   dispatch: (event: TurnEvent) => void;
-  /** Ref mirrors, kept synchronously current for AI SDK callbacks. */
+  /** Synchronously-current state for AI SDK callbacks (which close over stale
+   * React state otherwise). No component renders from turn state directly —
+   * rendering is driven by `useChat` status — so no React state mirror is
+   * kept; the ref is the single source of truth. */
   stateRef: React.RefObject<TurnState>;
-  userStoppedRef: React.RefObject<boolean>;
-  activeStreamChatIdRef: React.RefObject<string>;
 };
 
 /** Explicit turn lifecycle used by the chat page and its hooks. */
 export function useTurnMachine(initialChatId: string): TurnMachine {
-  const [state, baseDispatch] = useReducer(turnReducer, {
+  const stateRef = useRef<TurnState>({
     ...initialTurnState,
     chatId: initialChatId,
-    activeChatId: initialChatId,
   });
-  const stateRef = useRef(state);
-  const userStoppedRef = useRef(false);
-  const activeStreamChatIdRef = useRef(initialChatId);
 
   const dispatch = useCallback((event: TurnEvent) => {
-    const next = turnReducer(stateRef.current, event);
-    stateRef.current = next;
-    userStoppedRef.current = next.userStopped;
-    if (next.activeChatId) activeStreamChatIdRef.current = next.activeChatId;
-    baseDispatch(event);
+    stateRef.current = turnReducer(stateRef.current, event);
   }, []);
 
-  useEffect(() => {
-    stateRef.current = state;
-    userStoppedRef.current = state.userStopped;
-    if (state.activeChatId) activeStreamChatIdRef.current = state.activeChatId;
-  }, [state]);
-
-  return { state, dispatch, stateRef, userStoppedRef, activeStreamChatIdRef };
+  return { dispatch, stateRef };
 }

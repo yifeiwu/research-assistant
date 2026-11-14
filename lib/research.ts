@@ -1,4 +1,5 @@
 import "server-only";
+import { isAbortError } from "./errors";
 import {
   generateText,
   type LanguageModel,
@@ -42,9 +43,6 @@ export type ResearchOutcome = {
   degraded?: DegradedResearch;
 };
 
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && error.name === "AbortError";
-}
 
 /**
  * Parse newline-separated plain-text queries from a model output, tolerating

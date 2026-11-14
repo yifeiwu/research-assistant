@@ -10,7 +10,6 @@ import { serverConfig } from "@/lib/config";
 export type ResolvedModels = {
   mainModel: LanguageModel;
   summaryModel: LanguageModel;
-  mainModelId: string;
   summaryModelId: string;
   modelInfo: string;
   supportsReasoning: boolean;
@@ -42,7 +41,6 @@ export function resolveModels(input: {
   return {
     mainModel: groq(selectedModel),
     summaryModel: groq(summaryModelId),
-    mainModelId: selectedModel,
     summaryModelId,
     modelInfo: `groq ${selectedModel}`,
     supportsReasoning: groqModelSupportsReasoning(selectedModel),

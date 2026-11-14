@@ -1,4 +1,5 @@
 import "server-only";
+import { isAbortError } from "./errors";
 import { logDebug, logError, logInfo } from "./logger";
 import { serverConfig } from "./config";
 import { normalizeCacheText, requestCache, type RequestCache } from "./cache";
@@ -78,9 +79,6 @@ function getExaApiKey(): string {
   return apiKey;
 }
 
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && error.name === "AbortError";
-}
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (ms <= 0 || signal?.aborted) return Promise.resolve();
@@ -391,9 +389,5 @@ export function createExaClient(opts: {
     searchDetailed: (query: string, numResults: number) =>
       limit(() => searchDetailed(query, numResults)),
     fetchDetailed: (urls: string[]) => limit(() => fetchDetailed(urls)),
-    search: async (query: string, numResults: number) =>
-      (await limit(() => searchDetailed(query, numResults))).docs,
-    fetchContents: async (urls: string[]) =>
-      (await limit(() => fetchDetailed(urls))).docs,
   };
 }

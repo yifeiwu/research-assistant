@@ -1,4 +1,4 @@
-import { DEFAULT_GROQ_MODEL, GROQ_MODELS, isValidGroqModel } from "./models";
+import { DEFAULT_GROQ_MODEL, groqModelLabel, isValidGroqModel } from "./models";
 import { DEFAULT_EFFORT, type EffortLevel } from "./effort";
 
 /** Client-side settings (persisted in the browser). Groq is the only provider. */
@@ -34,6 +34,5 @@ export function sanitizeSettings(value: unknown): AppSettings {
 
 /** Short label for the currently selected Groq model. */
 export function currentModelLabel(settings: AppSettings): string {
-  const found = GROQ_MODELS.find((m) => m.id === settings.model);
-  return found?.label ?? settings.model;
+  return groqModelLabel(settings.model);
 }

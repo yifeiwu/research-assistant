@@ -132,6 +132,5 @@ Files:
 | `UPSTASH_REDIS_REST_URL`   | yes      | Upstash Redis REST URL for cross-instance stream resumption and request caching.            |
 | `UPSTASH_REDIS_REST_TOKEN` | yes      | Upstash Redis REST token.                                                                   |
 | `GROQ_MODEL`               | no       | Fallback Groq model id when the UI doesn't send one. Defaults to `openai/gpt-oss-120b`.     |
-| `GROQ_SUMMARY_MODEL`       | no       | Cheap/fast model for the map (summarization) step. Defaults to `llama-3.1-8b-instant`.      |
 | `CACHE_SEARCH_TTL_SECONDS` | no       | Redis TTL for cached Exa search results. Defaults to `900` (15 min).                        |
 | `CACHE_NOTES_TTL_SECONDS`  | no       | Redis TTL for cached condensed source notes. Defaults to `86400` (24 h).                    |

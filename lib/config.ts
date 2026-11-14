@@ -10,7 +10,12 @@ function intFromEnv(name: string, fallback: number): number {
 /** Single home for server-side tunables (timeouts, caps, cache TTLs). */
 export const serverConfig = {
   groqModel: process.env.GROQ_MODEL ?? "openai/gpt-oss-120b",
-  summaryModel: process.env.GROQ_SUMMARY_MODEL ?? "llama-3.1-8b-instant",
+  // Hardcoded summarizer model (no env override): verified against Groq's
+  // model list — `qwen/qwen3.8-27b` is the current Qwen 27B on Groq. Its
+  // predecessor `qwen/qwen3.6-27b` was deprecated 2026-09-14 and
+  // `llama-3.1-8b-instant` was shut down 2026-08-16, so a stale env default
+  // silently degraded every research turn to raw-text fallbacks.
+  summaryModel: "qwen/qwen3.8-27b",
   exa: {
     timeoutMs: intFromEnv("EXA_TIMEOUT_MS", 25_000),
     maxRetries: 2,

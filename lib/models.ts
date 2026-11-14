@@ -4,8 +4,8 @@ export type GroqModel = {
   hint?: string;
   /**
    * Whether the model is a reasoning model that accepts Groq's
-   * `reasoning_format` parameter. Non-reasoning models (e.g. Llama) reject the
-   * request with a 400 if it's sent, so we only pass it when this is true.
+   * `reasoning_format` parameter. Non-reasoning models reject the request
+   * with a 400 if it's sent, so we only pass it when this is true.
    */
   reasoning?: boolean;
 };
@@ -17,15 +17,10 @@ export type GroqModel = {
  */
 export const GROQ_MODELS: GroqModel[] = [
   {
-    id: "qwen/qwen3.6-27b",
-    label: "Qwen 3.6 27B",
+    id: "qwen/qwen3.8-27b",
+    label: "Qwen 3.8 27B",
     hint: "Balanced reasoning",
     reasoning: true,
-  },
-  {
-    id: "llama-3.3-70b-versatile",
-    label: "Llama 3.3 70B",
-    hint: "Fast & versatile",
   },
   {
     id: "openai/gpt-oss-120b",

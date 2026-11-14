@@ -1,0 +1,84 @@
+import { describe, expect, it } from "vitest";
+import { isResolutionError, resolveModels } from "@/lib/agent/models";
+import {
+  GROQ_MODELS,
+  fallbackModelsFor,
+  groqReasoningOptions,
+  maxSynthesisOutputTokens,
+} from "@/lib/models";
+
+describe("resolveModels stage separation", () => {
+  it("never collides auxiliary planner or summarizer with selectedModel for any GROQ_MODELS choice", () => {
+    for (const model of GROQ_MODELS) {
+      const resolved = resolveModels({
+        model: model.id,
+        apiKey: "gsk_test",
+        db: null,
+      });
+      expect(isResolutionError(resolved)).toBe(false);
+      if (isResolutionError(resolved)) continue;
+
+      expect(resolved.selectedModel).toBe(model.id);
+      expect(resolved.plannerModelId).not.toBe(model.id);
+      expect(resolved.summaryModelId).not.toBe(model.id);
+    }
+  });
+
+  it("allocates all three distinct buckets on default GPT-OSS 120B", () => {
+    const resolved = resolveModels({
+      model: "openai/gpt-oss-120b",
+      apiKey: "gsk_test",
+      db: null,
+    });
+    if (isResolutionError(resolved)) throw new Error(resolved.error);
+
+    expect(resolved.selectedModel).toBe("openai/gpt-oss-120b");
+    expect(resolved.plannerModelId).toBe("openai/gpt-oss-20b");
+    expect(resolved.summaryModelId).toBe("qwen/qwen3.8-27b");
+  });
+
+  it("shifts summarizer off Qwen when the user selects Qwen 3.8 27B for synthesis", () => {
+    const resolved = resolveModels({
+      model: "qwen/qwen3.8-27b",
+      apiKey: "gsk_test",
+      db: null,
+    });
+    if (isResolutionError(resolved)) throw new Error(resolved.error);
+
+    expect(resolved.selectedModel).toBe("qwen/qwen3.8-27b");
+    expect(resolved.summaryModelId).toBe("openai/gpt-oss-20b");
+    expect(resolved.plannerModelId).toBe("openai/gpt-oss-20b");
+  });
+});
+
+describe("per-model reasoning options and OTPM synthesis caps", () => {
+  it("caps Qwen synthesis maxOutputTokens under 1,000 OTPM while preserving 3,500 on GPT-OSS", () => {
+    expect(maxSynthesisOutputTokens("qwen/qwen3.8-27b", 3_500)).toBe(900);
+    expect(maxSynthesisOutputTokens("openai/gpt-oss-120b", 3_500)).toBe(3_500);
+    expect(maxSynthesisOutputTokens("openai/gpt-oss-20b", 3_500)).toBe(3_500);
+  });
+
+  it("uses zero reasoning on Qwen auxiliary calls, low effort on GPT-OSS auxiliary calls, and omits options on unknown models", () => {
+    expect(groqReasoningOptions("qwen/qwen3.8-27b", "auxiliary")).toEqual({
+      groq: { reasoningEffort: "none", reasoningFormat: "hidden" },
+    });
+    expect(groqReasoningOptions("openai/gpt-oss-20b", "auxiliary")).toEqual({
+      groq: { reasoningEffort: "low", reasoningFormat: "parsed" },
+    });
+    expect(groqReasoningOptions("qwen/qwen3.8-27b", "synthesis")).toEqual({
+      groq: { reasoningFormat: "parsed" },
+    });
+    expect(groqReasoningOptions("custom/non-reasoning", "synthesis")).toBeUndefined();
+  });
+
+  it("excludes primaryModel from fallbackModelsFor and prioritizes high-headroom models", () => {
+    expect(fallbackModelsFor("openai/gpt-oss-120b")).toEqual([
+      "openai/gpt-oss-20b",
+      "qwen/qwen3.8-27b",
+    ]);
+    expect(fallbackModelsFor("qwen/qwen3.8-27b")).toEqual([
+      "openai/gpt-oss-120b",
+      "openai/gpt-oss-20b",
+    ]);
+  });
+});

@@ -1,6 +1,6 @@
 "use client";
 
-import { Chat, useChat } from "@ai-sdk/react";
+import { Chat } from "@ai-sdk/react";
 import { DefaultChatTransport, type UIMessage } from "ai";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, RotateCw } from "lucide-react";
@@ -10,6 +10,7 @@ import { Composer } from "@/components/Composer";
 import { EmptyState } from "@/components/EmptyState";
 import { ConversationSidebar } from "@/components/ConversationSidebar";
 import { SettingsPanel } from "@/components/SettingsPanel";
+import { useChatState } from "@/lib/hooks/useChatState";
 import { useConversations } from "@/lib/hooks/useConversations";
 import { useChatSettings } from "@/lib/hooks/useChatSettings";
 import { useScrollAnchor } from "@/lib/hooks/useScrollAnchor";
@@ -22,7 +23,11 @@ import {
 import { useTurnMachine } from "@/lib/hooks/turnMachine";
 import { busyLabel, formatDuration } from "@/lib/format";
 import { findLastUserMessageId } from "@/lib/messages";
-import { createConversationId } from "@/lib/conversations";
+import {
+  CHAT_STREAM_THROTTLE_MS,
+  createConversationId,
+} from "@/lib/conversations";
+import { describeChatError } from "@/lib/chat-error";
 
 function isNetworkDisconnectError(err: unknown): boolean {
   return (
@@ -208,9 +213,7 @@ export default function Home() {
     stop,
     setMessages,
     resumeStream,
-  } = useChat({
-    chat: chatSession.chat,
-  });
+  } = useChatState(chatSession.chat, CHAT_STREAM_THROTTLE_MS);
 
   const [input, setInput] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -220,6 +223,7 @@ export default function Home() {
 
   const isBusy = status === "submitted" || status === "streaming";
   const hasMessages = messages.length > 0;
+  const errorInfo = error ? describeChatError(error) : null;
 
   useEffect(() => {
     if (status === "submitted" || status === "streaming") {
@@ -422,10 +426,10 @@ export default function Home() {
                   </div>
                 )}
 
-                {error && (
+                {error && errorInfo && (
                   <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-300">
                     <div className="flex items-start justify-between gap-3">
-                      <div className="font-medium">Something went wrong</div>
+                      <div className="font-medium">{errorInfo.title}</div>
                       <button
                         type="button"
                         onClick={handleRetry}
@@ -437,13 +441,22 @@ export default function Home() {
                       </button>
                     </div>
                     <div className="mt-1 break-words text-red-300/90">
-                      {error.message}
+                      {errorInfo.detail}
                     </div>
                     <div className="mt-2 text-xs text-red-300/70">
-                      This can happen intermittently with some models. Try
-                      sending the message again, or switch models in Settings. If
-                      it persists, check that your API keys are set.
+                      {errorInfo.hint}
                     </div>
+                    {errorInfo.technical &&
+                      errorInfo.technical !== errorInfo.detail && (
+                        <details className="mt-2 text-xs text-red-300/60">
+                          <summary className="cursor-pointer select-none">
+                            Technical detail
+                          </summary>
+                          <div className="mt-1 break-words whitespace-pre-wrap">
+                            {errorInfo.technical}
+                          </div>
+                        </details>
+                      )}
                   </div>
                 )}
               </div>

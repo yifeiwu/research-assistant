@@ -24,17 +24,23 @@ export function useHeartbeat(
 
   useEffect(() => {
     if (!isBusy) {
-      setHeartbeat({ elapsed: 0, idle: 0 });
+      setHeartbeat((prev) =>
+        prev.elapsed === 0 && prev.idle === 0 ? prev : { elapsed: 0, idle: 0 },
+      );
       return;
     }
     const start = Date.now();
     lastActivityRef.current = start;
     const id = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
       const now = Date.now();
-      setHeartbeat({
-        elapsed: Math.floor((now - start) / 1000),
-        idle: Math.floor((now - lastActivityRef.current) / 1000),
-      });
+      const elapsed = Math.floor((now - start) / 1000);
+      const idle = Math.floor((now - lastActivityRef.current) / 1000);
+      setHeartbeat((prev) =>
+        prev.elapsed === elapsed && prev.idle === idle
+          ? prev
+          : { elapsed, idle },
+      );
     }, 1000);
     return () => window.clearInterval(id);
   }, [isBusy]);

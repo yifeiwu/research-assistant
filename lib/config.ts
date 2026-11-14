@@ -10,6 +10,9 @@ function intFromEnv(name: string, fallback: number): number {
 /** Single home for server-side tunables (timeouts, caps, cache TTLs). */
 export const serverConfig = {
   groqModel: process.env.GROQ_MODEL ?? "openai/gpt-oss-120b",
+  // Dedicated fast model for query planning and gap checks so auxiliary
+  // stages use their own Groq TPM bucket instead of starving `groqModel`.
+  plannerModel: "openai/gpt-oss-20b",
   // Hardcoded summarizer model (no env override): verified against Groq's
   // model list — `qwen/qwen3.8-27b` is the current Qwen 27B on Groq. Its
   // predecessor `qwen/qwen3.6-27b` was deprecated 2026-09-14 and
@@ -44,12 +47,10 @@ export const serverConfig = {
     timeoutMs: 25_000,
   },
   // Planner/gap-check outputs are a handful of short query lines (or DONE /
-  // NO_SEARCH); their output caps are kept small because every planner,
-  // gap-check, and synthesis call draws on the same main-model TPM budget,
-  // and Groq reserves the full max-output budget against it. Oversized caps
-  // here starved the final synthesis call in production.
-  planner: { timeoutMs: 30_000, maxOutputTokens: 800 },
-  gapCheck: { timeoutMs: 25_000, maxOutputTokens: 600, notesTokenBudget: 1_000 },
+  // NO_SEARCH); with auxiliary reasoning set to "low"/"none" and routed to a
+  // separate planner model, output reservations stay compact.
+  planner: { timeoutMs: 30_000, maxOutputTokens: 300 },
+  gapCheck: { timeoutMs: 25_000, maxOutputTokens: 250, notesTokenBudget: 1_000 },
   synthesis: {
     totalTimeoutMs: 180_000,
     stepTimeoutMs: 120_000,
@@ -63,6 +64,12 @@ export const serverConfig = {
     // 413s in production), so the evidence is trimmed to fit, leaving room
     // for history, the system prompt, and the answer itself.
     evidenceTokenBudget: intFromEnv("SYNTHESIS_EVIDENCE_TOKEN_BUDGET", 3_000),
+  },
+  groqRateLimit: {
+    synthesisMaxWaitMs: intFromEnv("GROQ_SYNTHESIS_MAX_WAIT_MS", 10_000),
+    plannerMaxWaitMs: intFromEnv("GROQ_PLANNER_MAX_WAIT_MS", 3_000),
+    summaryMaxWaitMs: 0,
+    maxCooldownSeconds: 300,
   },
   rateLimit: {
     // Per-IP fixed windows for POST /api/chat (checked in Redis).

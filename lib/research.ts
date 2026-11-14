@@ -6,10 +6,10 @@ import {
   type ModelMessage,
   type UIMessageStreamWriter,
 } from "ai";
-import type { GroqProviderOptions } from "@ai-sdk/groq";
 import type { EffortConfig } from "./effort";
 import { createExaClient, type ExaDocument } from "./exa";
 import { logDebug, logError, logInfo } from "./logger";
+import { groqReasoningOptions } from "./models";
 import { condenseSourcesDetailed, stripThinking } from "./pipeline";
 import { buildGapCheckPrompt, buildQueryPlanPrompt } from "./prompts";
 import { extractUrls, normalizeUrlKey } from "./sources";
@@ -129,11 +129,9 @@ function toResearchSource(doc: ExaDocument): ResearchSource {
 /** Planner adapter backed by plain-text `generateText` calls. */
 function createTextPlanner(opts: {
   model: LanguageModel;
-  supportsReasoning: boolean;
+  modelId?: string;
 }): Planner {
-  const reasoningOpts = opts.supportsReasoning
-    ? { groq: { reasoningFormat: "parsed" } satisfies GroqProviderOptions }
-    : undefined;
+  const reasoningOpts = groqReasoningOptions(opts.modelId, "auxiliary");
   return {
     async planQueries({ messages, maxQueries, signal }) {
       const result = await generateText({
@@ -144,7 +142,7 @@ function createTextPlanner(opts: {
         providerOptions: reasoningOpts,
         abortSignal: signal,
         timeout: { totalMs: serverConfig.planner.timeoutMs },
-        maxRetries: 1,
+        maxRetries: 0,
       });
       const parsed = parsePlainTextLines(result.text, { stopToken: "NO_SEARCH", maxLines: maxQueries });
       return { stopped: parsed.stopped, queries: parsed.lines };
@@ -157,7 +155,7 @@ function createTextPlanner(opts: {
         providerOptions: reasoningOpts,
         abortSignal: signal,
         timeout: { totalMs: serverConfig.gapCheck.timeoutMs },
-        maxRetries: 1,
+        maxRetries: 0,
         prompt: `User question:\n${query}\n\nQueries already run:\n${priorQueries.map((q) => `- ${q}`).join("\n")}\n\nGathered research notes so far:\n${notes}\n\nDecide whether these notes are sufficient ("DONE") or list up to ${maxQueries} follow-up search queries (one per line).`,
       });
       const parsed = parsePlainTextLines(result.text, { stopToken: "DONE", maxLines: maxQueries });
@@ -201,10 +199,10 @@ export async function runResearchPipeline(opts: {
   messages: ModelMessage[];
   query: string;
   effort: EffortConfig;
-  mainModel: LanguageModel;
+  plannerModel: LanguageModel;
+  plannerModelId?: string;
   summaryModel: LanguageModel;
   summaryModelId?: string;
-  supportsReasoning: boolean;
   writer: UIMessageStreamWriter<ChatUIMessage>;
   signal?: AbortSignal;
   requestId: string;
@@ -216,7 +214,9 @@ export async function runResearchPipeline(opts: {
     return { searched: false, evidenceBlock: "", totalSources: 0, sources: [] };
   }
 
-  const planner = opts.deps?.planner ?? createTextPlanner({ model: opts.mainModel, supportsReasoning: opts.supportsReasoning });
+  const planner =
+    opts.deps?.planner ??
+    createTextPlanner({ model: opts.plannerModel, modelId: opts.plannerModelId });
   const search = opts.deps?.search ?? createExaSearchProvider({ signal, requestId });
   const condenser = opts.deps?.condenser ?? createModelCondenser({ model: opts.summaryModel, modelId: opts.summaryModelId });
 

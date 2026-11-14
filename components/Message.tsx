@@ -7,7 +7,7 @@ import { ResearchStep } from "./ResearchStep";
 import { Markdown } from "./Markdown";
 import { collectSources } from "@/lib/sources";
 import { getMessageText } from "@/lib/messages";
-import type { ResearchStepData } from "@/lib/types/chat";
+import type { ModelFallbackData, ResearchStepData } from "@/lib/types/chat";
 import { ActionButton } from "./message/ActionButton";
 import { CopyButton } from "./message/CopyButton";
 import { EditUserMessage } from "./message/EditUserMessage";
@@ -101,6 +101,28 @@ export const Message = memo(function Message({
                   key={dataPart.id ?? index}
                   data={dataPart.data}
                 />
+              );
+            }
+
+            if (part.type === "data-model-fallback") {
+              const dataPart = part as {
+                id?: string;
+                data?: ModelFallbackData;
+              };
+              if (!dataPart.data) return null;
+              return (
+                <div
+                  key={dataPart.id ?? index}
+                  className="my-2 inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface-2/60 px-2.5 py-1 text-xs text-muted"
+                >
+                  <span>
+                    Answered with{" "}
+                    <span className="font-medium text-foreground">
+                      {dataPart.data.toLabel}
+                    </span>{" "}
+                    ({dataPart.data.fromLabel} was rate-limited)
+                  </span>
+                </div>
               );
             }
 

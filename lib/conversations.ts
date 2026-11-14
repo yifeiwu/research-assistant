@@ -20,6 +20,13 @@ const LEGACY_MESSAGES_STORAGE_KEY = "web-seek-messages";
 const MAX_TITLE_LENGTH = 60;
 
 /**
+ * Throttle interval (ms) for streaming message notifications (~20 fps).
+ * Paired with `useChatState` (`DefaultLane`) so UI re-renders stay smooth
+ * during fast token bursts without fighting timer/polling state updates.
+ */
+export const CHAT_STREAM_THROTTLE_MS = 50;
+
+/**
  * Cap on saved threads. Once exceeded, the least-recently-updated conversations
  * are evicted (LRU) so localStorage doesn't grow without bound.
  */

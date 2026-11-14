@@ -94,4 +94,25 @@ describe("condenseSourcesDetailed (batched)", () => {
     // 10,000-char batch cap plus headings/instructions overhead.
     expect(prompt.length).toBeLessThan(12_000);
   });
+
+  it("disables reasoning tokens on Qwen summarizer and sets low effort on GPT-OSS", async () => {
+    mockGenerate.mockResolvedValue({ text: "### Source 1\n- a" } as never);
+    await condenseSourcesDetailed([longDoc("https://a.com")], {
+      ...opts,
+      modelId: "qwen/qwen3.8-27b",
+    });
+    expect(mockGenerate.mock.calls[0][0].providerOptions).toEqual({
+      groq: { reasoningEffort: "none", reasoningFormat: "hidden" },
+    });
+
+    mockGenerate.mockClear();
+    mockGenerate.mockResolvedValue({ text: "### Source 1\n- b" } as never);
+    await condenseSourcesDetailed([longDoc("https://b.com")], {
+      ...opts,
+      modelId: "openai/gpt-oss-20b",
+    });
+    expect(mockGenerate.mock.calls[0][0].providerOptions).toEqual({
+      groq: { reasoningEffort: "low", reasoningFormat: "parsed" },
+    });
+  });
 });

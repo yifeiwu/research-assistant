@@ -7,6 +7,10 @@ export class FakeRedis {
   async get<T>(key: string): Promise<T | null> {
     return (this.strings.get(key) ?? null) as T | null;
   }
+  async set(key: string, value: string): Promise<string> {
+    this.strings.set(key, value);
+    return "OK";
+  }
   async incr(key: string): Promise<number> {
     const next = (Number(this.strings.get(key) ?? 0) || 0) + 1;
     this.strings.set(key, String(next));

@@ -39,9 +39,18 @@ export type ResearchStepData = {
   degraded?: DegradedResearch;
 };
 
+/** Payload carried by a `data-model-fallback` UI message part when synthesis auto-switches models. */
+export type ModelFallbackData = {
+  fromModel: string;
+  toModel: string;
+  fromLabel: string;
+  toLabel: string;
+};
+
 /** Custom AI SDK v6 data parts emitted by `/api/chat`. */
 export type ChatDataParts = {
   "research-step": ResearchStepData;
+  "model-fallback": ModelFallbackData;
 };
 
 /** Application UIMessage type with typed research-step data parts. */

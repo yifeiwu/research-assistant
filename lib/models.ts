@@ -1,3 +1,5 @@
+import type { GroqProviderOptions } from "@ai-sdk/groq";
+
 export type GroqModel = {
   id: string;
   label: string;
@@ -8,7 +10,22 @@ export type GroqModel = {
    * with a 400 if it's sent, so we only pass it when this is true.
    */
   reasoning?: boolean;
+  /**
+   * Whether the model accepts `reasoning_effort: "none"` to disable thinking
+   * completely on auxiliary stages (supported by Qwen 3.8 27B, rejected by
+   * GPT-OSS which requires `"low"` as its minimum).
+   */
+  supportsZeroReasoning?: boolean;
+  /**
+   * Per-model cap on synthesis `maxOutputTokens` when the org's OTPM limit is
+   * tighter than the default synthesis cap (Qwen 3.8 27B allows 1,000 OTPM).
+   */
+  maxSynthesisTokens?: number;
 };
+
+export type GroqModelRole = "synthesis" | "auxiliary";
+
+const DEFAULT_SYNTHESIS_MAX_TOKENS = 3_500;
 
 /**
  * Curated list of Groq models available on the free tier. Because the research
@@ -21,6 +38,8 @@ export const GROQ_MODELS: GroqModel[] = [
     label: "Qwen 3.8 27B",
     hint: "Balanced reasoning",
     reasoning: true,
+    supportsZeroReasoning: true,
+    maxSynthesisTokens: 900,
   },
   {
     id: "openai/gpt-oss-120b",
@@ -38,6 +57,13 @@ export const GROQ_MODELS: GroqModel[] = [
 
 export const DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b";
 
+/** Preferred fallback priority when a model's rate-limit bucket is hot. */
+const FALLBACK_PRIORITY: readonly string[] = [
+  "openai/gpt-oss-120b",
+  "openai/gpt-oss-20b",
+  "qwen/qwen3.8-27b",
+];
+
 export function isValidGroqModel(id: string | undefined | null): id is string {
   return !!id && GROQ_MODELS.some((m) => m.id === id);
 }
@@ -53,12 +79,71 @@ export function groqModelLabel(id: string | undefined | null): string {
 }
 
 /**
- * Whether a Groq model accepts the `reasoning_format` provider option. Unknown
- * model ids (e.g. a custom `GROQ_MODEL` env override) default to `false` so we
- * never send a parameter the model might reject.
+ * Provider options for a Groq call given its pipeline role:
+ * - `"synthesis"` surfaces parsed reasoning tokens to the UI.
+ * - `"auxiliary"` (planner, gap check, summarizer) disables reasoning on Qwen
+ *   (`effort: "none", format: "hidden"`) and minimizes it on GPT-OSS
+ *   (`effort: "low"`), avoiding wasted output-token reservations.
+ * Unknown custom models return `undefined` so unsupported fields are never sent.
  */
-export function groqModelSupportsReasoning(
+export function groqReasoningOptions(
   id: string | undefined | null,
-): boolean {
-  return !!id && GROQ_MODELS.some((m) => m.id === id && m.reasoning === true);
+  role: GroqModelRole,
+): { groq: GroqProviderOptions } | undefined {
+  const known = id ? GROQ_MODELS.find((m) => m.id === id) : undefined;
+  if (!known?.reasoning) return undefined;
+
+  if (role === "synthesis") {
+    return { groq: { reasoningFormat: "parsed" } };
+  }
+
+  if (known.supportsZeroReasoning) {
+    return {
+      groq: {
+        reasoningEffort: "none",
+        reasoningFormat: "hidden",
+      },
+    };
+  }
+
+  return {
+    groq: {
+      reasoningEffort: "low",
+      reasoningFormat: "parsed",
+    },
+  };
+}
+
+/**
+ * Safe `maxOutputTokens` reservation for final synthesis on `id`. Caps Qwen at
+ * 900 tokens so a single synthesis request never exceeds its 1,000 OTPM limit.
+ */
+export function maxSynthesisOutputTokens(
+  id: string | undefined | null,
+  defaultMax: number = DEFAULT_SYNTHESIS_MAX_TOKENS,
+): number {
+  const known = id ? GROQ_MODELS.find((m) => m.id === id) : undefined;
+  if (known?.maxSynthesisTokens != null) {
+    return Math.min(known.maxSynthesisTokens, defaultMax);
+  }
+  return defaultMax;
+}
+
+/** Ordered fallback model IDs from `GROQ_MODELS`, excluding `primaryModelId`. */
+export function fallbackModelsFor(
+  primaryModelId: string | undefined | null,
+): string[] {
+  const validIds = new Set(GROQ_MODELS.map((m) => m.id));
+  const ordered = [
+    ...FALLBACK_PRIORITY.filter((id) => validIds.has(id)),
+    ...GROQ_MODELS.map((m) => m.id),
+  ];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const id of ordered) {
+    if (id === primaryModelId || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
 }

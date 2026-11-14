@@ -107,7 +107,7 @@ export function createPipelineStreamResponse(
   run: (writer: UIMessageStreamWriter<ChatUIMessage>) => Promise<StreamResult>,
   ctx: {
     requestId: string;
-    modelInfo: string;
+    modelInfo: string | (() => string);
     signal?: AbortSignal;
     /** Live lookup for this turn's retrieved sources (citation allowlist). */
     getAllowedSources?: () => ResearchSource[];
@@ -118,6 +118,9 @@ export function createPipelineStreamResponse(
     }) => void | PromiseLike<void>;
   },
 ): Response {
+  const currentModelInfo = () =>
+    typeof ctx.modelInfo === "function" ? ctx.modelInfo() : ctx.modelInfo;
+
   const stream = createUIMessageStream<ChatUIMessage>({
     execute: async ({ writer }) => {
       writer.write({ type: "start" });
@@ -127,7 +130,7 @@ export function createPipelineStreamResponse(
         result = await run(writer);
       } catch (error) {
         if (isAbortError(error) || ctx.signal?.aborted) {
-          logInfo("abort", { requestId: ctx.requestId, model: ctx.modelInfo });
+          logInfo("abort", { requestId: ctx.requestId, model: currentModelInfo() });
           writer.write({ type: "abort" });
           return;
         }
@@ -150,8 +153,37 @@ export function createPipelineStreamResponse(
       // treated as code throughout, and very long lines must not stall the
       // stream until text-end.
       const FLUSH_CHAR_CAP = 4_096;
+      const REASONING_FLUSH_CHARS = 120;
       type TextState = { buffer: string; inFence: boolean };
+      type ReasoningState = {
+        buffer: string;
+        providerMetadata?: Record<string, Record<string, unknown>>;
+      };
       const textBuffers = new Map<string, TextState>();
+      const reasoningBuffers = new Map<string, ReasoningState>();
+
+      const flushReasoning = (id: string, force: boolean) => {
+        const state = reasoningBuffers.get(id);
+        if (!state || !state.buffer) return;
+        if (
+          !force &&
+          !state.buffer.includes("\n") &&
+          state.buffer.length < REASONING_FLUSH_CHARS
+        ) {
+          return;
+        }
+        const delta = state.buffer;
+        const providerMetadata = state.providerMetadata;
+        state.buffer = "";
+        state.providerMetadata = undefined;
+        if (force) reasoningBuffers.delete(id);
+        writer.write({
+          type: "reasoning-delta",
+          id,
+          delta,
+          ...(providerMetadata != null ? { providerMetadata } : {}),
+        } as Parameters<typeof writer.write>[0]);
+      };
 
       const verifyFragment = (state: TextState, emit: string): string => {
         if (state.inFence) {
@@ -198,6 +230,26 @@ export function createPipelineStreamResponse(
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
+          if (value.type === "reasoning-delta") {
+            const r = value as {
+              id: string;
+              delta: string;
+              providerMetadata?: Record<string, Record<string, unknown>>;
+            };
+            const state = reasoningBuffers.get(r.id) ?? { buffer: "" };
+            state.buffer += r.delta;
+            if (r.providerMetadata != null) {
+              state.providerMetadata = r.providerMetadata;
+            }
+            reasoningBuffers.set(r.id, state);
+            flushReasoning(r.id, false);
+            continue;
+          }
+          if (reasoningBuffers.size > 0) {
+            for (const id of [...reasoningBuffers.keys()]) {
+              flushReasoning(id, true);
+            }
+          }
           if (value.type === "text-delta") {
             sawText = true;
             const id = (value as { id: string }).id;
@@ -215,6 +267,7 @@ export function createPipelineStreamResponse(
           }
           writer.write(value);
         }
+        for (const id of [...reasoningBuffers.keys()]) flushReasoning(id, true);
         for (const id of [...textBuffers.keys()]) flushText(id, true);
         if (strippedCitations > 0) {
           logInfo("citation-verification", {
@@ -244,7 +297,7 @@ export function createPipelineStreamResponse(
       if (!sawText) {
         logInfo("empty-answer", {
           requestId: ctx.requestId,
-          modelInfo: ctx.modelInfo,
+          modelInfo: currentModelInfo(),
           finishReason,
         });
         const id = crypto.randomUUID();
@@ -263,11 +316,12 @@ export function createPipelineStreamResponse(
       });
     },
     onError: (error) => {
+      const info = currentModelInfo();
       logError("stream", error, {
         requestId: ctx.requestId,
-        modelInfo: ctx.modelInfo,
+        modelInfo: info,
       });
-      return clientErrorMessage(error, ctx.modelInfo);
+      return clientErrorMessage(error, info);
     },
   });
 

@@ -209,6 +209,14 @@ export function useConversations({
     if (promptMessages.length === 0) return;
 
     const lastPromptId = promptMessages[promptMessages.length - 1]?.id;
+    const current = conversationsRef.current.find((c) => c.id === id);
+    if (
+      current?.pending &&
+      current.messages.length === promptMessages.length &&
+      current.messages[current.messages.length - 1]?.id === lastPromptId
+    ) {
+      return;
+    }
 
     setConversations((prev) => {
       const existing = prev.find((c) => c.id === id);

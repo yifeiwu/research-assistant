@@ -4,6 +4,7 @@ import { generateText, type LanguageModel } from "ai";
 import type { ExaDocument } from "./exa";
 import { logDebug, logError } from "./logger";
 import { serverConfig } from "./config";
+import { groqReasoningOptions } from "./models";
 import { normalizeCacheText, requestCache, type RequestCache } from "./cache";
 
 const PASSTHROUGH_CHAR_LIMIT = serverConfig.summary.passthroughCharLimit;
@@ -154,6 +155,7 @@ export async function condenseSourcesDetailed(
             model: opts.model,
             system: SUMMARY_SYSTEM_PROMPT,
             maxOutputTokens: serverConfig.summary.batchMaxOutputTokens,
+            providerOptions: groqReasoningOptions(opts.modelId, "auxiliary"),
             // Signal-free loader (shared/coalesced via the cache); the
             // caller's own signal is passed to `wrap` below and only
             // detaches this caller.

@@ -32,9 +32,9 @@ describe("effortConfig parallelism vs rounds", () => {
     // Summarizer: Groq reserves the full output cap against a 1k OTPM limit,
     // so one round's batch must leave room for the next round's.
     expect(serverConfig.summary.batchMaxOutputTokens).toBeLessThanOrEqual(350);
-    // Planner/gap/synthesis share the main model's 8k TPM.
-    expect(serverConfig.planner.maxOutputTokens).toBeLessThanOrEqual(800);
-    expect(serverConfig.gapCheck.maxOutputTokens).toBeLessThanOrEqual(600);
+    // Planner/gap run on a dedicated auxiliary model with low/none reasoning.
+    expect(serverConfig.planner.maxOutputTokens).toBeLessThanOrEqual(300);
+    expect(serverConfig.gapCheck.maxOutputTokens).toBeLessThanOrEqual(250);
     expect(serverConfig.gapCheck.notesTokenBudget).toBeLessThanOrEqual(1_000);
     // Summarizer input: a 20k-char batch requested 3.7-4.2k input tokens in
     // production, so round 2 busted the 7k ITPM window. ~10k chars keeps a
@@ -63,9 +63,8 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "what happened",
       effort: effortConfig("medium"),
-      mainModel: {} as never,
+      plannerModel: {} as never,
       summaryModel: {} as never,
-      supportsReasoning: false,
       writer,
       requestId: "test1234",
       deps: {
@@ -98,9 +97,8 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "breaking news",
       effort: effortConfig("medium"),
-      mainModel: {} as never,
+      plannerModel: {} as never,
       summaryModel: {} as never,
-      supportsReasoning: false,
       writer,
       requestId: "test1234",
       deps: {
@@ -126,9 +124,8 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "summarise https://a.com/page please",
       effort: effortConfig("medium"),
-      mainModel: {} as never,
+      plannerModel: {} as never,
       summaryModel: {} as never,
-      supportsReasoning: false,
       writer,
       requestId: "test1234",
       deps: {
@@ -157,9 +154,8 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "q",
       effort: effortConfig("medium"),
-      mainModel: {} as never,
+      plannerModel: {} as never,
       summaryModel: {} as never,
-      supportsReasoning: false,
       writer,
       requestId: "test1234",
       deps: {
@@ -192,9 +188,8 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "q",
       effort: effortConfig("high"),
-      mainModel: {} as never,
+      plannerModel: {} as never,
       summaryModel: {} as never,
-      supportsReasoning: false,
       writer,
       requestId: "test1234",
       deps: {
@@ -240,9 +235,8 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "q",
       effort: effortConfig("high"),
-      mainModel: {} as never,
+      plannerModel: {} as never,
       summaryModel: {} as never,
-      supportsReasoning: false,
       writer,
       requestId: "test1234",
       deps: {
@@ -272,9 +266,8 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "q",
       effort: effortConfig("medium"),
-      mainModel: {} as never,
+      plannerModel: {} as never,
       summaryModel: {} as never,
-      supportsReasoning: false,
       writer,
       requestId: "test1234",
       deps: {
@@ -304,9 +297,8 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "q",
       effort: effortConfig("high"),
-      mainModel: {} as never,
+      plannerModel: {} as never,
       summaryModel: {} as never,
-      supportsReasoning: false,
       writer,
       requestId: "test1234",
       deps: {
@@ -341,9 +333,8 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "q",
       effort: effortConfig("medium"),
-      mainModel: {} as never,
+      plannerModel: {} as never,
       summaryModel: {} as never,
-      supportsReasoning: false,
       writer,
       requestId: "test1234",
       deps: {

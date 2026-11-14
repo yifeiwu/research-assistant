@@ -1,12 +1,21 @@
-import { convertToModelMessages, streamText, type UIMessage } from "ai";
-import type { GroqProviderOptions } from "@ai-sdk/groq";
+import {
+  convertToModelMessages,
+  streamText,
+  type UIMessage,
+  type UIMessageStreamWriter,
+} from "ai";
 import { after } from "next/server";
 import { effortConfig } from "@/lib/effort";
-import { chatRequestSchema } from "@/lib/types/chat";
+import { chatRequestSchema, type ChatUIMessage } from "@/lib/types/chat";
 import { latestUserText, pruneAssistantHistory } from "@/lib/messages";
 import { buildDirectAnswerPrompt, buildSynthesisPrompt } from "@/lib/prompts";
 import { logInfo, logError } from "@/lib/logger";
 import { resolveModels, isResolutionError } from "@/lib/agent/models";
+import {
+  groqModelLabel,
+  groqReasoningOptions,
+  maxSynthesisOutputTokens,
+} from "@/lib/models";
 import { serverConfig } from "@/lib/config";
 import type { Synthesizer } from "@/lib/ports";
 import { createPipelineStreamResponse } from "@/lib/agent/stream";
@@ -77,17 +86,43 @@ export async function POST(req: Request) {
     );
   }
 
-  const resolved = resolveModels({ model });
+  const requestId = crypto.randomUUID().slice(0, 8);
+  let activeWriter: UIMessageStreamWriter<ChatUIMessage> | undefined;
+  let activeModelInfo = "";
+
+  const resolved = resolveModels({
+    model,
+    onSynthesisFallback: (event) => {
+      activeModelInfo = `groq ${event.to}`;
+      activeWriter?.write({
+        type: "data-model-fallback",
+        id: `model-fallback-${requestId}`,
+        data: {
+          fromModel: event.from,
+          toModel: event.to,
+          fromLabel: groqModelLabel(event.from),
+          toLabel: groqModelLabel(event.to),
+        },
+      });
+    },
+  });
   if (isResolutionError(resolved)) {
     return Response.json(
       { error: resolved.error },
       { status: resolved.status },
     );
   }
-  const { mainModel, summaryModel, summaryModelId, modelInfo, supportsReasoning } =
-    resolved;
+  const {
+    selectedModel,
+    mainModel,
+    plannerModel,
+    plannerModelId,
+    summaryModel,
+    summaryModelId,
+    modelInfo,
+  } = resolved;
+  activeModelInfo = modelInfo;
 
-  const requestId = crypto.randomUUID().slice(0, 8);
   const query = latestUserText(messages);
   const turnId = latestUserMessageId(messages);
 
@@ -107,6 +142,8 @@ export async function POST(req: Request) {
   logInfo("request", {
     requestId,
     model: modelInfo,
+    plannerModel: plannerModelId,
+    summaryModel: summaryModelId,
     messageCount: messages.length,
     query: query.slice(0, 200),
     rounds: effort.rounds,
@@ -135,6 +172,7 @@ export async function POST(req: Request) {
   try {
     return createPipelineStreamResponse(
       async (writer) => {
+        activeWriter = writer;
         if (signal?.aborted) {
           throw new DOMException("The operation was aborted.", "AbortError");
         }
@@ -143,10 +181,10 @@ export async function POST(req: Request) {
           messages: modelMessages,
           query,
           effort,
-          mainModel,
+          plannerModel,
+          plannerModelId,
           summaryModel,
           summaryModelId,
-          supportsReasoning,
           writer,
           signal,
           requestId,
@@ -161,31 +199,30 @@ export async function POST(req: Request) {
                 ? buildSynthesisPrompt(input.evidenceBlock, input.degraded)
                 : buildDirectAnswerPrompt(input.degraded, input.searchFailed),
               messages: modelMessages,
-          providerOptions: supportsReasoning
-            ? {
-                groq: {
-                  reasoningFormat: "parsed",
-                } satisfies GroqProviderOptions,
-              }
-            : undefined,
-          // Bounded output so Groq's TPM reservation for the synthesis call
-          // stays predictable alongside the planner/gap-check calls that
-          // share the same main-model per-minute budget.
-          maxOutputTokens: serverConfig.synthesis.maxOutputTokens,
-          timeout: {
-            totalMs: serverConfig.synthesis.totalTimeoutMs,
-            stepMs: serverConfig.synthesis.stepTimeoutMs,
-          },
-          abortSignal: signal,
-          onAbort: () => {
-            logInfo("abort", { requestId, model: modelInfo });
-          },
-          onError: ({ error }) => {
-            logError("streamText", error, { requestId, model: modelInfo });
-          },
+              providerOptions: groqReasoningOptions(selectedModel, "synthesis"),
+              // Bounded per-model output reservation (e.g. 900 on Qwen's 1k OTPM
+              // bucket, 3,500 on GPT-OSS); retries/fallbacks are owned by
+              // `createResilientGroqFetch` so AI SDK blind retries are disabled.
+              maxOutputTokens: maxSynthesisOutputTokens(
+                selectedModel,
+                serverConfig.synthesis.maxOutputTokens,
+              ),
+              maxRetries: 0,
+              timeout: {
+                totalMs: serverConfig.synthesis.totalTimeoutMs,
+                stepMs: serverConfig.synthesis.stepTimeoutMs,
+              },
+              abortSignal: signal,
+              onAbort: () => {
+                logInfo("abort", { requestId, model: activeModelInfo });
+              },
+              onError: ({ error }) => {
+                logError("streamText", error, { requestId, model: activeModelInfo });
+              },
               onFinish: ({ finishReason, usage }) => {
                 logInfo("finish", {
                   requestId,
+                  model: activeModelInfo,
                   finishReason,
                   searched: outcome.searched,
                   sources: outcome.totalSources,
@@ -201,7 +238,12 @@ export async function POST(req: Request) {
           searchFailed: outcome.searchFailed,
         }) as ReturnType<typeof streamText>;
       },
-      { requestId, modelInfo, signal, getAllowedSources: () => allowedSources },
+      {
+        requestId,
+        modelInfo: () => activeModelInfo,
+        signal,
+        getAllowedSources: () => allowedSources,
+      },
       streamHandle
         ? {
             consumeSseStream: ({ stream }) => {

@@ -58,9 +58,10 @@ describe("condenseSourcesDetailed (batched)", () => {
     const out = await condenseSourcesDetailed(docs, opts);
     expect(mockGenerate).toHaveBeenCalledTimes(1);
     expect(out.fallbackCount).toBe(2);
-    // Fallback excerpts are capped at 4,000 chars of the source body.
-    expect(out.notes[0]).toContain("x".repeat(4_000));
-    expect(out.notes[0]).not.toContain("x".repeat(4_001));
+    // Fallback excerpts come from the per-source input slice (3,000 chars
+    // for 2 pending sources), itself under the 4,000-char fallback cap.
+    expect(out.notes[0]).toContain("x".repeat(3_000));
+    expect(out.notes[0]).not.toContain("x".repeat(3_001));
   });
 
   it("falls back only for sources missing from the batch response", async () => {
@@ -90,7 +91,7 @@ describe("condenseSourcesDetailed (batched)", () => {
     const docs = Array.from({ length: 8 }, (_, i) => longDoc(`https://s${i}.com`, "x", 10_000));
     await condenseSourcesDetailed(docs, opts);
     const prompt = String(mockGenerate.mock.calls[0][0].prompt);
-    // 20,000-char batch cap plus headings/instructions overhead.
-    expect(prompt.length).toBeLessThan(22_000);
+    // 10,000-char batch cap plus headings/instructions overhead.
+    expect(prompt.length).toBeLessThan(12_000);
   });
 });

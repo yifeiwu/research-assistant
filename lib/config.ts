@@ -27,12 +27,15 @@ export const serverConfig = {
   summary: {
     passthroughCharLimit: 1_500,
     // All sources in a round are condensed in ONE batched model call (see
-    // lib/pipeline.ts). The batch input is capped so a single request stays
-    // under the summary model's per-minute input-token limit (7k ITPM on the
-    // current Groq org) once the system prompt is added, and each source
-    // gets a bounded slice so one long page cannot starve the rest.
-    batchInputCharCap: 20_000,
-    perSourceInputCharCap: 6_000,
+    // lib/pipeline.ts). The batch input is capped so sequential rounds'
+    // batches fit inside the summary model's per-minute input-token limit
+    // (7k ITPM on the current Groq org): at a 20k-char cap production
+    // batches requested 3.7-4.2k input tokens each, so round 2 always
+    // busted the window. Halving the cap puts a batch at ~2k tokens, so
+    // 2-3 rounds fit in one minute. Each source still gets a bounded slice
+    // so one long page cannot starve the rest.
+    batchInputCharCap: 10_000,
+    perSourceInputCharCap: 3_000,
     fallbackCharCap: 4_000,
     // Groq reserves the full max-output budget against the summary model's
     // 1k OTPM, so one round's batch must leave room for the next round's:
@@ -50,7 +53,11 @@ export const serverConfig = {
   synthesis: {
     totalTimeoutMs: 180_000,
     stepTimeoutMs: 120_000,
-    maxOutputTokens: 2_500,
+    // Output cap includes reasoning tokens (gpt-oss spent ~700 of the old
+    // 2,500 cap on reasoning in production, truncating answers mid-table
+    // with finishReason "length"). 3,500 leaves room for both while still
+    // fitting the 8k TPM window: evidence-capped input is ~2.9k tokens.
+    maxOutputTokens: 3_500,
     // Cap on the assembled research-notes evidence injected into synthesis.
     // Groq's free tier rejects requests over ~8k TPM in one shot (observed
     // 413s in production), so the evidence is trimmed to fit, leaving room

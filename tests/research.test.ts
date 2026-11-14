@@ -36,7 +36,14 @@ describe("effortConfig parallelism vs rounds", () => {
     expect(serverConfig.planner.maxOutputTokens).toBeLessThanOrEqual(800);
     expect(serverConfig.gapCheck.maxOutputTokens).toBeLessThanOrEqual(600);
     expect(serverConfig.gapCheck.notesTokenBudget).toBeLessThanOrEqual(1_000);
-    expect(serverConfig.synthesis.maxOutputTokens).toBeLessThanOrEqual(2_500);
+    // Summarizer input: a 20k-char batch requested 3.7-4.2k input tokens in
+    // production, so round 2 busted the 7k ITPM window. ~10k chars keeps a
+    // batch near 2k tokens, letting sequential rounds share the minute.
+    expect(serverConfig.summary.batchInputCharCap).toBeLessThanOrEqual(10_000);
+    expect(serverConfig.summary.perSourceInputCharCap).toBeLessThanOrEqual(3_000);
+    // Synthesis cap counts reasoning tokens too (~700 observed); 3,500 fits
+    // the 8k TPM window alongside the ~2.9k-token evidence-capped input.
+    expect(serverConfig.synthesis.maxOutputTokens).toBeLessThanOrEqual(3_500);
   });
 });
 

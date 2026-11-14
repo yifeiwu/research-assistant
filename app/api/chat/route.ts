@@ -10,6 +10,7 @@ import { resolveModels, isResolutionError } from "@/lib/agent/models";
 import { serverConfig } from "@/lib/config";
 import type { Synthesizer } from "@/lib/ports";
 import { createPipelineStreamResponse } from "@/lib/agent/stream";
+import { checkChatRateLimit, getClientIp } from "@/lib/rate-limit";
 import { runResearchPipeline } from "@/lib/research";
 import {
   startChatStream,
@@ -34,6 +35,18 @@ function latestUserMessageId(messages: UIMessage[]): string | undefined {
 }
 
 export async function POST(req: Request) {
+  // Per-IP Redis rate limit before any expensive work (model/Exa calls).
+  const rateLimit = await checkChatRateLimit(getClientIp(req.headers));
+  if (!rateLimit.allowed) {
+    return Response.json(
+      { error: "You're sending messages too quickly. Please wait a moment and try again." },
+      {
+        status: 429,
+        headers: { "Retry-After": String(rateLimit.retryAfterSeconds) },
+      },
+    );
+  }
+
   let body: unknown;
   try {
     body = await req.json();

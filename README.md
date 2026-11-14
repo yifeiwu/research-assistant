@@ -20,10 +20,10 @@ Browser (Chat) ─POST /api/chat─▶ Deterministic Research Pipeline (lib/rese
                                       │ 1. Plain-text query planning (or NO_SEARCH)
                                       ▼
                                Exa REST API (/search + /contents, Redis-cached)
-                                      │ 2. Parallel retrieval (<= 4 req/s per user)
+                                      │ 2. Retrieval (<= 2 parallel searches per round, sequential rounds)
                                       ▼
                                Summarizer model (map, Redis-cached notes)
-                                      │ 3. Bounded parallel condensation (+ optional Round 2 gap check)
+                                      │ 3. One batched condensation call per round (+ optional Round 2 gap check)
                                       ▼
                                Main model (reduce) ──▶ streamed, citation-verified answer
 ```
@@ -39,14 +39,18 @@ client. Partial retrieval or condensation failures surface as a visible
 "degraded research" warning on the research card and are disclosed to the
 synthesis model.
 
-Research depth is controlled by the **Effort** selector (`lib/effort.ts`), tuned
-for Exa's 10 req/s rate limit across concurrent users:
+Research depth is controlled by the **Effort** selector (`lib/effort.ts`).
+Retrieval is narrow-but-deep: at most 2 parallel searches in any round, with
+depth from extra sequential, gap-checked rounds — keeping bursts well under
+Exa's 10 req/s limit and spreading model calls across rate-limit windows:
 
 - **Low:** skips web search (`0` rounds) and answers directly in a single pass.
-- **Medium (default):** `1` round — up to 4 parallel queries and up to 8
-  deduplicated, condensed sources.
-- **High:** `2` rounds — up to 5 initial queries, an automated gap check over
-  Round 1 notes, and up to 4 targeted follow-up queries (up to 14 unique sources).
+- **Medium (default):** up to `2` sequential rounds — 2 queries in Round 1,
+  then a gap check over the notes so far and up to 2 follow-up queries
+  (up to 8 deduplicated, condensed sources).
+- **High:** up to `4` sequential rounds — 2 queries per round, a gap check
+  between rounds, stopping early when the notes are sufficient (up to 14
+  unique sources).
 
 Streaming is resumable across serverless instances: SSE chunks are buffered in
 Upstash Redis (`lib/agent/chat-stream.ts`) so reloads, tab switches, and thread
@@ -64,8 +68,11 @@ Files:
 - `lib/exa.ts` — Exa REST adapter (`/search` and `/contents`) with per-request
   concurrency limiting, timeouts, retry backoff, and Redis request caching
   (`lib/cache.ts`).
-- `lib/pipeline.ts` — concurrent map-stage source condensation and `<think>`
-  stripping for open-weight reasoning models.
+- `lib/pipeline.ts` — map-stage source condensation: all sources in a round
+  are condensed in a single batched, fail-fast (`maxRetries: 0`) summarizer
+  call, sized to fit the summary model's per-minute token budget, with raw
+  excerpt fallbacks per source — plus `<think>` stripping for open-weight
+  reasoning models.
 
 ## Prerequisites
 
@@ -134,3 +141,6 @@ Files:
 | `GROQ_MODEL`               | no       | Fallback Groq model id when the UI doesn't send one. Defaults to `openai/gpt-oss-120b`.     |
 | `CACHE_SEARCH_TTL_SECONDS` | no       | Redis TTL for cached Exa search results. Defaults to `900` (15 min).                        |
 | `CACHE_NOTES_TTL_SECONDS`  | no       | Redis TTL for cached condensed source notes. Defaults to `86400` (24 h).                    |
+| `RATE_LIMIT_PER_MINUTE`    | no       | Per-IP `POST /api/chat` limit per minute (Redis). Defaults to `6`; `0` disables.            |
+| `RATE_LIMIT_PER_HOUR`      | no       | Per-IP `POST /api/chat` limit per hour (Redis). Defaults to `60`; `0` disables.             |
+| `SYNTHESIS_EVIDENCE_TOKEN_BUDGET` | no | Max estimated tokens of research evidence in the final answer. Defaults to `3000`.       |

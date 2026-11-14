@@ -7,6 +7,14 @@ export class FakeRedis {
   async get<T>(key: string): Promise<T | null> {
     return (this.strings.get(key) ?? null) as T | null;
   }
+  async incr(key: string): Promise<number> {
+    const next = (Number(this.strings.get(key) ?? 0) || 0) + 1;
+    this.strings.set(key, String(next));
+    return next;
+  }
+  async expire(): Promise<number> {
+    return 1;
+  }
   async hgetall<T>(key: string): Promise<T | null> {
     const hash = this.hashes.get(key);
     return hash ? ({ ...hash } as T) : null;

@@ -2,31 +2,35 @@
  * Research "effort" controls how deeply the deterministic research pipeline
  * searches and condenses sources before synthesizing an answer.
  *
- * Tuned for Exa's 10 req/s global rate limit assuming at most 2 concurrent
- * users: each request runs at most 4 Exa calls concurrently (peak 8 req/s
- * across 2 users).
+ * Retrieval is deliberately narrow-but-deep: at most 2 search queries run in
+ * parallel in any round, and depth comes from additional sequential rounds
+ * (each preceded by a gap check over the notes gathered so far) rather than
+ * a wide parallel burst. That keeps a single request's burst well under
+ * Exa's 10 req/s global limit and spreads the summarizer / planner model
+ * calls over time instead of firing them all in the same rate-limit window.
  *
  * - low:    no web research at all (0 rounds) — answer directly from the
  *           model's own knowledge in a single pass.
- * - medium: single-round research (up to 4 queries, up to 8 condensed sources).
- * - high:   two-round deep research (up to 5 initial queries + gap check with
- *           up to 4 follow-up queries, up to 14 condensed sources total).
+ * - medium: up to 2 sequential rounds (2 queries per round, gap check in
+ *           between), up to 8 condensed sources total.
+ * - high:   up to 4 sequential rounds (2 queries per round, gap check
+ *           between rounds), up to 14 condensed sources total.
  */
 export type EffortLevel = "low" | "medium" | "high";
 
 export type EffortConfig = {
-  /** Number of retrieval rounds (0 = direct answer, 1 = single pass, 2 = gap-checked). */
-  rounds: 0 | 1 | 2;
-  /** Max search queries generated in Round 1. */
+  /** Max sequential retrieval rounds (0 = direct answer). Later rounds only run if the gap check asks for more. */
+  rounds: number;
+  /** Max search queries generated in Round 1 (bounds parallel searches in that round). */
   queriesPerRound: number;
-  /** Max follow-up search queries generated in Round 2 (when rounds === 2). */
+  /** Max follow-up search queries generated per gap check (bounds parallel searches in later rounds). */
   followUpQueries: number;
   /** Number of Exa search results requested per query. */
   resultsPerQuery: number;
   /** Total cap on unique URLs condensed across all rounds. */
   maxSources: number;
-  /** Cap on unique URLs condensed in Round 1 (leaves room for Round 2). */
-  round1MaxSources: number;
+  /** Cap on unique URLs condensed in any single round. */
+  sourcesPerRound: number;
 };
 
 const EFFORT_CONFIG: Record<EffortLevel, EffortConfig> = {
@@ -36,23 +40,23 @@ const EFFORT_CONFIG: Record<EffortLevel, EffortConfig> = {
     followUpQueries: 0,
     resultsPerQuery: 0,
     maxSources: 0,
-    round1MaxSources: 0,
+    sourcesPerRound: 0,
   },
   medium: {
-    rounds: 1,
-    queriesPerRound: 4,
-    followUpQueries: 0,
+    rounds: 2,
+    queriesPerRound: 2,
+    followUpQueries: 2,
     resultsPerQuery: 4,
     maxSources: 8,
-    round1MaxSources: 8,
+    sourcesPerRound: 4,
   },
   high: {
-    rounds: 2,
-    queriesPerRound: 5,
-    followUpQueries: 4,
+    rounds: 4,
+    queriesPerRound: 2,
+    followUpQueries: 2,
     resultsPerQuery: 4,
     maxSources: 14,
-    round1MaxSources: 8,
+    sourcesPerRound: 4,
   },
 };
 
@@ -64,8 +68,8 @@ export const EFFORT_OPTIONS: {
   hint: string;
 }[] = [
   { id: "low", label: "Low", hint: "No web search — answer directly" },
-  { id: "medium", label: "Medium", hint: "Balanced research (default)" },
-  { id: "high", label: "High", hint: "Two-pass deep research" },
+  { id: "medium", label: "Medium", hint: "Up to 2 sequential research rounds (default)" },
+  { id: "high", label: "High", hint: "Up to 4 sequential deep-research rounds" },
 ];
 
 function isValidEffort(value: unknown): value is EffortLevel {

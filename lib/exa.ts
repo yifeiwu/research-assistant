@@ -12,8 +12,9 @@ const BASE_BACKOFF_MS = serverConfig.exa.baseBackoffMs;
 const MAX_BACKOFF_MS = serverConfig.exa.maxBackoffMs;
 
 /**
- * Per-request Exa concurrency cap. With Exa's 10 req/s global limit and up to
- * 2 concurrent users, 4 concurrent calls per user keeps peak burst at <= 8 req/s.
+ * Per-request Exa concurrency cap. Research rounds run at most 2 queries, so
+ * 2 concurrent calls per request keeps a single request's burst low against
+ * Exa's 10 req/s global limit even with several concurrent users.
  */
 const EXA_CONCURRENCY_PER_REQUEST =
   serverConfig.exa.concurrencyPerRequest;
@@ -34,7 +35,7 @@ type RawExaResult = {
 };
 
 /** Bound async work to at most `limit` in-flight promises at once. */
-export function createConcurrencyLimiter(
+function createConcurrencyLimiter(
   limit: number,
 ): <T>(fn: () => Promise<T>) => Promise<T> {
   const cap = Math.max(1, Math.floor(limit));

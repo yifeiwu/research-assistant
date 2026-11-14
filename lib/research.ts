@@ -14,6 +14,7 @@ import { condenseSourcesDetailed, stripThinking } from "./pipeline";
 import { buildGapCheckPrompt, buildQueryPlanPrompt } from "./prompts";
 import { extractUrls, normalizeUrlKey } from "./sources";
 import { serverConfig } from "./config";
+import { estimateTokens, truncateToTokenBudget } from "./tokens";
 import type {
   Condenser,
   Planner,
@@ -283,66 +284,96 @@ export async function runResearchPipeline(opts: {
     return { searched: false, evidenceBlock: "", totalSources: 0, sources: [] };
   }
 
-  // --- Round 1: Parallel Exa search + explicit URL fetch ---
-  emitStep(round1Id, { round: 1, phase: "searching", queries: round1Queries, sources: [] });
+  // --- Sequential retrieval rounds ---
+  // Each round runs at most `queriesPerRound` / `followUpQueries` searches in
+  // parallel (further bounded by the Exa client's per-request concurrency
+  // cap); depth comes from looping — a gap check over all notes so far
+  // decides whether another, narrower round is worth running — rather than
+  // widening any single round's parallel burst.
+  const allQueries: string[] = [];
+  let nextQueries = round1Queries;
 
-  const [explicitOutcome, ...searchOutcomes] = await Promise.all([
-    explicitUrls.length > 0
-      ? search.fetchContents(explicitUrls, { signal, requestId })
-      : Promise.resolve<{ docs: ExaDocument[]; error?: string }>({ docs: [] }),
-    ...round1Queries.map((q) => search.search(q, effort.resultsPerQuery, { signal, requestId })),
-  ]);
-  if (explicitOutcome.error) failedContents = true;
-  // Exa can succeed overall yet return fewer documents than requested URLs;
-  // that partial loss is degraded too, not just a whole-fetch error.
-  if (explicitUrls.length > 0 && explicitOutcome.docs.length < explicitUrls.length) {
-    failedContents = true;
-  }
-  searchOutcomes.forEach((outcome, i) => {
-    if (outcome.error) failedQueries.push(round1Queries[i]);
-  });
+  for (let round = 1; round <= effort.rounds; round++) {
+    const roundId = `research-r${round}-${requestId}`;
+    const queries = nextQueries;
+    allQueries.push(...queries);
+    emitStep(roundId, { round, phase: "searching", queries, sources: [] });
 
-  const round1Docs = selectDeduplicatedDocs(
-    explicitOutcome.docs,
-    searchOutcomes.map((o) => o.docs),
-    seenUrlKeys,
-    effort.round1MaxSources,
-  );
-
-  if (round1Docs.length === 0) {
-    emitStep(round1Id, {
-      round: 1,
-      phase: "error",
-      queries: round1Queries,
-      sources: [],
-      error: "No web sources could be retrieved for these queries.",
-      degraded: currentDegraded(),
+    // Explicit URLs are fetched once, alongside Round 1's searches.
+    const [explicitOutcome, ...searchOutcomes] = await Promise.all([
+      round === 1 && explicitUrls.length > 0
+        ? search.fetchContents(explicitUrls, { signal, requestId })
+        : Promise.resolve<{ docs: ExaDocument[]; error?: string }>({ docs: [] }),
+      ...queries.map((q) => search.search(q, effort.resultsPerQuery, { signal, requestId })),
+    ]);
+    if (round === 1) {
+      if (explicitOutcome.error) failedContents = true;
+      // Exa can succeed overall yet return fewer documents than requested
+      // URLs; that partial loss is degraded too, not just a whole-fetch error.
+      if (explicitUrls.length > 0 && explicitOutcome.docs.length < explicitUrls.length) {
+        failedContents = true;
+      }
+    }
+    searchOutcomes.forEach((outcome, i) => {
+      if (outcome.error) failedQueries.push(queries[i]);
     });
-    return { searched: false, searchFailed: true, evidenceBlock: "", totalSources: 0, sources: [], degraded: currentDegraded() };
-  }
 
-  const round1Sources = round1Docs.map(toResearchSource);
-  allSources.push(...round1Sources);
-  emitSources(round1Docs);
+    const roundDocs = selectDeduplicatedDocs(
+      round === 1 ? explicitOutcome.docs : [],
+      searchOutcomes.map((o) => o.docs),
+      seenUrlKeys,
+      Math.min(effort.sourcesPerRound, effort.maxSources - totalSources),
+    );
 
-  // --- Round 1: Map condense ---
-  emitStep(round1Id, { round: 1, phase: "reading", queries: round1Queries, sources: round1Sources });
+    if (roundDocs.length === 0) {
+      if (round === 1) {
+        emitStep(roundId, {
+          round,
+          phase: "error",
+          queries,
+          sources: [],
+          error: "No web sources could be retrieved for these queries.",
+          degraded: currentDegraded(),
+        });
+        return { searched: false, searchFailed: true, evidenceBlock: "", totalSources: 0, sources: [], degraded: currentDegraded() };
+      }
+      emitStep(roundId, {
+        round,
+        phase: "done",
+        queries,
+        sources: [],
+        notes: "_Follow-up queries did not surface any additional unseen sources._",
+        degraded: currentDegraded(),
+      });
+      break;
+    }
 
-  const round1Condensed = await condenser.condense(round1Docs, { query, signal, requestId });
-  fallbackSources += round1Condensed.fallbackCount;
-  allNotes.push(...round1Condensed.notes);
-  totalSources += round1Docs.length;
-  const round1NotesText = round1Condensed.notes.join("\n\n");
+    const roundSources = roundDocs.map(toResearchSource);
+    allSources.push(...roundSources);
+    emitSources(roundDocs);
 
-  // --- Optional Round 2 (High effort): Gap Check + Follow-up retrieval ---
-  const remainingBudget = effort.maxSources - totalSources;
-  if (effort.rounds >= 2 && effort.followUpQueries > 0 && remainingBudget > 0) {
-    emitStep(round1Id, {
-      round: 1,
+    // --- Map condense (one batched summarizer call per round) ---
+    emitStep(roundId, { round, phase: "reading", queries, sources: roundSources });
+
+    const condensed = await condenser.condense(roundDocs, { query, signal, requestId });
+    fallbackSources += condensed.fallbackCount;
+    allNotes.push(...condensed.notes);
+    totalSources += roundDocs.length;
+    const notesText = condensed.notes.join("\n\n");
+
+    const isLastRound = round >= effort.rounds || totalSources >= effort.maxSources;
+    if (isLastRound || effort.followUpQueries <= 0) {
+      emitStep(roundId, { round, phase: "done", queries, sources: roundSources, notes: notesText, degraded: currentDegraded() });
+      break;
+    }
+
+    // --- Gap check: is another, narrower round needed? ---
+    emitStep(roundId, {
+      round,
       phase: "checking-gaps",
-      queries: round1Queries,
-      sources: round1Sources,
-      notes: round1NotesText,
+      queries,
+      sources: roundSources,
+      notes: notesText,
       degraded: currentDegraded(),
     });
 
@@ -350,88 +381,63 @@ export async function runResearchPipeline(opts: {
     try {
       const parsedGap = await planner.planFollowUps({
         query,
-        priorQueries: round1Queries,
-        notes: round1NotesText,
+        priorQueries: allQueries,
+        notes: truncateToTokenBudget(allNotes.join("\n\n"), serverConfig.synthesis.evidenceTokenBudget),
         maxQueries: effort.followUpQueries,
         signal,
         requestId,
       });
       if (!parsedGap.stopped) {
-        const priorSet = new Set(round1Queries.map((q) => q.toLowerCase()));
+        const priorSet = new Set(allQueries.map((q) => q.toLowerCase()));
         followUpQueries = parsedGap.queries.filter((q) => !priorSet.has(q.toLowerCase()));
       }
     } catch (error) {
       if (isAbortError(error) || signal?.aborted) throw error;
       logError("gap-check", error, { requestId });
-      failedStages.push("the gap check could not be completed");
-    }
-
-    emitStep(round1Id, {
-      round: 1,
-      phase: "done",
-      queries: round1Queries,
-      sources: round1Sources,
-      notes: round1NotesText,
-      degraded: currentDegraded(),
-    });
-
-    logDebug("gap-check", { requestId, followUpQueries });
-
-    if (followUpQueries.length > 0) {
-      const round2Id = `research-r2-${requestId}`;
-      emitStep(round2Id, { round: 2, phase: "searching", queries: followUpQueries, sources: [] });
-
-      const round2Outcomes = await Promise.all(
-        followUpQueries.map((q) => search.search(q, effort.resultsPerQuery, { signal, requestId })),
-      );
-      round2Outcomes.forEach((outcome, i) => {
-        if (outcome.error) failedQueries.push(followUpQueries[i]);
-      });
-
-      const round2Docs = selectDeduplicatedDocs([], round2Outcomes.map((o) => o.docs), seenUrlKeys, remainingBudget);
-
-      if (round2Docs.length > 0) {
-        const round2Sources = round2Docs.map(toResearchSource);
-        allSources.push(...round2Sources);
-        emitSources(round2Docs);
-        emitStep(round2Id, { round: 2, phase: "reading", queries: followUpQueries, sources: round2Sources });
-
-        const round2Condensed = await condenser.condense(round2Docs, { query, signal, requestId });
-        fallbackSources += round2Condensed.fallbackCount;
-        allNotes.push(...round2Condensed.notes);
-        totalSources += round2Docs.length;
-
-        emitStep(round2Id, {
-          round: 2,
-          phase: "done",
-          queries: followUpQueries,
-          sources: round2Sources,
-          notes: round2Condensed.notes.join("\n\n"),
-          degraded: currentDegraded(),
-        });
-      } else {
-        emitStep(round2Id, {
-          round: 2,
-          phase: "done",
-          queries: followUpQueries,
-          sources: [],
-          notes: "_Follow-up queries did not surface any additional unseen sources._",
-          degraded: currentDegraded(),
-        });
+      if (!failedStages.includes("the gap check could not be completed")) {
+        failedStages.push("the gap check could not be completed");
       }
     }
-  } else {
-    emitStep(round1Id, {
-      round: 1,
-      phase: "done",
-      queries: round1Queries,
-      sources: round1Sources,
-      notes: round1NotesText,
-      degraded: currentDegraded(),
-    });
+
+    emitStep(roundId, { round, phase: "done", queries, sources: roundSources, notes: notesText, degraded: currentDegraded() });
+    logDebug("gap-check", { requestId, round, followUpQueries });
+
+    if (followUpQueries.length === 0) break;
+    nextQueries = followUpQueries;
   }
 
-  const evidenceBlock = allNotes.map((note, idx) => `[Source ${idx + 1}]\n${note}`).join("\n\n---\n\n");
+  // Assemble the synthesis evidence under a token budget: whole notes are
+  // included in source order until the budget is hit, the note that crosses
+  // it is truncated, and any remaining notes are dropped. Trimming is
+  // disclosed via the degraded channel so synthesis can say evidence was cut.
+  const evidenceBudget = serverConfig.synthesis.evidenceTokenBudget;
+  const evidenceParts: string[] = [];
+  let usedTokens = 0;
+  let trimmedNotes = 0;
+  for (const [idx, note] of allNotes.entries()) {
+    const part = `[Source ${idx + 1}]\n${note}`;
+    const partTokens = estimateTokens(part);
+    if (usedTokens + partTokens <= evidenceBudget) {
+      evidenceParts.push(part);
+      usedTokens += partTokens;
+      continue;
+    }
+    const remaining = evidenceBudget - usedTokens;
+    if (remaining >= 100) {
+      evidenceParts.push(
+        `${truncateToTokenBudget(part, remaining)}\n[Note trimmed to fit the answer token budget]`,
+      );
+    }
+    // Every note from `idx` onward was truncated or dropped entirely.
+    trimmedNotes = allNotes.length - idx;
+    break;
+  }
+  if (trimmedNotes > 0) {
+    failedStages.push(
+      `${trimmedNotes} research ${trimmedNotes === 1 ? "note was" : "notes were"} trimmed or omitted to fit the answer token budget`,
+    );
+  }
+  const evidenceBlock = evidenceParts.join("\n\n---\n\n");
   return {
     searched: true,
     evidenceBlock,

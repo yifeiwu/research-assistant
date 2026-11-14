@@ -12,9 +12,24 @@ function stripTrailingPunctuation(url: string): string {
   return url.replace(/[.,;:!?)\]}'"]+$/, "");
 }
 
-/** Canonical comparison key for URL deduplication (strips trailing slashes). */
+/**
+ * Canonical comparison key for URL deduplication: lowercases/strips `www.`
+ * from the host, drops the fragment and trailing path slashes, and removes
+ * sentence punctuation stuck to the end, so `https://www.A.com/x/#f` and
+ * `https://a.com/x` dedupe to the same source. Falls back to a plain string
+ * cleanup for unparseable values.
+ */
 export function normalizeUrlKey(url: string): string {
-  return stripTrailingPunctuation(url.trim()).replace(/\/+$/, "");
+  const cleaned = stripTrailingPunctuation(url.trim());
+  try {
+    const parsed = new URL(cleaned);
+    parsed.hostname = parsed.hostname.replace(/^www\./i, "").toLowerCase();
+    parsed.hash = "";
+    const path = parsed.pathname.replace(/\/+$/, "") || "/";
+    return `${parsed.protocol}//${parsed.hostname}${parsed.port ? `:${parsed.port}` : ""}${path}${parsed.search}`;
+  } catch {
+    return cleaned.replace(/\/+$/, "");
+  }
 }
 
 export function extractUrls(text: string): string[] {
@@ -22,19 +37,6 @@ export function extractUrls(text: string): string[] {
   return matches.map(stripTrailingPunctuation).filter(Boolean);
 }
 
-/** Dedupe URLs, treating trailing slashes as equivalent; preserves order. */
-export function dedupeUrls(urls: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const url of urls) {
-    const key = normalizeUrlKey(url);
-    if (key && !seen.has(key)) {
-      seen.add(key);
-      out.push(url);
-    }
-  }
-  return out;
-}
 
 export function domainOf(url: string): string {
   try {

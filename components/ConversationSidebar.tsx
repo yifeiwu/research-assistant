@@ -2,7 +2,7 @@
 
 import { MessageSquarePlus, Settings2, Trash2, X } from "lucide-react";
 import type { Conversation } from "@/lib/conversations";
-import { currentModelLabel, type ProviderSettings } from "@/lib/provider";
+import { currentModelLabel, type AppSettings } from "@/lib/settings";
 
 export function ConversationSidebar({
   conversations,
@@ -18,7 +18,7 @@ export function ConversationSidebar({
   conversations: Conversation[];
   activeId: string | null;
   open: boolean;
-  settings: ProviderSettings;
+  settings: AppSettings;
   onSelect: (id: string) => void;
   onNewChat: () => void;
   onDelete: (id: string) => void;
@@ -135,7 +135,7 @@ export function ConversationSidebar({
           >
             <Settings2 className="h-4 w-4 shrink-0" aria-hidden />
             <span className="flex min-w-0 flex-col">
-              <span className="text-xs text-muted">Model &amp; provider</span>
+              <span className="text-xs text-muted">Model</span>
               <span className="truncate text-foreground">
                 {currentModelLabel(settings)}
               </span>

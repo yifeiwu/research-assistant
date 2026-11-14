@@ -20,8 +20,18 @@ function currentDateLine(): string {
   return `Today's date is ${today} (UTC).`;
 }
 
-/** Prompt used when no web search runs (`low` effort or `NO_SEARCH`). */
-export function buildDirectAnswerPrompt(): string {
+/** Prompt used when no web search runs (`low` effort or `NO_SEARCH`), and as
+ * the fallback when search was attempted but retrieved nothing — in which
+ * case `searchFailed`/`degraded` force an explicit disclosure. */
+export function buildDirectAnswerPrompt(
+  degraded?: import("./types/chat").DegradedResearch,
+  searchFailed?: boolean,
+): string {
+  const failureLine = searchFailed
+    ? `\n- Web research was attempted but no sources could be retrieved${degraded ? ` (${degraded.messages.join("; ")})` : ""}. Begin by briefly disclosing that web research failed and this answer is based on your own knowledge only, which may be out of date. Do not answer with false confidence about recent or specific facts.`
+    : degraded
+      ? `\n- Research was partially degraded (${degraded.messages.join("; ")}). Disclose that some evidence could not be retrieved.`
+      : "";
   return `${currentDateLine()}
 
 You are a knowledgeable assistant.
@@ -30,7 +40,7 @@ Answer the user's question directly and concisely using your own knowledge.
 
 Guidelines:
 - Be concise and well-structured. Use markdown (headings, lists) where it helps readability.
-- If the question depends on recent events, live prices, or specifics you're not confident about, say so honestly rather than guessing.`;
+- If the question depends on recent events, live prices, or specifics you're not confident about, say so honestly rather than guessing.${failureLine}`;
 }
 
 /**
@@ -75,7 +85,13 @@ DONE
  * Stage 4 (reduce) prompt: synthesizes the pre-fetched, condensed research
  * notes into a grounded, inline-cited final answer.
  */
-export function buildSynthesisPrompt(evidenceBlock: string): string {
+export function buildSynthesisPrompt(
+  evidenceBlock: string,
+  degraded?: import("./types/chat").DegradedResearch,
+): string {
+  const degradedLine = degraded
+    ? `\n- Research was partially degraded (${degraded.messages.join("; ")}). Disclose in your answer that some evidence could not be retrieved and may be incomplete rather than answering with false confidence.`
+    : "";
   return `${currentDateLine()}
 
 You are a meticulous web research assistant.
@@ -88,7 +104,7 @@ Guidelines:
 - Cite sources inline using markdown links — e.g. [Source Name](https://example.com/...) — using ONLY the exact URLs provided in the research notes. Never invent URLs.
 - End your answer with a compact "Sources" section listing the markdown links you relied on.
 - If the research notes do not fully answer part of the question or conflict with each other, state that transparently rather than guessing.
-- Be concise, direct, and well-structured with markdown headings/lists where helpful.
+- Be concise, direct, and well-structured with markdown headings/lists where helpful.${degradedLine}
 
 === RESEARCH NOTES ===
 ${evidenceBlock}

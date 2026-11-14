@@ -3,10 +3,12 @@ import type { GroqProviderOptions } from "@ai-sdk/groq";
 import { after } from "next/server";
 import { effortConfig } from "@/lib/effort";
 import { chatRequestSchema } from "@/lib/types/chat";
-import { latestUserText, pruneToolHistory } from "@/lib/messages";
+import { latestUserText, pruneAssistantHistory } from "@/lib/messages";
 import { buildDirectAnswerPrompt, buildSynthesisPrompt } from "@/lib/prompts";
 import { logInfo, logError } from "@/lib/logger";
 import { resolveModels, isResolutionError } from "@/lib/agent/models";
+import { serverConfig } from "@/lib/config";
+import type { Synthesizer } from "@/lib/ports";
 import { createPipelineStreamResponse } from "@/lib/agent/stream";
 import { runResearchPipeline } from "@/lib/research";
 import {
@@ -50,7 +52,7 @@ export async function POST(req: Request) {
     );
   }
 
-  const { model, provider, effort: rawEffort, id: rawChatId } = parsed.data;
+  const { model, effort: rawEffort, id: rawChatId } = parsed.data;
   const messages = parsed.data.messages as unknown as UIMessage[];
   const chatId = rawChatId && isChatId(rawChatId) ? rawChatId : undefined;
 
@@ -62,14 +64,15 @@ export async function POST(req: Request) {
     );
   }
 
-  const resolved = resolveModels({ model, provider });
+  const resolved = resolveModels({ model });
   if (isResolutionError(resolved)) {
     return Response.json(
       { error: resolved.error },
       { status: resolved.status },
     );
   }
-  const { mainModel, summaryModel, modelInfo, supportsReasoning } = resolved;
+  const { mainModel, summaryModel, summaryModelId, modelInfo, supportsReasoning } =
+    resolved;
 
   const requestId = crypto.randomUUID().slice(0, 8);
   const query = latestUserText(messages);
@@ -79,7 +82,7 @@ export async function POST(req: Request) {
   // payloads fail cleanly with 400 rather than leaving an empty active run.
   let modelMessages: Awaited<ReturnType<typeof convertToModelMessages>>;
   try {
-    modelMessages = await convertToModelMessages(pruneToolHistory(messages));
+    modelMessages = await convertToModelMessages(pruneAssistantHistory(messages));
   } catch (error) {
     logError("convert-messages", error, { requestId, chatId });
     return Response.json(
@@ -114,6 +117,7 @@ export async function POST(req: Request) {
   }
 
   const signal = streamHandle?.abortSignal;
+  let allowedSources: import("@/lib/types/chat").ResearchSource[] = [];
 
   try {
     return createPipelineStreamResponse(
@@ -128,20 +132,22 @@ export async function POST(req: Request) {
           effort,
           mainModel,
           summaryModel,
+          summaryModelId,
           supportsReasoning,
           writer,
           signal,
           requestId,
         });
 
-        const system = outcome.searched
-          ? buildSynthesisPrompt(outcome.evidenceBlock)
-          : buildDirectAnswerPrompt();
-
-        return streamText({
-          model: mainModel,
-          system,
-          messages: modelMessages,
+        allowedSources = outcome.sources;
+        const synthesizer: Synthesizer = {
+          synthesize: (input) =>
+            streamText({
+              model: mainModel,
+              system: input.searched
+                ? buildSynthesisPrompt(input.evidenceBlock, input.degraded)
+                : buildDirectAnswerPrompt(input.degraded, input.searchFailed),
+              messages: modelMessages,
           providerOptions: supportsReasoning
             ? {
                 groq: {
@@ -149,7 +155,10 @@ export async function POST(req: Request) {
                 } satisfies GroqProviderOptions,
               }
             : undefined,
-          timeout: { totalMs: 180_000, stepMs: 120_000 },
+          timeout: {
+            totalMs: serverConfig.synthesis.totalTimeoutMs,
+            stepMs: serverConfig.synthesis.stepTimeoutMs,
+          },
           abortSignal: signal,
           onAbort: () => {
             logInfo("abort", { requestId, model: modelInfo });
@@ -157,18 +166,25 @@ export async function POST(req: Request) {
           onError: ({ error }) => {
             logError("streamText", error, { requestId, model: modelInfo });
           },
-          onFinish: ({ finishReason, usage }) => {
-            logInfo("finish", {
-              requestId,
-              finishReason,
-              searched: outcome.searched,
-              sources: outcome.totalSources,
-              usage,
-            });
-          },
-        });
+              onFinish: ({ finishReason, usage }) => {
+                logInfo("finish", {
+                  requestId,
+                  finishReason,
+                  searched: outcome.searched,
+                  sources: outcome.totalSources,
+                  usage,
+                });
+              },
+            }),
+        };
+        return synthesizer.synthesize({
+          evidenceBlock: outcome.evidenceBlock,
+          degraded: outcome.degraded,
+          searched: outcome.searched,
+          searchFailed: outcome.searchFailed,
+        }) as ReturnType<typeof streamText>;
       },
-      { requestId, modelInfo, signal },
+      { requestId, modelInfo, signal, getAllowedSources: () => allowedSources },
       streamHandle
         ? {
             consumeSseStream: ({ stream }) => {

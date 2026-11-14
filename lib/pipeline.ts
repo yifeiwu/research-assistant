@@ -2,19 +2,13 @@ import "server-only";
 import { generateText, type LanguageModel } from "ai";
 import { createConcurrencyLimiter, type ExaDocument } from "./exa";
 import { logDebug, logError } from "./logger";
+import { serverConfig } from "./config";
+import { normalizeCacheText, requestCache, type RequestCache } from "./cache";
 
-// Short excerpts pass through untouched without spending a summarizer call.
-const PASSTHROUGH_CHAR_LIMIT = 1_500;
-
-// Cap the content handed to the summarizer so the map step stays well within
-// free-tier context / tokens-per-minute limits.
-const SUMMARY_INPUT_CHAR_CAP = 16_000;
-
-// Hard cap used as a fallback when the summarizer call fails or times out.
-const FALLBACK_CHAR_CAP = 4_000;
-
-// Concurrent map summarizations per request.
-const SUMMARY_CONCURRENCY = 4;
+const PASSTHROUGH_CHAR_LIMIT = serverConfig.summary.passthroughCharLimit;
+const SUMMARY_INPUT_CHAR_CAP = serverConfig.summary.inputCharCap;
+const FALLBACK_CHAR_CAP = serverConfig.summary.fallbackCharCap;
+const SUMMARY_CONCURRENCY = serverConfig.summary.concurrency;
 
 /**
  * Strip inline `<think>...</think>` blocks emitted by open-weight reasoning
@@ -29,9 +23,7 @@ export function stripThinking(text: string): string {
 
 function formatSourceHeader(doc: ExaDocument): string {
   const lines = [`### ${doc.title ?? doc.url}`, `URL: ${doc.url}`];
-  if (doc.publishedDate) {
-    lines.push(`Published: ${doc.publishedDate}`);
-  }
+  if (doc.publishedDate) lines.push(`Published: ${doc.publishedDate}`);
   return lines.join("\n");
 }
 
@@ -52,82 +44,89 @@ Rules:
 - Output plain text bullet points only. Do not call tools or wrap output in JSON.
 - If the content is not relevant to the question, say so in one line.`;
 
-/**
- * The "map" step: condense a single retrieved web document into compact,
- * source-attributed research notes with a canonical URL header preserved.
- */
-export async function condenseSource(
+type CondenseSourceOutcome = { note: string; usedFallback: boolean };
+
+export type CondenseOpts = {
+  model: LanguageModel;
+  query: string;
+  signal?: AbortSignal;
+  requestId?: string;
+  modelId?: string;
+  cache?: RequestCache;
+  disableCache?: boolean;
+};
+
+/** The "map" step for a single document, reporting fallback use. */
+async function condenseSourceDetailed(
   doc: ExaDocument,
-  opts: {
-    model: LanguageModel;
-    query: string;
-    signal?: AbortSignal;
-    requestId?: string;
-  },
-): Promise<string> {
+  opts: CondenseOpts,
+): Promise<CondenseSourceOutcome> {
   const header = formatSourceHeader(doc);
   const rawBody = doc.text.trim();
-
   if (!rawBody) {
-    return `${header}\n- (No extractable page text returned.)`;
+    return { note: `${header}\n- (No extractable page text returned.)`, usedFallback: true };
   }
-
   if (rawBody.length <= PASSTHROUGH_CHAR_LIMIT) {
-    return `${header}\n${rawBody}`;
+    return { note: `${header}\n${rawBody}`, usedFallback: false };
   }
 
   const input = rawBody.slice(0, SUMMARY_INPUT_CHAR_CAP);
-
+  const cache = opts.cache ?? requestCache;
   try {
-    const { text } = await generateText({
-      model: opts.model,
-      system: SUMMARY_SYSTEM_PROMPT,
-      maxOutputTokens: 700,
-      abortSignal: opts.signal,
-      timeout: { totalMs: 25_000 },
-      maxRetries: 1,
-      prompt: `Research question:\n${opts.query || "(not provided)"}\n\nSource: ${doc.title ?? doc.url}\nURL: ${doc.url}\n\nWeb content to condense:\n"""\n${input}\n"""\n\nWrite concise research notes (bullet points). Attribute claims to the source, distinguish fact from opinion, and flag any reliability concerns.`,
-    });
-
-    const cleaned = stripThinking(text);
-    if (cleaned.length > 0) {
-      logDebug("summarize", {
-        requestId: opts.requestId,
+    const cleaned = await cache.wrap(
+      "notes",
+      {
         url: doc.url,
-        rawChars: rawBody.length,
-        notesChars: cleaned.length,
-      });
-      return `${header}\n${cleaned}`;
-    }
-
-    return `${header}\n${input.slice(0, FALLBACK_CHAR_CAP)}`;
+        content: input,
+        q: normalizeCacheText(opts.query),
+        model: opts.modelId ?? "summary",
+      },
+      serverConfig.cache.notesTtlSeconds,
+      async () => {
+        const { text } = await generateText({
+          model: opts.model,
+          system: SUMMARY_SYSTEM_PROMPT,
+          maxOutputTokens: serverConfig.summary.maxOutputTokens,
+          // Signal-free loader (shared/coalesced via the cache); the caller's
+          // own signal is passed to `wrap` below and only detaches this caller.
+          timeout: { totalMs: serverConfig.summary.timeoutMs },
+          maxRetries: 1,
+          prompt: `Research question:\n${opts.query || "(not provided)"}\n\nSource: ${doc.title ?? doc.url}\nURL: ${doc.url}\n\nWeb content to condense:\n"""\n${input}\n"""\n\nWrite concise research notes (bullet points). Attribute claims to the source, distinguish fact from opinion, and flag any reliability concerns.`,
+        });
+        const value = stripThinking(text);
+        if (!value) throw new Error("Summarizer returned empty notes");
+        return value;
+      },
+      { bypass: opts.disableCache, requestId: opts.requestId, signal: opts.signal },
+    );
+    logDebug("summarize", {
+      requestId: opts.requestId,
+      url: doc.url,
+      rawChars: rawBody.length,
+      notesChars: cleaned.length,
+    });
+    return { note: `${header}\n${cleaned}`, usedFallback: false };
   } catch (error) {
     if (isAbortError(error) || opts.signal?.aborted) {
       throw new DOMException("The operation was aborted.", "AbortError");
     }
     logError("summarize", error, { requestId: opts.requestId, url: doc.url });
-    return `${header}\n${input.slice(0, FALLBACK_CHAR_CAP)}`;
+    return { note: `${header}\n${input.slice(0, FALLBACK_CHAR_CAP)}`, usedFallback: true };
   }
 }
 
-/**
- * Condense multiple retrieved sources concurrently (bounded to 4 at a time so
- * free-tier TPM limits aren't stampeded while keeping latency low).
- */
-export async function condenseSources(
+export type CondenseSourcesOutcome = { notes: string[]; fallbackCount: number };
+
+export async function condenseSourcesDetailed(
   docs: ExaDocument[],
-  opts: {
-    model: LanguageModel;
-    query: string;
-    signal?: AbortSignal;
-    requestId?: string;
-    concurrency?: number;
-  },
-): Promise<string[]> {
-  const limit = createConcurrencyLimiter(
-    opts.concurrency ?? SUMMARY_CONCURRENCY,
+  opts: CondenseOpts & { concurrency?: number },
+): Promise<CondenseSourcesOutcome> {
+  const limit = createConcurrencyLimiter(opts.concurrency ?? SUMMARY_CONCURRENCY);
+  const outcomes = await Promise.all(
+    docs.map((doc) => limit(() => condenseSourceDetailed(doc, opts))),
   );
-  return Promise.all(
-    docs.map((doc) => limit(() => condenseSource(doc, opts))),
-  );
+  return {
+    notes: outcomes.map((o) => o.note),
+    fallbackCount: outcomes.filter((o) => o.usedFallback).length,
+  };
 }

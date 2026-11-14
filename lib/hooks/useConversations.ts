@@ -27,7 +27,7 @@ type UseConversationsArgs = {
   messages: UIMessage[];
   setMessages: (messages: UIMessage[]) => void;
   isBusy: boolean;
-  stoppedChatIdRef: React.RefObject<string | null>;
+  isStopped: (id: string) => boolean;
   /** Detach the client fetch/reconnect stream without cancelling server Redis generation. */
   detach: () => void;
   /** Explicitly cancel server-side generation for a thread (e.g. on delete). */
@@ -59,7 +59,8 @@ type BackgroundPollResult =
   | { state: "running" }
   | { state: "empty" }
   | { state: "retry" }
-  | { state: "done"; assistantMessage: UIMessage };
+  | { state: "done"; assistantMessage: UIMessage }
+  | { state: "stale"; assistantMessage: UIMessage };
 
 /**
  * Non-blocking check for a background `pending` thread (`?onlyDone=1`).
@@ -79,6 +80,7 @@ async function pollBackgroundConversation(
   if (response.status === 202) return { state: "running" };
   if (response.status === 204) return { state: "empty" };
   if (!response.ok || !response.body) return { state: "retry" };
+  const isStale = response.headers.get("x-chat-stream-stale") === "1";
 
   const chunkStream = parseJsonEventStream({
     stream: response.body,
@@ -99,9 +101,10 @@ async function pollBackgroundConversation(
     assistantMessage = msg;
   }
 
-  return assistantMessage
-    ? { state: "done", assistantMessage }
-    : { state: "empty" };
+  if (!assistantMessage) return { state: "empty" };
+  return isStale
+    ? { state: "stale", assistantMessage }
+    : { state: "done", assistantMessage };
 }
 
 /**
@@ -115,7 +118,7 @@ export function useConversations({
   messages,
   setMessages,
   isBusy,
-  stoppedChatIdRef,
+  isStopped,
   detach,
   stopServer,
 }: UseConversationsArgs): UseConversations {
@@ -208,7 +211,7 @@ export function useConversations({
     if (!isSeeded || !isBusy || messages.length === 0) return;
 
     const id = chatIdRef.current;
-    if (stoppedChatIdRef.current === id) return;
+    if (isStopped(id)) return;
     const last = messages[messages.length - 1];
     const promptMessages =
       last?.role === "assistant" ? messages.slice(0, -1) : messages;
@@ -253,7 +256,7 @@ export function useConversations({
       conversationsRef.current = next;
       return next;
     });
-  }, [isSeeded, isBusy, messages]);
+  }, [isSeeded, isBusy, messages, isStopped]);
 
   const settleConversation = useCallback(
     (id: string, finalMessages?: UIMessage[]) => {
@@ -327,13 +330,29 @@ export function useConversations({
             );
             if (!latest?.pending) return;
 
-            if (res.state === "done") {
+            if (res.state === "done" || res.state === "stale") {
               const last = latest.messages[latest.messages.length - 1];
               const base =
                 last?.role === "assistant"
                   ? latest.messages.slice(0, -1)
                   : latest.messages;
-              settleConversation(conv.id, [...base, res.assistantMessage]);
+              // A stale run's producer died mid-answer: keep the partial text
+              // but disclose the interruption instead of presenting a
+              // truncated answer as complete.
+              const collected =
+                res.state === "stale"
+                  ? {
+                      ...res.assistantMessage,
+                      parts: [
+                        ...res.assistantMessage.parts,
+                        {
+                          type: "text" as const,
+                          text: "\n\n_This response was interrupted before it finished, so it may be incomplete._",
+                        },
+                      ],
+                    }
+                  : res.assistantMessage;
+              settleConversation(conv.id, [...base, collected]);
             } else if (res.state === "empty") {
               settleConversation(conv.id);
             }

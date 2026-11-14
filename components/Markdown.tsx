@@ -14,11 +14,12 @@ const components: Components = {
       </a>
     );
   },
-  // Wrap tables so wide ones scroll horizontally instead of overflowing the
-  // viewport (which the body clips on narrow screens).
+  // Tables are sized to the message width in CSS (`table-layout: fixed`
+  // with wrapping cells), so they fit without any horizontal scrolling —
+  // no scroll wrapper is needed here.
   table({ children }) {
     return (
-      <div className="-mx-1 overflow-x-auto">
+      <div className="w-full min-w-0">
         <table>{children}</table>
       </div>
     );

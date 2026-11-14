@@ -12,10 +12,10 @@ export type Conversation = {
   updatedAt: number;
 };
 
-export const CONVERSATIONS_STORAGE_KEY = "web-seek-conversations";
-export const ACTIVE_CONVERSATION_STORAGE_KEY = "web-seek-active-conversation";
+const CONVERSATIONS_STORAGE_KEY = "web-seek-conversations";
+const ACTIVE_CONVERSATION_STORAGE_KEY = "web-seek-active-conversation";
 /** Old single-thread key, migrated into a conversation on first load. */
-export const LEGACY_MESSAGES_STORAGE_KEY = "web-seek-messages";
+const LEGACY_MESSAGES_STORAGE_KEY = "web-seek-messages";
 
 const MAX_TITLE_LENGTH = 60;
 
@@ -23,7 +23,7 @@ const MAX_TITLE_LENGTH = 60;
  * Cap on saved threads. Once exceeded, the least-recently-updated conversations
  * are evicted (LRU) so localStorage doesn't grow without bound.
  */
-export const MAX_CONVERSATIONS = 20;
+const MAX_CONVERSATIONS = 20;
 
 /** Keep only the `MAX_CONVERSATIONS` most recently updated threads. */
 function capConversations(conversations: Conversation[]): Conversation[] {

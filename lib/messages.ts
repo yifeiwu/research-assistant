@@ -33,7 +33,7 @@ export function latestUserText(messages: UIMessage[]): string {
  * token usage low and compatible with every model). Assistant turns that
  * produced no text are dropped entirely.
  */
-export function pruneToolHistory(messages: UIMessage[]): UIMessage[] {
+export function pruneAssistantHistory(messages: UIMessage[]): UIMessage[] {
   const result: UIMessage[] = [];
   for (const message of messages) {
     if (message.role !== "assistant") {

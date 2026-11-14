@@ -36,10 +36,11 @@ export function useResumeOnVisible({
   setMessages,
   resumeStream,
   consumeReconnectOutcome,
-  stoppedChatIdRef,
+  isStopped,
   isSeeded,
   activePending,
   onNothingToResume,
+  onResumeStart,
 }: {
   chatId: string;
   status: ChatStatus;
@@ -47,10 +48,11 @@ export function useResumeOnVisible({
   setMessages: (messages: UIMessage[]) => void;
   resumeStream: () => Promise<void>;
   consumeReconnectOutcome: () => ReconnectOutcome;
-  stoppedChatIdRef: React.RefObject<string | null>;
+  isStopped: (id: string) => boolean;
   isSeeded: boolean;
   activePending: boolean;
   onNothingToResume: (id: string, restoredMessages: UIMessage[]) => void;
+  onResumeStart?: (id: string) => void;
 }): void {
   const chatIdRef = useRef(chatId);
   const statusRef = useRef(status);
@@ -86,7 +88,7 @@ export function useResumeOnVisible({
       inflightRef.current = true;
       return;
     }
-    if (stoppedChatIdRef.current === chatId) {
+    if (isStopped(chatId)) {
       inflightRef.current = false;
       return;
     }
@@ -95,12 +97,12 @@ export function useResumeOnVisible({
       inflightRef.current = false;
     }
     // If the tab is hidden, keep `inflight` so coming back triggers a resume.
-  }, [chatId, status, stoppedChatIdRef]);
+  }, [chatId, status, isStopped]);
 
   const reconnect = useCallback(
     async (targetChatId: string) => {
       if (document.visibilityState !== "visible") return;
-      if (stoppedChatIdRef.current === targetChatId) return;
+      if (isStopped(targetChatId)) return;
       if (chatIdRef.current !== targetChatId) return;
       if (reconnectingChatIdRef.current === targetChatId) return;
 
@@ -115,6 +117,7 @@ export function useResumeOnVisible({
       }
 
       reconnectingChatIdRef.current = targetChatId;
+      onResumeStart?.(targetChatId);
       try {
         await resumeRef.current();
       } finally {
@@ -134,7 +137,7 @@ export function useResumeOnVisible({
         if (hadTrailingAssistant) {
           setMessagesRef.current(snapshot);
         }
-        if (stoppedChatIdRef.current !== targetChatId) {
+        if (!isStopped(targetChatId)) {
           onNothingToResumeRef.current(targetChatId, snapshot);
         }
         inflightRef.current = false;
@@ -155,7 +158,7 @@ export function useResumeOnVisible({
         if (hadTrailingAssistant) {
           setMessagesRef.current(snapshot);
         }
-        if (stoppedChatIdRef.current !== targetChatId) {
+        if (!isStopped(targetChatId)) {
           onNothingToResumeRef.current(targetChatId, snapshot);
         }
         inflightRef.current = false;
@@ -171,7 +174,7 @@ export function useResumeOnVisible({
         inflightRef.current = false;
       }
     },
-    [stoppedChatIdRef],
+    [isStopped, onResumeStart],
   );
 
   // Resume automatically when restoring from reload or selecting a pending
@@ -185,19 +188,19 @@ export function useResumeOnVisible({
     }
     if (!isSeeded) return;
     if (document.visibilityState !== "visible") return;
-    if (stoppedChatIdRef.current === chatId) return;
+    if (isStopped(chatId)) return;
     if (status === "streaming" || status === "submitted") return;
     if (attemptedPendingChatIdRef.current === chatId) return;
 
     attemptedPendingChatIdRef.current = chatId;
     void reconnect(chatId);
-  }, [chatId, isSeeded, activePending, status, stoppedChatIdRef, reconnect]);
+  }, [chatId, isSeeded, activePending, status, isStopped, reconnect]);
 
   // Reconnect when returning to a backgrounded tab or recovering connectivity.
   useEffect(() => {
     function onVisible() {
       if (document.visibilityState !== "visible") return;
-      if (stoppedChatIdRef.current === chatIdRef.current) return;
+      if (isStopped(chatIdRef.current)) return;
       if (!inflightRef.current && !activePendingRef.current) return;
       void reconnect(chatIdRef.current);
     }
@@ -210,5 +213,5 @@ export function useResumeOnVisible({
       window.removeEventListener("focus", onVisible);
       window.removeEventListener("online", onVisible);
     };
-  }, [chatId, stoppedChatIdRef, reconnect]);
+  }, [chatId, isStopped, reconnect]);
 }

@@ -3,6 +3,7 @@
 import { useState } from "react";
 import {
   AlertCircle,
+  AlertTriangle,
   ChevronDown,
   Compass,
   FileText,
@@ -157,9 +158,24 @@ export function ResearchStep({ data }: { data: ResearchStepData }) {
         </span>
       </button>
 
+      {data.degraded && (data.phase === "done" || data.phase === "error") && (
+        <div className="flex items-start gap-1.5 border-t border-border px-3 py-2 text-xs text-amber-300">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+          <span>
+            Some sources couldn&apos;t be retrieved — the answer may be
+            incomplete. ({data.degraded.messages.join("; ")})
+          </span>
+        </div>
+      )}
+
       {open && hasDetails && (
         <div className="max-h-80 space-y-3 overflow-auto border-t border-border px-3 py-2.5 text-xs text-muted">
           {data.error && <div className="text-red-400">{data.error}</div>}
+          {data.degraded && (
+            <div className="text-amber-300">
+              Partial research: {data.degraded.messages.join("; ")}.
+            </div>
+          )}
 
           {data.queries.length > 0 && (
             <div>

@@ -19,6 +19,7 @@ import {
   useResumeOnVisible,
   type ReconnectOutcome,
 } from "@/lib/hooks/useResumeOnVisible";
+import { useTurnMachine } from "@/lib/hooks/turnMachine";
 import { busyLabel, formatDuration } from "@/lib/format";
 import { createConversationId } from "@/lib/conversations";
 
@@ -40,8 +41,12 @@ function findLastUserMessageId(messages: UIMessage[]): string | undefined {
 
 export default function Home() {
   const [chatId, setChatId] = useState(createConversationId);
-  /** Tracks which specific `chatId` the user explicitly clicked Stop on. */
-  const stoppedChatIdRef = useRef<string | null>(null);
+  const turnMachine = useTurnMachine(chatId);
+  const turnDispatch = turnMachine.dispatch;
+  const isStopped = useCallback(
+    (id: string) => turnMachine.stateRef.current.stoppedChatId === id,
+    [turnMachine.stateRef],
+  );
   const settleRef = useRef<(id: string, finalMessages?: UIMessage[]) => void>(
     () => {},
   );
@@ -146,13 +151,15 @@ export default function Home() {
         lastErrorWasNetwork = false;
         lastRequestWasHttpRejection = false;
 
-        if (stoppedChatIdRef.current === instanceId) {
+        if (turnMachine.stateRef.current.stoppedChatId === instanceId) {
+          turnDispatch({ type: "SETTLE", chatId: instanceId });
           settleRef.current(instanceId, finishedMessages);
           return;
         }
         if (isAbort || wasNetworkDrop) {
           // Detached on thread switch or dropped by network: keep `pending: true`
           // so the thread can resume or be collected from Upstash Redis.
+          turnDispatch({ type: "FINISH_DETACHED", chatId: instanceId });
           return;
         }
         if (isError) {
@@ -168,11 +175,17 @@ export default function Home() {
         if (document.visibilityState !== "visible" && finishReason == null) {
           return;
         }
+        turnDispatch({ type: "FINISH_OK", chatId: instanceId });
         settleRef.current(instanceId, finishedMessages);
       },
       onError: (err) => {
         const networkDrop = isNetworkDisconnectError(err);
         lastErrorWasNetwork = networkDrop;
+        turnDispatch(
+          networkDrop
+            ? { type: "NETWORK_ERROR" }
+            : { type: "NON_NETWORK_ERROR" },
+        );
         if (
           !networkDrop &&
           (lastRequestWasHttpRejection ||
@@ -216,6 +229,16 @@ export default function Home() {
   const isBusy = status === "submitted" || status === "streaming";
   const hasMessages = messages.length > 0;
 
+  useEffect(() => {
+    if (status === "submitted" || status === "streaming") {
+      turnDispatch({ type: "STATUS", status, chatId });
+    }
+  }, [status, chatId, turnDispatch]);
+
+  useEffect(() => {
+    turnDispatch({ type: "THREAD_SWITCH", chatId });
+  }, [chatId, turnDispatch]);
+
   const { settings, updateSettings, requestBody } = useChatSettings();
 
   const stopServer = useCallback((id: string, turnId?: string) => {
@@ -227,12 +250,10 @@ export default function Home() {
   }, []);
 
   const detachStream = useCallback(() => {
-    if (stoppedChatIdRef.current === chatId) {
-      stoppedChatIdRef.current = null;
-    }
+    turnDispatch({ type: "DETACH", chatId });
     chatSession.abortReconnect();
     void stop();
-  }, [chatId, chatSession, stop]);
+  }, [chatId, chatSession, stop, turnDispatch]);
 
   const {
     conversations,
@@ -249,22 +270,25 @@ export default function Home() {
     messages,
     setMessages,
     isBusy,
-    stoppedChatIdRef,
+    isStopped,
     detach: detachStream,
     stopServer,
   });
 
-  settleRef.current = settleConversation;
+  settleRef.current = (id, finalMessages) => {
+    settleConversation(id, finalMessages);
+    turnDispatch({ type: "SETTLE", chatId: id });
+  };
 
   const stopGeneration = useCallback(() => {
     const currentMessages = chatSession.chat.messages;
     const turnId = findLastUserMessageId(currentMessages);
-    stoppedChatIdRef.current = chatId;
+    turnDispatch({ type: "STOP", chatId });
     stopServer(chatId, turnId);
     chatSession.abortReconnect();
     void stop();
     settleConversation(chatId, currentMessages);
-  }, [chatId, chatSession, stop, stopServer, settleConversation]);
+  }, [chatId, chatSession, stop, stopServer, settleConversation, turnDispatch]);
 
   useResumeOnVisible({
     chatId,
@@ -273,10 +297,14 @@ export default function Home() {
     setMessages,
     resumeStream,
     consumeReconnectOutcome: chatSession.consumeReconnectOutcome,
-    stoppedChatIdRef,
+    isStopped,
     isSeeded,
     activePending,
-    onNothingToResume: settleConversation,
+    onNothingToResume: (id, restored) => {
+      turnDispatch({ type: "RESUME_EMPTY", chatId: id });
+      settleConversation(id, restored);
+    },
+    onResumeStart: (id) => turnDispatch({ type: "RESUME_START", chatId: id }),
   });
 
   const { scrollRef, atBottom, handleScroll, scrollToBottom } = useScrollAnchor(
@@ -287,10 +315,8 @@ export default function Home() {
   const heartbeat = useHeartbeat(isBusy, messages);
 
   const clearStoppedForActiveChat = useCallback(() => {
-    if (stoppedChatIdRef.current === chatId) {
-      stoppedChatIdRef.current = null;
-    }
-  }, [chatId]);
+    turnDispatch({ type: "SEND", chatId });
+  }, [chatId, turnDispatch]);
 
   const { handleEditUser, handleRegenerate, handleRetry } = useChatActions({
     messages,
@@ -318,7 +344,7 @@ export default function Home() {
   function submit(text: string) {
     const trimmed = text.trim();
     if (!trimmed || isBusy) return;
-    clearStoppedForActiveChat();
+    turnDispatch({ type: "SEND", chatId });
     void sendMessage({ text: trimmed }, { body: requestBody() });
     setInput("");
   }
@@ -363,7 +389,6 @@ export default function Home() {
             disabled={isBusy}
             settings={settings}
             onSettingsChange={updateSettings}
-            onOpenSettings={() => setSettingsOpen(true)}
           />
         ) : (
           <>
@@ -454,8 +479,7 @@ export default function Home() {
                   busy={isBusy}
                   settings={settings}
                   onSettingsChange={updateSettings}
-                  onOpenSettings={() => setSettingsOpen(true)}
-                />
+                      />
               </div>
             </div>
           </>

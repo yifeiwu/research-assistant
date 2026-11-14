@@ -2,51 +2,54 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  DEFAULT_PROVIDER_SETTINGS,
-  type ProviderSettings,
-} from "@/lib/provider";
+  DEFAULT_SETTINGS,
+  sanitizeSettings,
+  type AppSettings,
+} from "@/lib/settings";
 import type { ChatRequestBody } from "@/lib/types/chat";
 
 const SETTINGS_STORAGE_KEY = "web-seek-settings";
 
 export type ChatSettings = {
-  settings: ProviderSettings;
-  updateSettings: (next: ProviderSettings) => void;
-  /**
-   * Build the per-request body from the latest settings. Stable identity (reads
-   * settings via a ref) so callbacks depending on it don't churn — which would
-   * otherwise break Message memoization during streaming.
-   */
+  settings: AppSettings;
+  updateSettings: (next: AppSettings) => void;
   requestBody: () => ChatRequestBody;
 };
 
-/** Owns provider/model/effort settings and their localStorage persistence. */
+/** Owns Groq model/effort settings and their localStorage persistence. */
 export function useChatSettings(): ChatSettings {
-  const [settings, setSettings] = useState<ProviderSettings>(
-    DEFAULT_PROVIDER_SETTINGS,
-  );
-
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const settingsRef = useRef(settings);
   useEffect(() => {
     settingsRef.current = settings;
   }, [settings]);
 
-  // Restore provider settings.
+  // Restore settings, migrating legacy payloads by discarding any custom
+  // provider fields (including a stored API key) and rewriting the clean copy.
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
       if (saved) {
-        setSettings({ ...DEFAULT_PROVIDER_SETTINGS, ...JSON.parse(saved) });
+        const cleaned = sanitizeSettings(JSON.parse(saved));
+        setSettings(cleaned);
+        window.localStorage.setItem(
+          SETTINGS_STORAGE_KEY,
+          JSON.stringify(cleaned),
+        );
       }
     } catch {
       // ignore malformed storage
     }
   }, []);
 
-  const updateSettings = useCallback((next: ProviderSettings) => {
-    setSettings(next);
+  const updateSettings = useCallback((next: AppSettings) => {
+    const cleaned = sanitizeSettings(next);
+    setSettings(cleaned);
     try {
-      window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(next));
+      window.localStorage.setItem(
+        SETTINGS_STORAGE_KEY,
+        JSON.stringify(cleaned),
+      );
     } catch {
       // ignore
     }
@@ -54,18 +57,7 @@ export function useChatSettings(): ChatSettings {
 
   const requestBody = useCallback((): ChatRequestBody => {
     const s = settingsRef.current;
-    if (s.provider === "custom") {
-      return {
-        provider: {
-          type: "custom",
-          baseURL: s.customBaseURL.trim(),
-          apiKey: s.customApiKey.trim(),
-          model: s.customModel.trim(),
-        },
-        effort: s.effort,
-      };
-    }
-    return { model: s.groqModel, effort: s.effort };
+    return { model: s.model, effort: s.effort };
   }, []);
 
   return { settings, updateSettings, requestBody };

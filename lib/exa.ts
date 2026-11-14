@@ -1,18 +1,21 @@
 import "server-only";
 import { logDebug, logError, logInfo } from "./logger";
+import { serverConfig } from "./config";
+import { normalizeCacheText, requestCache, type RequestCache } from "./cache";
 
 const EXA_API_BASE = "https://api.exa.ai";
-const DEFAULT_MAX_CHARS = 14_000;
-const REQUEST_TIMEOUT_MS = 25_000;
-const MAX_RETRIES = 2;
-const BASE_BACKOFF_MS = 500;
-const MAX_BACKOFF_MS = 3_000;
+const DEFAULT_MAX_CHARS = serverConfig.exa.defaultMaxChars;
+const REQUEST_TIMEOUT_MS = serverConfig.exa.timeoutMs;
+const MAX_RETRIES = serverConfig.exa.maxRetries;
+const BASE_BACKOFF_MS = serverConfig.exa.baseBackoffMs;
+const MAX_BACKOFF_MS = serverConfig.exa.maxBackoffMs;
 
 /**
  * Per-request Exa concurrency cap. With Exa's 10 req/s global limit and up to
  * 2 concurrent users, 4 concurrent calls per user keeps peak burst at <= 8 req/s.
  */
-export const EXA_CONCURRENCY_PER_REQUEST = 4;
+const EXA_CONCURRENCY_PER_REQUEST =
+  serverConfig.exa.concurrencyPerRequest;
 
 export type ExaDocument = {
   url: string;
@@ -246,7 +249,7 @@ function parseExaResults(rawList: RawExaResult[]): ExaDocument[] {
  * Semantic + keyword web search via Exa REST API, returning page text in a
  * single HTTP call (no separate crawl step needed).
  */
-export async function searchExa(
+async function searchExa(
   query: string,
   opts: {
     numResults?: number;
@@ -281,7 +284,7 @@ export async function searchExa(
  * Fetch full text content for explicit URLs (e.g. URLs pasted directly in the
  * user's message) via Exa's `/contents` endpoint.
  */
-export async function fetchExaContents(
+async function fetchExaContents(
   urls: string[],
   opts: {
     maxCharacters?: number;
@@ -312,45 +315,85 @@ export async function fetchExaContents(
  * Scoped Exa client enforcing a per-request concurrency cap (`maxConcurrent`)
  * and resilient error handling so individual query failures don't kill a round.
  */
+export type ExaSearchOutcome = { docs: ExaDocument[]; error?: string };
+
+/**
+ * Scoped Exa client (the SearchProvider adapter) enforcing a per-request
+ * concurrency cap, Redis request caching, and resilient error reporting so
+ * individual query failures don't kill a round — but are no longer silent.
+ */
 export function createExaClient(opts: {
   maxConcurrent?: number;
   signal?: AbortSignal;
   requestId?: string;
+  cache?: RequestCache;
+  disableCache?: boolean;
 }) {
   const limit = createConcurrencyLimiter(
     opts.maxConcurrent ?? EXA_CONCURRENCY_PER_REQUEST,
   );
+  const cache = opts.cache ?? requestCache;
+
+  const searchDetailed = async (
+    query: string,
+    numResults: number,
+  ): Promise<ExaSearchOutcome> => {
+    try {
+      const docs = await cache.wrap(
+        "search",
+        {
+          q: normalizeCacheText(query),
+          numResults,
+          maxChars: DEFAULT_MAX_CHARS,
+        },
+        serverConfig.cache.searchTtlSeconds,
+        // Signal-free loader: this task may be coalesced across callers, so
+        // one caller's abort must not fail the rest. Our own signal is passed
+        // to `wrap`, which detaches only this caller.
+        () =>
+          searchExa(query, {
+            numResults,
+            requestId: opts.requestId,
+          }),
+        { bypass: opts.disableCache, requestId: opts.requestId, signal: opts.signal },
+      );
+      return { docs };
+    } catch (error) {
+      if (isAbortError(error) || opts.signal?.aborted) throw error;
+      logError("exa-search", error, { requestId: opts.requestId, query });
+      return { docs: [], error: error instanceof Error ? error.message : "Search failed" };
+    }
+  };
+
+  const fetchDetailed = async (urls: string[]): Promise<ExaSearchOutcome> => {
+    try {
+      // Explicitly pasted URLs use the short contents TTL: the user may have
+      // just changed the page, so long-lived caching would serve stale text.
+      const docs = await cache.wrap(
+        "contents",
+        { urls: [...urls].sort(), maxChars: DEFAULT_MAX_CHARS },
+        serverConfig.cache.contentsTtlSeconds,
+        () =>
+          fetchExaContents(urls, {
+            requestId: opts.requestId,
+          }),
+        { bypass: opts.disableCache, requestId: opts.requestId, signal: opts.signal },
+      );
+      return { docs };
+    } catch (error) {
+      if (isAbortError(error) || opts.signal?.aborted) throw error;
+      logError("exa-contents", error, { requestId: opts.requestId, urls });
+      return { docs: [], error: error instanceof Error ? error.message : "Contents fetch failed" };
+    }
+  };
 
   return {
-    search: (query: string, numResults: number) =>
-      limit(async () => {
-        try {
-          return await searchExa(query, {
-            numResults,
-            signal: opts.signal,
-            requestId: opts.requestId,
-          });
-        } catch (error) {
-          if (isAbortError(error) || opts.signal?.aborted) throw error;
-          logError("exa-search", error, { requestId: opts.requestId, query });
-          return [];
-        }
-      }),
-    fetchContents: (urls: string[]) =>
-      limit(async () => {
-        try {
-          return await fetchExaContents(urls, {
-            signal: opts.signal,
-            requestId: opts.requestId,
-          });
-        } catch (error) {
-          if (isAbortError(error) || opts.signal?.aborted) throw error;
-          logError("exa-contents", error, {
-            requestId: opts.requestId,
-            urls,
-          });
-          return [];
-        }
-      }),
+    searchDetailed: (query: string, numResults: number) =>
+      limit(() => searchDetailed(query, numResults)),
+    fetchDetailed: (urls: string[]) => limit(() => fetchDetailed(urls)),
+    search: async (query: string, numResults: number) =>
+      (await limit(() => searchDetailed(query, numResults))).docs,
+    fetchContents: async (urls: string[]) =>
+      (await limit(() => fetchDetailed(urls))).docs,
   };
 }

@@ -1,0 +1,71 @@
+import { describe, expect, it, vi } from "vitest";
+import { cacheKey, createRequestCache, type CacheStore } from "@/lib/cache";
+
+function fakeStore(fail = false): CacheStore & { data: Map<string, string> } {
+  const data = new Map<string, string>();
+  return {
+    data,
+    get: async (k) => {
+      if (fail) throw new Error("redis down");
+      return data.get(k) ?? null;
+    },
+    set: async (k, v) => {
+      if (fail) throw new Error("redis down");
+      data.set(k, v);
+    },
+  };
+}
+
+describe("request cache", () => {
+  it("produces stable keys for equal parts", () => {
+    expect(cacheKey("search", { q: "a" })).toBe(cacheKey("search", { q: "a" }));
+    expect(cacheKey("search", { q: "a" })).not.toBe(cacheKey("search", { q: "b" }));
+  });
+  it("serves the second call from cache", async () => {
+    const cache = createRequestCache(fakeStore());
+    const loader = vi.fn(async () => ({ docs: [1] }));
+    const a = await cache.wrap("search", { q: "x" }, 60, loader);
+    const b = await cache.wrap("search", { q: "x" }, 60, loader);
+    expect(a).toEqual(b);
+    expect(loader).toHaveBeenCalledTimes(1);
+  });
+  it("coalesces concurrent misses", async () => {
+    const cache = createRequestCache(fakeStore());
+    const loader = vi.fn(async () => {
+      await new Promise((r) => setTimeout(r, 10));
+      return 42;
+    });
+    const [a, b] = await Promise.all([
+      cache.wrap("search", { q: "y" }, 60, loader),
+      cache.wrap("search", { q: "y" }, 60, loader),
+    ]);
+    expect(a).toBe(42);
+    expect(b).toBe(42);
+    expect(loader).toHaveBeenCalledTimes(1);
+  });
+  it("fails open when Redis errors", async () => {
+    const cache = createRequestCache(fakeStore(true));
+    await expect(cache.wrap("search", { q: "z" }, 60, async () => "live")).resolves.toBe("live");
+  });
+  it("bypasses cache when requested", async () => {
+    const cache = createRequestCache(fakeStore());
+    const loader = vi.fn(async () => 1);
+    await cache.wrap("search", { q: "b" }, 60, loader, { bypass: true });
+    await cache.wrap("search", { q: "b" }, 60, loader, { bypass: true });
+    expect(loader).toHaveBeenCalledTimes(2);
+  });
+  it("one caller's abort detaches only that caller from a coalesced task", async () => {
+    const cache = createRequestCache(fakeStore());
+    const loader = vi.fn(async () => {
+      await new Promise((r) => setTimeout(r, 20));
+      return 42;
+    });
+    const ctrl = new AbortController();
+    const first = cache.wrap("search", { q: "shared" }, 60, loader, { signal: ctrl.signal });
+    const second = cache.wrap("search", { q: "shared" }, 60, loader);
+    ctrl.abort();
+    await expect(first).rejects.toMatchObject({ name: "AbortError" });
+    await expect(second).resolves.toBe(42);
+    expect(loader).toHaveBeenCalledTimes(1);
+  });
+});

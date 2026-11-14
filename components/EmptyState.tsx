@@ -1,7 +1,7 @@
 "use client";
 
 import { Composer } from "./Composer";
-import type { ProviderSettings } from "@/lib/provider";
+import type { AppSettings } from "@/lib/settings";
 
 const EXAMPLE_PROMPTS = [
   "What are the most significant AI model releases this month?",
@@ -17,16 +17,14 @@ export function EmptyState({
   disabled,
   settings,
   onSettingsChange,
-  onOpenSettings,
 }: {
   input: string;
   setInput: (v: string) => void;
   onSubmit: () => void;
   onExample: (prompt: string) => void;
   disabled: boolean;
-  settings: ProviderSettings;
-  onSettingsChange: (next: ProviderSettings) => void;
-  onOpenSettings: () => void;
+  settings: AppSettings;
+  onSettingsChange: (next: AppSettings) => void;
 }) {
   return (
     <main className="flex flex-1 flex-col items-center justify-center px-4">
@@ -49,7 +47,6 @@ export function EmptyState({
             autoFocus
             settings={settings}
             onSettingsChange={onSettingsChange}
-            onOpenSettings={onOpenSettings}
           />
         </div>
 

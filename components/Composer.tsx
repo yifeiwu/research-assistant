@@ -4,7 +4,7 @@ import { useEffect, useRef } from "react";
 import { ArrowUp, Square } from "lucide-react";
 import { EffortSelector } from "./EffortSelector";
 import { ModelSelector } from "./ModelSelector";
-import type { ProviderSettings } from "@/lib/provider";
+import type { AppSettings } from "@/lib/settings";
 
 /**
  * Two-row composer: the textarea sits on top, with a control bar below holding
@@ -23,7 +23,6 @@ export function Composer({
   inputRef,
   settings,
   onSettingsChange,
-  onOpenSettings,
 }: {
   input: string;
   setInput: (v: string) => void;
@@ -33,9 +32,8 @@ export function Composer({
   busy?: boolean;
   autoFocus?: boolean;
   inputRef?: React.RefObject<HTMLTextAreaElement | null>;
-  settings: ProviderSettings;
-  onSettingsChange: (next: ProviderSettings) => void;
-  onOpenSettings: () => void;
+  settings: AppSettings;
+  onSettingsChange: (next: AppSettings) => void;
 }) {
   const localRef = useRef<HTMLTextAreaElement>(null);
   const ref = inputRef ?? localRef;
@@ -75,11 +73,7 @@ export function Composer({
         />
 
         <div className="flex items-center gap-2">
-          <ModelSelector
-            settings={settings}
-            onChange={onSettingsChange}
-            onOpenSettings={onOpenSettings}
-          />
+          <ModelSelector settings={settings} onChange={onSettingsChange} />
           <EffortSelector
             effort={settings.effort}
             onChange={(effort) => onSettingsChange({ ...settings, effort })}

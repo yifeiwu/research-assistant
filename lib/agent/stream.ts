@@ -10,7 +10,8 @@ import {
 } from "ai";
 import { logInfo, logError, extractFailedGeneration } from "@/lib/logger";
 import { groqModelLabel } from "@/lib/models";
-import type { ChatUIMessage } from "@/lib/types/chat";
+import { verifyCitations } from "@/lib/citations";
+import type { ChatUIMessage, ResearchSource } from "@/lib/types/chat";
 
 /** The parts of a `streamText` result this module consumes. */
 export type StreamResult = Pick<
@@ -37,7 +38,7 @@ function rootError(error: unknown): unknown {
  * raw provider text leaks internal org ids and upgrade URLs, so we never show it
  * verbatim. Returns `undefined` when the error isn't a rate limit.
  */
-export function rateLimitMessage(
+function rateLimitMessage(
   error: unknown,
   modelInfo?: string,
 ): string | undefined {
@@ -66,7 +67,7 @@ export function rateLimitMessage(
 }
 
 /** Turn an error into a user-facing message, including Groq's failed_generation. */
-export function clientErrorMessage(error: unknown, modelInfo?: string): string {
+function clientErrorMessage(error: unknown, modelInfo?: string): string {
   const rateLimited = rateLimitMessage(error, modelInfo);
   if (rateLimited) return rateLimited;
 
@@ -87,7 +88,7 @@ export function clientErrorMessage(error: unknown, modelInfo?: string): string {
  * Explain to the user why the model stopped without writing an answer, so a
  * successful-but-empty turn shows a helpful note instead of a blank message.
  */
-export function noAnswerMessage(finishReason: string | undefined): string {
+function noAnswerMessage(finishReason: string | undefined): string {
   switch (finishReason) {
     case "length":
       return "I ran out of output space before I could finish answering. This can happen when a reasoning model spends its whole token budget thinking. Please try again, or switch to a different model in Settings.";
@@ -110,6 +111,8 @@ export function createPipelineStreamResponse(
     requestId: string;
     modelInfo: string;
     signal?: AbortSignal;
+    /** Live lookup for this turn's retrieved sources (citation allowlist). */
+    getAllowedSources?: () => ResearchSource[];
   },
   options?: {
     consumeSseStream?: (options: {
@@ -142,16 +145,84 @@ export function createPipelineStreamResponse(
 
       let sawText = false;
       let sawTerminal = false;
+      let strippedCitations = 0;
+      // Per-text-part buffer plus fenced-code state. Citation verification is
+      // line-buffered (so markdown links are never split across flushes), but
+      // a fence opened in one flush and closed in a later one must still be
+      // treated as code throughout, and very long lines must not stall the
+      // stream until text-end.
+      const FLUSH_CHAR_CAP = 4_096;
+      type TextState = { buffer: string; inFence: boolean };
+      const textBuffers = new Map<string, TextState>();
+
+      const verifyFragment = (state: TextState, emit: string): string => {
+        if (state.inFence) {
+          const closeIdx = emit.indexOf("```");
+          if (closeIdx === -1) return emit; // still inside the fence
+          state.inFence = false;
+          const head = emit.slice(0, closeIdx + 3);
+          return head + verifyFragment(state, emit.slice(closeIdx + 3));
+        }
+        const fenceCount = (emit.match(/```/g) ?? []).length;
+        if (fenceCount % 2 === 1) state.inFence = true;
+        const verified = verifyCitations(emit, ctx.getAllowedSources?.() ?? []);
+        strippedCitations += verified.strippedCount;
+        return verified.text;
+      };
+
+      const flushText = (id: string, force: boolean) => {
+        const state = textBuffers.get(id);
+        if (!state || !state.buffer) return;
+        const buffer = state.buffer;
+        let emit = buffer;
+        if (!force) {
+          // Prefer a newline boundary; for very long single lines, fall back
+          // to the last space once past the cap (spaces never occur inside a
+          // bare URL, so this cannot split a citation URL).
+          let boundary = buffer.lastIndexOf("\n");
+          if (boundary === -1 && buffer.length >= FLUSH_CHAR_CAP) {
+            boundary = buffer.lastIndexOf(" ");
+          }
+          if (boundary === -1) return;
+          emit = buffer.slice(0, boundary + 1);
+          state.buffer = buffer.slice(boundary + 1);
+        } else {
+          state.buffer = "";
+          textBuffers.delete(id);
+        }
+        const text = verifyFragment(state, emit);
+        if (text) {
+          writer.write({ type: "text-delta", id, delta: text });
+        }
+      };
 
       try {
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          if (value.type === "text-delta") sawText = true;
+          if (value.type === "text-delta") {
+            sawText = true;
+            const id = (value as { id: string }).id;
+            const state = textBuffers.get(id) ?? { buffer: "", inFence: false };
+            state.buffer += value.delta;
+            textBuffers.set(id, state);
+            flushText(id, false);
+            continue;
+          }
+          if (value.type === "text-end") {
+            flushText((value as { id: string }).id, true);
+          }
           if (value.type === "abort" || value.type === "error") {
             sawTerminal = true;
           }
           writer.write(value);
+        }
+        for (const id of [...textBuffers.keys()]) flushText(id, true);
+        if (strippedCitations > 0) {
+          logInfo("citation-verification", {
+            requestId: ctx.requestId,
+            stripped: strippedCitations,
+          });
         }
       } catch (error) {
         if (isAbortError(error) || ctx.signal?.aborted) {

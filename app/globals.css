@@ -84,17 +84,31 @@ body {
   color: var(--muted);
   margin: 0.75rem 0;
 }
+/* Fit tables to the message width instead of scrolling sideways:
+   fixed layout distributes the available width across columns, and
+   cells wrap (even long URLs / inline code) rather than forcing the
+   table wider than its container. */
 .prose-chat table {
   border-collapse: collapse;
   margin: 0.75rem 0;
-  width: max-content;
-  min-width: 100%;
+  width: 100%;
+  table-layout: fixed;
 }
 .prose-chat th,
 .prose-chat td {
   border: 1px solid var(--border);
   padding: 0.4rem 0.6rem;
   text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.prose-chat :where(th, td) :where(a, code) {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.prose-chat :where(th, td) img {
+  max-width: 100%;
+  height: auto;
 }
 
 @keyframes pulse-dot {

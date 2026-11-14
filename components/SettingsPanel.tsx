@@ -124,9 +124,10 @@ export function SettingsPanel({
             </Field>
 
             <p className="text-xs leading-relaxed text-muted">
-              Must be an OpenAI Chat Completions-compatible endpoint that
-              supports tool calling. Your key is stored only in this browser and
-              sent to this app&apos;s server to make requests on your behalf.
+              Works with any OpenAI Chat Completions-compatible endpoint or
+              local model (no tool-calling support required). Your key is stored
+              only in this browser and sent to this app&apos;s server to make
+              requests on your behalf.
             </p>
           </div>
         )}

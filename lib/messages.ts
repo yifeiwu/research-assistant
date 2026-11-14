@@ -18,7 +18,7 @@ export function getMessageText(message: UIMessage, separator = "\n\n"): string {
     .join(separator);
 }
 
-/** Text of the most recent user message (used to focus tool summaries). */
+/** Text of the most recent user message (used to focus research queries & summaries). */
 export function latestUserText(messages: UIMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role !== "user") continue;
@@ -28,10 +28,10 @@ export function latestUserText(messages: UIMessage[]): string {
 }
 
 /**
- * Strip tool invocations and reasoning from PRIOR assistant turns so we don't
- * resend large search/crawl payloads on every follow-up (keeps token usage and
- * latency down). The final answer text of each turn is kept for context, and
- * assistant turns that produced no text are dropped entirely.
+ * Strip research steps, source metadata, and reasoning parts from PRIOR
+ * assistant turns so we only resend final answer text on follow-ups (keeps
+ * token usage low and compatible with every model). Assistant turns that
+ * produced no text are dropped entirely.
  */
 export function pruneToolHistory(messages: UIMessage[]): UIMessage[] {
   const result: UIMessage[] = [];

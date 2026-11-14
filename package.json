@@ -9,7 +9,6 @@
   },
   "dependencies": {
     "@ai-sdk/groq": "^3.0.42",
-    "@ai-sdk/mcp": "^1.0.52",
     "@ai-sdk/openai-compatible": "^2.0.51",
     "@ai-sdk/react": "^3.0.211",
     "@upstash/redis": "^1.41.0",

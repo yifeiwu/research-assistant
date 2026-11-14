@@ -10,16 +10,19 @@ import { logError, logInfo } from "@/lib/logger";
  * Allows `POST /api/chat` on one serverless isolate to keep streaming into
  * Redis after the client disconnects (tab switch, reload, thread switch), while
  * `GET /api/chat/:id/stream` and `POST /api/chat/:id/stop` on any isolate can
- * replay/tail chunks or signal cancellation.
+ * replay/tail chunks, poll background completion, or signal cancellation.
  *
  * Each generation gets a unique `runId` so a superseding turn on the same
  * `chatId` never collides with or appends stray bytes to the newer run:
  *   - `chat:active:{chatId}` (String, TTL 600s) -> latest `runId`
  *   - `chat:run:{runId}:meta` (Hash, TTL 600s)  -> { status, stopped, updatedAt }
  *   - `chat:run:{runId}:chunks` (List, TTL 600s) -> coalesced SSE string batches
+ *   - `chat:stop-turn:{chatId}:{turnId}` (String, TTL 120s) -> pre-start stop marker
  */
 
 const STREAM_TTL_SECONDS = 10 * 60;
+const STOP_TURN_TTL_SECONDS = 2 * 60;
+const STOP_PENDING_TTL_SECONDS = 15;
 const FLUSH_INTERVAL_MS = 150;
 const FLUSH_CHAR_THRESHOLD = 16_384;
 const HEARTBEAT_INTERVAL_MS = 1_000;
@@ -54,8 +57,20 @@ function chunksKey(runId: string): string {
   return `chat:run:${runId}:chunks`;
 }
 
+function stopTurnKey(chatId: string, turnId: string): string {
+  return `chat:stop-turn:${chatId}:${turnId}`;
+}
+
+function stopPendingKey(chatId: string): string {
+  return `chat:stop-pending:${chatId}`;
+}
+
 export function isChatId(value: string): boolean {
   return /^[\w-]{8,80}$/.test(value);
+}
+
+export function isTurnId(value: unknown): value is string {
+  return typeof value === "string" && /^[\w-]{1,120}$/.test(value);
 }
 
 function createSerialRunner(): <T>(fn: () => Promise<T>) => Promise<T> {
@@ -88,34 +103,61 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 /**
  * Register a new generation run for `chatId` in Redis, marking any previous
  * active run on the same thread as stopped so its isolate aborts promptly.
- * Returns an `AbortSignal` detached from the HTTP request so client disconnects
- * do not cancel generation.
+ * Also checks whether an explicit Stop arrived for `turnId` before this isolate
+ * finished booting.
  */
 export async function startChatStream(
   chatId: string,
+  turnId?: string,
 ): Promise<ChatStreamHandle> {
   const db = redis();
   const runId = `r_${crypto.randomUUID()}`;
   const abortController = new AbortController();
   const now = String(Date.now());
+  const validTurnId = isTurnId(turnId) ? turnId : undefined;
 
-  const prevRunId = await db.get<string>(activeKey(chatId));
+  const lookupPipe = db.pipeline();
+  lookupPipe.get<string>(activeKey(chatId));
+  lookupPipe.get<string>(stopPendingKey(chatId));
+  if (validTurnId) {
+    lookupPipe.get<string>(stopTurnKey(chatId, validTurnId));
+  }
+  const lookupResults = await lookupPipe.exec();
+
+  const prevRunId = lookupResults[0] as string | null;
+  const pendingStop = String(lookupResults[1] ?? "") === "1";
+  const turnStopped = validTurnId
+    ? String(lookupResults[2] ?? "") === "1"
+    : false;
+  const preStopped = pendingStop || turnStopped;
+
+  if (preStopped) {
+    abortController.abort();
+  }
 
   const pipe = db.pipeline();
   if (prevRunId) {
     pipe.hset(metaKey(prevRunId), { stopped: "1", updatedAt: now });
     pipe.expire(metaKey(prevRunId), STREAM_TTL_SECONDS);
   }
+  if (pendingStop) {
+    pipe.del(stopPendingKey(chatId));
+  }
   pipe.hset(metaKey(runId), {
-    status: "streaming",
-    stopped: "0",
+    status: preStopped ? "done" : "streaming",
+    stopped: preStopped ? "1" : "0",
     updatedAt: now,
   });
   pipe.expire(metaKey(runId), STREAM_TTL_SECONDS);
   pipe.set(activeKey(chatId), runId, { ex: STREAM_TTL_SECONDS });
   await pipe.exec();
 
-  logInfo("stream-start", { chatId, runId, superseded: Boolean(prevRunId) });
+  logInfo("stream-start", {
+    chatId,
+    runId,
+    superseded: Boolean(prevRunId),
+    preStopped,
+  });
 
   return {
     chatId,
@@ -125,26 +167,69 @@ export async function startChatStream(
   };
 }
 
-/** Explicit Stop — signals the active run on any isolate to abort. */
-export async function stopChatStream(chatId: string): Promise<boolean> {
+/**
+ * Cleanly finalize a run that failed before `ingestSseStream` could start so it
+ * never lingers as a stale `"streaming"` entry with 0 chunks.
+ */
+export async function abortChatStream(handle: ChatStreamHandle): Promise<void> {
+  if (!handle.abortController.signal.aborted) {
+    handle.abortController.abort();
+  }
+  try {
+    const db = redis();
+    const now = String(Date.now());
+    await db
+      .pipeline()
+      .hset(metaKey(handle.runId), {
+        status: "done",
+        stopped: "1",
+        updatedAt: now,
+      })
+      .expire(metaKey(handle.runId), STREAM_TTL_SECONDS)
+      .exec();
+  } catch (error) {
+    logError("stream-abort-cleanup", error, {
+      chatId: handle.chatId,
+      runId: handle.runId,
+    });
+  }
+}
+
+/**
+ * Explicit Stop — signals the active run on any isolate to abort, and records a
+ * short-lived turn tombstone in case `POST /api/chat` has not called
+ * `startChatStream` yet.
+ */
+export async function stopChatStream(
+  chatId: string,
+  turnId?: string,
+): Promise<boolean> {
   const db = redis();
   const runId = await db.get<string>(activeKey(chatId));
-  if (!runId) return false;
+  const validTurnId = isTurnId(turnId) ? turnId : undefined;
 
-  await db
-    .pipeline()
-    .hset(metaKey(runId), { stopped: "1", updatedAt: String(Date.now()) })
-    .expire(metaKey(runId), STREAM_TTL_SECONDS)
-    .exec();
+  const pipe = db.pipeline();
+  if (runId) {
+    pipe.hset(metaKey(runId), { stopped: "1", updatedAt: String(Date.now()) });
+    pipe.expire(metaKey(runId), STREAM_TTL_SECONDS);
+  }
+  if (validTurnId) {
+    pipe.set(stopTurnKey(chatId, validTurnId), "1", {
+      ex: STOP_TURN_TTL_SECONDS,
+    });
+  } else if (!runId) {
+    pipe.set(stopPendingKey(chatId), "1", { ex: STOP_PENDING_TTL_SECONDS });
+  }
+  await pipe.exec();
 
-  logInfo("stream-stop", { chatId, runId });
-  return true;
+  logInfo("stream-stop", { chatId, runId, turnId: validTurnId });
+  return Boolean(runId || validTurnId);
 }
 
 /**
  * Consume a teed SSE string stream, batching writes to Redis every ~150ms (or
  * 16 KB) while polling for remote stop / supersede signals at least once per
- * second even during quiet tool calls.
+ * second even during quiet retrieval/condensation stages.
  */
 export async function ingestSseStream(
   handle: ChatStreamHandle,
@@ -287,15 +372,42 @@ export async function ingestSseStream(
 /**
  * Replay buffered SSE batches for `chatId` and, while the run is still active,
  * tail new batches from Redis until completion, client disconnect, or staleness.
- * Returns `null` when there is nothing to resume (caller responds 204).
+ *
+ * When `opts.onlyDone` is true (used by background thread collection), returns:
+ *   - `202` immediately if the run is still actively streaming (0 chunk bytes read)
+ *   - `null` (caller responds `204`) if nothing is stored or 0 chunks exist
+ *   - `200` with the full buffered SSE stream once finished (or stale with chunks)
  */
 export async function resumeChatStream(
   chatId: string,
   signal?: AbortSignal,
+  opts?: { onlyDone?: boolean },
 ): Promise<Response | null> {
   const db = redis();
   const runId = await db.get<string>(activeKey(chatId));
   if (!runId) return null;
+
+  if (opts?.onlyDone) {
+    const meta = await db.hgetall<RunMeta>(metaKey(runId));
+    if (!meta?.status) return null;
+
+    const done = meta.status === "done";
+    const updatedAt = Number(meta.updatedAt) || 0;
+    const stale =
+      !done && updatedAt > 0 && Date.now() - updatedAt > STALE_STREAM_MS;
+
+    if (!done && !stale) {
+      return new Response(null, { status: 202 });
+    }
+
+    const chunks = await db.lrange<string>(chunksKey(runId), 0, -1);
+    if (chunks.length === 0) return null;
+
+    const payload = chunks.join("");
+    return new Response(encoder.encode(payload), {
+      headers: UI_MESSAGE_STREAM_HEADERS,
+    });
+  }
 
   const [initialMeta, initialChunks] = await db
     .pipeline()

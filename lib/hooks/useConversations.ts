@@ -1,7 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { UIMessage } from "ai";
+import {
+  parseJsonEventStream,
+  readUIMessageStream,
+  uiMessageChunkSchema,
+  type UIMessage,
+  type UIMessageChunk,
+} from "ai";
 import {
   type Conversation,
   createConversationId,
@@ -13,16 +19,19 @@ import {
   saveConversations,
 } from "@/lib/conversations";
 
+const BG_POLL_INTERVAL_MS = 3_000;
+
 type UseConversationsArgs = {
   chatId: string;
   setChatId: (id: string) => void;
   messages: UIMessage[];
   setMessages: (messages: UIMessage[]) => void;
   isBusy: boolean;
-  /** Detach the client fetch without cancelling server-side Redis generation. */
+  stoppedChatIdRef: React.RefObject<string | null>;
+  /** Detach the client fetch/reconnect stream without cancelling server Redis generation. */
   detach: () => void;
   /** Explicitly cancel server-side generation for a thread (e.g. on delete). */
-  stopServer: (id: string) => void;
+  stopServer: (id: string, turnId?: string) => void;
 };
 
 export type UseConversations = {
@@ -37,15 +46,68 @@ export type UseConversations = {
   settleConversation: (id: string, finalMessages?: UIMessage[]) => void;
 };
 
+function findLastUserMessageId(messages: UIMessage[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user" && typeof messages[i].id === "string") {
+      return messages[i].id;
+    }
+  }
+  return undefined;
+}
+
+type BackgroundPollResult =
+  | { state: "running" }
+  | { state: "empty" }
+  | { state: "retry" }
+  | { state: "done"; assistantMessage: UIMessage };
+
+/**
+ * Non-blocking check for a background `pending` thread (`?onlyDone=1`).
+ * Returns `running` (HTTP 202) with zero body transfer while the server is
+ * still streaming, and reconstructs the final `UIMessage` once done (HTTP 200)
+ * so background threads persist before Redis's 10-minute TTL expires.
+ */
+async function pollBackgroundConversation(
+  id: string,
+  signal: AbortSignal,
+): Promise<BackgroundPollResult> {
+  const response = await fetch(`/api/chat/${id}/stream?onlyDone=1`, {
+    method: "GET",
+    signal,
+  });
+
+  if (response.status === 202) return { state: "running" };
+  if (response.status === 204) return { state: "empty" };
+  if (!response.ok || !response.body) return { state: "retry" };
+
+  const chunkStream = parseJsonEventStream({
+    stream: response.body,
+    schema: uiMessageChunkSchema,
+  }).pipeThrough(
+    new TransformStream({
+      transform(part, controller) {
+        if (part.success) {
+          controller.enqueue(part.value as UIMessageChunk);
+        }
+      },
+    }),
+  );
+
+  let assistantMessage: UIMessage | undefined;
+  for await (const msg of readUIMessageStream({ stream: chunkStream })) {
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+    assistantMessage = msg;
+  }
+
+  return assistantMessage
+    ? { state: "done", assistantMessage }
+    : { state: "empty" };
+}
+
 /**
  * Manages multiple chat threads persisted in localStorage on top of the live
- * `useChat` message state.
- *
- * When a user turn starts (`isBusy`), the prompt messages are persisted
- * immediately with `pending: true` so reloading the page or switching threads
- * preserves the `chatId` and reconnects to Upstash Redis via
- * `GET /api/chat/:id/stream`. Switching threads detaches only the local fetch
- * so background threads continue generating server-side.
+ * `useChat` message state, plus background collection of finished `pending`
+ * threads while the user works in another conversation.
  */
 export function useConversations({
   chatId,
@@ -53,6 +115,7 @@ export function useConversations({
   messages,
   setMessages,
   isBusy,
+  stoppedChatIdRef,
   detach,
   stopServer,
 }: UseConversationsArgs): UseConversations {
@@ -70,8 +133,17 @@ export function useConversations({
     conversationsRef.current = conversations;
   }, [conversations]);
 
+  const bgControllersRef = useRef<Map<string, AbortController>>(new Map());
+
   const setActive = useCallback(
     (id: string) => {
+      // Abort any background poll for the thread becoming active so the live
+      // `useResumeOnVisible` stream takes over without contention.
+      const bgCtrl = bgControllersRef.current.get(id);
+      if (bgCtrl) {
+        bgCtrl.abort();
+        bgControllersRef.current.delete(id);
+      }
       chatIdRef.current = id;
       setChatId(id);
       saveActiveConversationId(id);
@@ -105,9 +177,18 @@ export function useConversations({
     }
 
     setRestored(true);
-    // Only on mount: `setActive` is stable enough, and re-running would clobber
-    // the live thread.
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Abort all in-flight background polls on unmount.
+  useEffect(() => {
+    const controllers = bgControllersRef.current;
+    return () => {
+      for (const ctrl of controllers.values()) {
+        ctrl.abort();
+      }
+      controllers.clear();
+    };
   }, []);
 
   // When the active thread changes (restore / sidebar), seed useChat from the
@@ -127,6 +208,7 @@ export function useConversations({
     if (!isSeeded || !isBusy || messages.length === 0) return;
 
     const id = chatIdRef.current;
+    if (stoppedChatIdRef.current === id) return;
     const last = messages[messages.length - 1];
     const promptMessages =
       last?.role === "assistant" ? messages.slice(0, -1) : messages;
@@ -216,6 +298,77 @@ export function useConversations({
     [],
   );
 
+  // Background collector: periodically check non-active `pending` threads so
+  // completed responses are saved to localStorage (and their sidebar indicators
+  // clear) even if the user never switches back before Redis TTL expiry.
+  const hasBackgroundPending = conversations.some(
+    (c) => c.pending && c.id !== chatId,
+  );
+
+  useEffect(() => {
+    if (!restored || !hasBackgroundPending) return;
+
+    const checkPendingBackgroundThreads = () => {
+      if (document.visibilityState !== "visible") return;
+      const pendingBg = conversationsRef.current.filter(
+        (c) => c.pending && c.id !== chatIdRef.current,
+      );
+
+      for (const conv of pendingBg) {
+        if (bgControllersRef.current.has(conv.id)) continue;
+        const ctrl = new AbortController();
+        bgControllersRef.current.set(conv.id, ctrl);
+
+        void pollBackgroundConversation(conv.id, ctrl.signal)
+          .then((res) => {
+            if (ctrl.signal.aborted || chatIdRef.current === conv.id) return;
+            const latest = conversationsRef.current.find(
+              (c) => c.id === conv.id,
+            );
+            if (!latest?.pending) return;
+
+            if (res.state === "done") {
+              const last = latest.messages[latest.messages.length - 1];
+              const base =
+                last?.role === "assistant"
+                  ? latest.messages.slice(0, -1)
+                  : latest.messages;
+              settleConversation(conv.id, [...base, res.assistantMessage]);
+            } else if (res.state === "empty") {
+              settleConversation(conv.id);
+            }
+          })
+          .catch(() => {
+            // Network error or abort; retry on next tick if still pending.
+          })
+          .finally(() => {
+            if (bgControllersRef.current.get(conv.id) === ctrl) {
+              bgControllersRef.current.delete(conv.id);
+            }
+          });
+      }
+    };
+
+    const initialTimer = window.setTimeout(
+      checkPendingBackgroundThreads,
+      1_000,
+    );
+    const interval = window.setInterval(
+      checkPendingBackgroundThreads,
+      BG_POLL_INTERVAL_MS,
+    );
+    document.addEventListener("visibilitychange", checkPendingBackgroundThreads);
+
+    return () => {
+      window.clearTimeout(initialTimer);
+      window.clearInterval(interval);
+      document.removeEventListener(
+        "visibilitychange",
+        checkPendingBackgroundThreads,
+      );
+    };
+  }, [restored, hasBackgroundPending, settleConversation]);
+
   const selectConversation = useCallback(
     (id: string) => {
       if (id === chatIdRef.current) return;
@@ -232,11 +385,20 @@ export function useConversations({
 
   const deleteConversation = useCallback(
     (id: string) => {
+      const bgCtrl = bgControllersRef.current.get(id);
+      if (bgCtrl) {
+        bgCtrl.abort();
+        bgControllersRef.current.delete(id);
+      }
+
       const target = conversationsRef.current.find((c) => c.id === id);
       const isCurrent = chatIdRef.current === id;
 
       if ((isCurrent && isBusy) || target?.pending) {
-        stopServer(id);
+        const turnId = findLastUserMessageId(
+          isCurrent ? messages : (target?.messages ?? []),
+        );
+        stopServer(id, turnId);
       }
 
       setConversations((prev) => {
@@ -251,7 +413,7 @@ export function useConversations({
         setActive(createConversationId());
       }
     },
-    [isBusy, detach, stopServer, setActive],
+    [isBusy, messages, detach, stopServer, setActive],
   );
 
   const activePending = Boolean(

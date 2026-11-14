@@ -5,15 +5,22 @@ import {
   createUIMessageStream,
   createUIMessageStreamResponse,
   streamText,
+  type FinishReason,
+  type UIMessageStreamWriter,
 } from "ai";
 import { logInfo, logError, extractFailedGeneration } from "@/lib/logger";
 import { groqModelLabel } from "@/lib/models";
+import type { ChatUIMessage } from "@/lib/types/chat";
 
 /** The parts of a `streamText` result this module consumes. */
-type StreamResult = Pick<
+export type StreamResult = Pick<
   ReturnType<typeof streamText>,
   "toUIMessageStream" | "finishReason"
 >;
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
 
 /**
  * Unwrap the most relevant underlying error. `streamText` retries transient
@@ -43,15 +50,14 @@ export function rateLimitMessage(
     /rate limit reached|rate limit exceeded|too many requests/i.test(rawMessage);
   if (!isRateLimit) return undefined;
 
-  // Prefer the model named in the request (`groq <id>`); otherwise pull the id
-  // out of the provider message (e.g. ...for model `openai/gpt-oss-120b`...).
   const idFromInfo = modelInfo?.replace(/^groq\s+/, "");
   const idFromMessage = rawMessage.match(/model `([^`]+)`/)?.[1];
   const label = groqModelLabel(idFromInfo ?? idFromMessage);
 
-  // Surface the provider's suggested wait time when it gives one.
   const retryIn = rawMessage.match(/try again in ([^.]+?)\./i)?.[1]?.trim();
-  const waitHint = retryIn ? ` You can try again in about ${retryIn}, or` : " You can wait a bit, or";
+  const waitHint = retryIn
+    ? ` You can try again in about ${retryIn}, or`
+    : " You can wait a bit, or";
 
   return (
     `You've hit the rate limit for ${label}.` +
@@ -72,7 +78,7 @@ export function clientErrorMessage(error: unknown, modelInfo?: string): string {
   const failed = extractFailedGeneration(error);
   if (failed) {
     const snippet = failed.length > 600 ? `${failed.slice(0, 600)}…` : failed;
-    message += `\n\nModel output that failed to parse:\n${snippet}`;
+    message += `\n\nModel output:\n${snippet}`;
   }
   return message;
 }
@@ -87,44 +93,91 @@ export function noAnswerMessage(finishReason: string | undefined): string {
       return "I ran out of output space before I could finish answering. This can happen when a reasoning model spends its whole token budget thinking. Please try again, or switch to a different model in Settings.";
     case "content-filter":
       return "The response was blocked by the model's content filter before an answer could be produced. Try rephrasing your question.";
-    case "tool-calls":
-      return "I used up my research budget without writing an answer. Please try sending your question again.";
     default:
       return "I finished without producing an answer. This can happen intermittently with some models — try sending the message again, or switch models in Settings.";
   }
 }
 
 /**
- * Forward the model's stream, but if it completes without any answer text
- * (e.g. finishReason "length"/"content-filter"/"tool-calls", or a reasoning
- * model that never wrote a final answer), append a note explaining why so the
- * user never sees a silently blank turn.
+ * Run the deterministic research + synthesis pipeline inside a single typed
+ * `UIMessageStream`. Emits `{ type: "start" }` immediately so live research
+ * progress cards stream to the client (and Upstash Redis) before final answer
+ * synthesis begins, and appends a fallback note if the model finishes empty.
  */
-export function streamWithEmptyAnswerFallback(
-  result: StreamResult,
-  ctx: { requestId: string; modelInfo: string },
+export function createPipelineStreamResponse(
+  run: (writer: UIMessageStreamWriter<ChatUIMessage>) => Promise<StreamResult>,
+  ctx: {
+    requestId: string;
+    modelInfo: string;
+    signal?: AbortSignal;
+  },
   options?: {
     consumeSseStream?: (options: {
       stream: ReadableStream<string>;
     }) => void | PromiseLike<void>;
   },
 ): Response {
-  const stream = createUIMessageStream({
+  const stream = createUIMessageStream<ChatUIMessage>({
     execute: async ({ writer }) => {
-      const reader = result.toUIMessageStream().getReader();
-      let sawText = false;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value.type === "text-delta") sawText = true;
-        writer.write(value);
+      writer.write({ type: "start" });
+
+      let result: StreamResult;
+      try {
+        result = await run(writer);
+      } catch (error) {
+        if (isAbortError(error) || ctx.signal?.aborted) {
+          logInfo("abort", { requestId: ctx.requestId, model: ctx.modelInfo });
+          writer.write({ type: "abort" });
+          return;
+        }
+        throw error;
       }
 
+      const reader = result
+        .toUIMessageStream<ChatUIMessage>({
+          sendStart: false,
+          sendFinish: false,
+        })
+        .getReader();
+
+      let sawText = false;
+      let sawTerminal = false;
+
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value.type === "text-delta") sawText = true;
+          if (value.type === "abort" || value.type === "error") {
+            sawTerminal = true;
+          }
+          writer.write(value);
+        }
+      } catch (error) {
+        if (isAbortError(error) || ctx.signal?.aborted) {
+          writer.write({ type: "abort" });
+          return;
+        }
+        throw error;
+      }
+
+      if (sawTerminal || ctx.signal?.aborted) {
+        if (!sawTerminal && ctx.signal?.aborted) {
+          writer.write({ type: "abort" });
+        }
+        return;
+      }
+
+      const finishReason: FinishReason | undefined = await Promise.resolve(
+        result.finishReason,
+      ).catch(() => undefined);
+
       if (!sawText) {
-        const finishReason = await Promise.resolve(result.finishReason).catch(
-          () => undefined,
-        );
-        logInfo("empty-answer", { ...ctx, finishReason });
+        logInfo("empty-answer", {
+          requestId: ctx.requestId,
+          modelInfo: ctx.modelInfo,
+          finishReason,
+        });
         const id = crypto.randomUUID();
         writer.write({ type: "text-start", id });
         writer.write({
@@ -134,9 +187,17 @@ export function streamWithEmptyAnswerFallback(
         });
         writer.write({ type: "text-end", id });
       }
+
+      writer.write({
+        type: "finish",
+        finishReason: finishReason ?? "stop",
+      });
     },
     onError: (error) => {
-      logError("stream", error, ctx);
+      logError("stream", error, {
+        requestId: ctx.requestId,
+        modelInfo: ctx.modelInfo,
+      });
       return clientErrorMessage(error, ctx.modelInfo);
     },
   });

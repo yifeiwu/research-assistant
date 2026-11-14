@@ -7,16 +7,18 @@ import {
   groqModelSupportsReasoning,
   isValidGroqModel,
 } from "@/lib/models";
-import { isCustomProviderPayload, type CustomProviderPayload } from "@/lib/provider";
-import { groqToolValidationFetch } from "@/lib/groq-tool-fix";
+import {
+  isCustomProviderPayload,
+  type CustomProviderPayload,
+} from "@/lib/provider";
 
 // Cheap, fast model used for the "map" step (per-page summarization).
 const DEFAULT_SUMMARY_MODEL = "llama-3.1-8b-instant";
 
 export type ResolvedModels = {
-  /** Reduce step: synthesizes the condensed notes into the final answer. */
+  /** Primary model used for query planning, gap checking, and final synthesis. */
   mainModel: LanguageModel;
-  /** Map step: a cheap, fast model condenses each large tool result. */
+  /** Map step: a cheap, fast model condenses each large web document. */
   summaryModel: LanguageModel;
   /** Human-readable model description, for logs. */
   modelInfo: string;
@@ -37,14 +39,14 @@ export function isResolutionError(
   return "error" in value;
 }
 
-/** Build the main (reduce) and summary (map) models for a custom endpoint. */
+/** Build the main and summary models for a custom OpenAI-compatible endpoint. */
 function buildCustomModels(payload: CustomProviderPayload): ResolvedModels {
   const provider = createOpenAICompatible({
     name: "custom",
     baseURL: payload.baseURL,
     apiKey: payload.apiKey,
   });
-  // Custom endpoints expose arbitrary models; use the chosen one for both steps.
+  // Custom endpoints expose arbitrary models; use the chosen one for all steps.
   const model = provider(payload.model);
   return {
     mainModel: model,
@@ -59,8 +61,6 @@ function buildCustomModels(payload: CustomProviderPayload): ResolvedModels {
 function buildGroqModels(model: string | undefined): ResolvedModels {
   const groq = createGroq({
     apiKey: process.env.GROQ_API_KEY,
-    // Work around Groq/Llama embedding tool args in the tool name.
-    fetch: groqToolValidationFetch,
   });
   // Only allow models from our curated free-tier allowlist; otherwise fall back.
   const selectedModel = isValidGroqModel(model)
@@ -68,7 +68,6 @@ function buildGroqModels(model: string | undefined): ResolvedModels {
     : (process.env.GROQ_MODEL ?? DEFAULT_GROQ_MODEL);
   return {
     mainModel: groq(selectedModel),
-    // Map step: a cheap, fast model condenses each large tool result.
     summaryModel: groq(process.env.GROQ_SUMMARY_MODEL ?? DEFAULT_SUMMARY_MODEL),
     modelInfo: `groq ${selectedModel}`,
     supportsReasoning: groqModelSupportsReasoning(selectedModel),
@@ -77,8 +76,8 @@ function buildGroqModels(model: string | undefined): ResolvedModels {
 
 /**
  * Resolve the models for a request: a custom OpenAI-compatible endpoint when the
- * client supplies one, otherwise Groq. Returns an error object (rather than
- * throwing) when required server configuration is missing.
+ * client supplies one, otherwise Groq. No model is required to support native
+ * function/tool calling.
  */
 export function resolveModels(input: {
   model?: string;

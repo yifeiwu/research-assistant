@@ -3,6 +3,40 @@ import type { UIMessage } from "ai";
 import type { CustomProviderPayload } from "@/lib/provider";
 import type { EffortLevel } from "@/lib/effort";
 
+/** A single web source retrieved during deterministic research. */
+export type ResearchSource = {
+  url: string;
+  title?: string;
+  publishedDate?: string;
+};
+
+/** Live phases for a deterministic research round rendered in the UI. */
+export type ResearchStepPhase =
+  | "planning"
+  | "searching"
+  | "reading"
+  | "checking-gaps"
+  | "done"
+  | "error";
+
+/** Payload carried by a `data-research-step` UI message part. */
+export type ResearchStepData = {
+  round: number;
+  phase: ResearchStepPhase;
+  queries: string[];
+  sources: ResearchSource[];
+  notes?: string;
+  error?: string;
+};
+
+/** Custom AI SDK v6 data parts emitted by `/api/chat`. */
+export type ChatDataParts = {
+  "research-step": ResearchStepData;
+};
+
+/** Application UIMessage type with typed research-step data parts. */
+export type ChatUIMessage = UIMessage<unknown, ChatDataParts>;
+
 /**
  * The `/api/chat` request contract, shared between the client (which builds the
  * body) and the server route (which validates and consumes it).
@@ -25,16 +59,16 @@ export type ChatRequestBody = Omit<ChatRequest, "messages">;
 /**
  * Upper bounds on the request payload. These guard against unbounded histories
  * (context blowups / memory pressure) and malformed clients; normal usage stays
- * well under them. `pruneToolHistory` already trims prior tool payloads, so the
- * character cap mostly bounds pathological inputs.
+ * well under them. `pruneToolHistory` already trims prior research payloads, so
+ * the character cap mostly bounds pathological inputs.
  */
 export const MAX_MESSAGES = 200;
 export const MAX_TOTAL_MESSAGE_CHARS = 500_000;
 
 /**
  * A single message part. We only assert the discriminating `type` field and
- * keep every other key (`text`, tool-call ids/inputs/outputs, etc.) via
- * `looseObject`, since the downstream AI SDK reads those fields directly.
+ * keep every other key (`text`, `data`, `url`, etc.) via `looseObject`, since
+ * the downstream AI SDK reads those fields directly.
  */
 const messagePartSchema = z.looseObject({
   type: z.string(),
@@ -65,7 +99,10 @@ export const chatRequestSchema = z
     provider: z.unknown().optional(),
     effort: z.unknown().optional(),
   })
-  .refine((body) => JSON.stringify(body.messages).length <= MAX_TOTAL_MESSAGE_CHARS, {
-    message: `Message history is too large (max ${MAX_TOTAL_MESSAGE_CHARS} characters).`,
-    path: ["messages"],
-  });
+  .refine(
+    (body) => JSON.stringify(body.messages).length <= MAX_TOTAL_MESSAGE_CHARS,
+    {
+      message: `Message history is too large (max ${MAX_TOTAL_MESSAGE_CHARS} characters).`,
+      path: ["messages"],
+    },
+  );

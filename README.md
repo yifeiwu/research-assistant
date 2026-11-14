@@ -1,68 +1,70 @@
 # Web Seek
 
 An AI web research assistant built with Next.js, the Vercel AI SDK, **Groq** for
-fast LLM inference, and the hosted **Exa** MCP server for live web search and
-page crawling.
+fast LLM inference, and the **Exa** REST API for live web search and content
+extraction.
 
-Type a question into the prompt box on the homepage. The model decides when to
-search the web (`web_search_exa`), reads the most relevant pages
-(`web_fetch_exa`), and then answers with inline citations — and you can watch
-each search/crawl step stream live.
+Type a question into the prompt box on the homepage. A deterministic,
+server-orchestrated research pipeline plans focused search queries, retrieves
+and condenses web sources in parallel, and streams a cited answer — with live
+research progress cards and zero reliance on LLM function/tool calling.
 
-Open the settings (gear) menu in the header to choose your model provider:
+Open the settings menu to choose your model provider:
 
-- **Groq (free tier):** pick from a curated list of free-tier Groq models that
-  support tool calling (`lib/models.ts`), validated server-side on every request.
+- **Groq (free tier):** pick from a curated list of free-tier Groq models
+  (`lib/models.ts`), validated server-side on every request.
 - **Custom (OpenAI-compatible):** enter your own base URL, API key, and model
-  id to use any OpenAI Chat Completions-compatible endpoint that supports tool
-  calling (OpenAI, OpenRouter, a local LLM server, a proxy, etc.). The key is
-  stored only in your browser and sent to this app's own server to make the
-  request on your behalf. When a custom provider is used, no `GROQ_API_KEY` is
-  required.
+  id to use **any** OpenAI Chat Completions-compatible endpoint (OpenAI,
+  OpenRouter, Ollama, vLLM, llama.cpp, DeepSeek, etc.) — models do **not** need
+  tool-calling or JSON-schema support. The key is stored only in your browser
+  and sent to this app's server to make requests on your behalf.
 
 Your selection is remembered in the browser.
 
 ## How it works
 
 ```
-Browser (useChat) ─POST /api/chat─▶ Main model (reduce)
-                                      │ tool calls
+Browser (useChat) ─POST /api/chat─▶ Deterministic Research Pipeline (lib/research.ts)
+                                      │ 1. Plain-text query planning (or NO_SEARCH)
                                       ▼
-                               Exa MCP server
-                          (web_search_exa / web_fetch_exa)
-                                      │ large raw results
+                               Exa REST API (/search + /contents)
+                                      │ 2. Parallel retrieval (<= 4 req/s per user)
                                       ▼
-                          Summarizer model (map)  ──▶ compact notes back to main model
+                               Summarizer model (map)
+                                      │ 3. Bounded parallel condensation (+ optional Round 2 gap check)
+                                      ▼
+                               Main model (reduce) ──▶ streamed cited answer
 ```
 
-To cope with free-tier context and tokens-per-minute limits, the app uses a
-two-stage (map-reduce) pipeline:
+Research depth is controlled by the **Effort** selector (`lib/effort.ts`), tuned
+for Exa's 10 req/s rate limit across concurrent users:
 
-- **Map:** every large search/crawl result is condensed by a cheap, fast model
-  (`llama-3.1-8b-instant` by default) into short, query-focused notes with
-  source URLs preserved — before it ever enters the main model's context.
-- **Reduce:** the model you pick in the UI synthesizes those notes into the
-  final cited answer.
+- **Low:** skips web search (`0` rounds) and answers directly in a single pass.
+- **Medium (default):** `1` round — up to 4 parallel queries and up to 8
+  deduplicated, condensed sources.
+- **High:** `2` rounds — up to 5 initial queries, an automated gap check over
+  Round 1 notes, and up to 4 targeted follow-up queries (up to 14 unique sources).
 
 Files:
 
-- `app/page.tsx` — homepage prompt box + streaming chat UI.
-- `app/api/chat/route.ts` — runs `streamText` (reduce) with the Exa MCP tools in
-  a multi-step agent loop.
-- `lib/agent/chat-stream.ts` — buffers SSE streams and coordinates cancellation
-  in Upstash Redis so threads resume across tab switches, reloads, and thread
-  switches.
-- `lib/pipeline.ts` — wraps the MCP tools so large results are summarized (map)
-  before re-entering context.
-- `lib/exa-mcp.ts` — connects to `https://mcp.exa.ai/mcp` over HTTP, passing the
-  Exa key as an `x-api-key` header (the key never reaches the browser).
+- `app/page.tsx` — homepage prompt box + streaming chat UI with Upstash Redis
+  stream resumption across reloads and tab switches.
+- `app/api/chat/route.ts` — orchestrates the deterministic research pipeline and
+  single-pass final answer synthesis.
+- `lib/research.ts` — plain-text query planning, parallel Exa retrieval, URL
+  deduplication, optional Round 2 gap check, and live `data-research-step` +
+  `source-url` streaming.
+- `lib/exa.ts` — direct Exa REST client (`/search` and `/contents`) with
+  per-request concurrency limiting, timeouts, and retry backoff.
+- `lib/pipeline.ts` — concurrent map-stage source condensation and `<think>`
+  stripping for open-weight reasoning models.
 
 ## Prerequisites
 
 - Node.js 18.18+ (Node 20+ recommended)
-- A [Groq API key](https://console.groq.com/keys)
+- A [Groq API key](https://console.groq.com/keys) (unless using a custom provider)
 - An [Exa API key](https://dashboard.exa.ai/api-keys)
-- An [Upstash Redis](https://console.upstash.com/redis) database
+- An [Upstash Redis](https://console.upstash.com/redis) database for stream resumption
 
 ## Local development
 
@@ -83,8 +85,6 @@ Files:
    EXA_API_KEY=...
    UPSTASH_REDIS_REST_URL=...
    UPSTASH_REDIS_REST_TOKEN=...
-   # optional
-   # GROQ_MODEL=openai/gpt-oss-120b
    ```
 
 3. Run the dev server:
@@ -104,24 +104,16 @@ Files:
    - `UPSTASH_REDIS_REST_URL`
    - `UPSTASH_REDIS_REST_TOKEN`
    - `GROQ_MODEL` (optional)
-3. Deploy. The `/api/chat` and `/api/chat/[id]/stream` routes run as serverless
-   functions with a 300s max duration (see `maxDuration` in `app/api/chat/route.ts`).
-   On Vercel's Fluid compute (the default), 300s is available on all plans, and
-   active-CPU billing pauses while the function waits on model/tool/Redis I/O.
+3. Deploy. The `/api/chat` route runs as a serverless function with a 300s max
+   duration (see `maxDuration` in `app/api/chat/route.ts`).
 
 ## Configuration
 
-| Variable        | Required | Description                                            |
-| --------------- | -------- | ------------------------------------------------------ |
-| `GROQ_API_KEY`  | conditional | Groq API key for LLM inference. Required unless you use a custom OpenAI-compatible provider in Settings. |
-| `EXA_API_KEY`   | yes      | Exa API key used for the hosted Exa MCP server.        |
-| `UPSTASH_REDIS_REST_URL` | yes | Upstash Redis REST URL used to buffer and resume active chat streams (`KV_REST_API_URL` is also supported). |
-| `UPSTASH_REDIS_REST_TOKEN` | yes | Upstash Redis REST token (`KV_REST_API_TOKEN` is also supported). |
-| `GROQ_MODEL`    | no       | Fallback Groq model id when the UI doesn't send one. Defaults to `openai/gpt-oss-120b`. |
-| `GROQ_SUMMARY_MODEL` | no  | Cheap/fast model for the map (summarization) step. Defaults to `llama-3.1-8b-instant`. |
-
-> The model is normally chosen from the in-app settings menu (Groq free-tier
-> models in `lib/models.ts`, or a custom OpenAI-compatible endpoint).
-> `GROQ_MODEL` only acts as a server-side fallback. Any model used must support
-> native function/tool calling, since the agent relies on tool calls to search
-> and crawl.
+| Variable                   | Required    | Description                                                                                      |
+| -------------------------- | ----------- | ------------------------------------------------------------------------------------------------ |
+| `GROQ_API_KEY`             | conditional | Groq API key for LLM inference. Required unless you use a custom OpenAI-compatible provider.     |
+| `EXA_API_KEY`              | yes         | Exa API key used for web search and URL content retrieval.                                       |
+| `UPSTASH_REDIS_REST_URL`   | yes         | Upstash Redis REST URL for cross-instance stream resumption and remote Stop cancellation.        |
+| `UPSTASH_REDIS_REST_TOKEN` | yes         | Upstash Redis REST token.                                                                        |
+| `GROQ_MODEL`               | no          | Fallback Groq model id when the UI doesn't send one. Defaults to `openai/gpt-oss-120b`.          |
+| `GROQ_SUMMARY_MODEL`       | no          | Cheap/fast model for the map (summarization) step. Defaults to `llama-3.1-8b-instant`.           |

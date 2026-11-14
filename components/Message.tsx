@@ -3,10 +3,11 @@
 import { memo, useMemo, useState } from "react";
 import type { UIMessage } from "ai";
 import { Pencil, RotateCcw } from "lucide-react";
-import { ToolStep, type DynamicToolPart } from "./ToolStep";
+import { ResearchStep } from "./ResearchStep";
 import { Markdown } from "./Markdown";
 import { collectSources } from "@/lib/sources";
 import { getMessageText } from "@/lib/messages";
+import type { ResearchStepData } from "@/lib/types/chat";
 import { ActionButton } from "./message/ActionButton";
 import { CopyButton } from "./message/CopyButton";
 import { EditUserMessage } from "./message/EditUserMessage";
@@ -89,8 +90,18 @@ export const Message = memo(function Message({
               );
             }
 
-            if (part.type === "dynamic-tool") {
-              return <ToolStep key={index} part={part as DynamicToolPart} />;
+            if (part.type === "data-research-step") {
+              const dataPart = part as {
+                id?: string;
+                data?: ResearchStepData;
+              };
+              if (!dataPart.data) return null;
+              return (
+                <ResearchStep
+                  key={dataPart.id ?? index}
+                  data={dataPart.data}
+                />
+              );
             }
 
             if (part.type === "step-start") {

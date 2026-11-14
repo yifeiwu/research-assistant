@@ -1,6 +1,6 @@
 "use client";
 
-import { useChat } from "@ai-sdk/react";
+import { Chat, useChat } from "@ai-sdk/react";
 import { DefaultChatTransport, type UIMessage } from "ai";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, RotateCw } from "lucide-react";
@@ -15,7 +15,10 @@ import { useChatSettings } from "@/lib/hooks/useChatSettings";
 import { useScrollAnchor } from "@/lib/hooks/useScrollAnchor";
 import { useHeartbeat } from "@/lib/hooks/useHeartbeat";
 import { useChatActions } from "@/lib/hooks/useChatActions";
-import { useResumeOnVisible } from "@/lib/hooks/useResumeOnVisible";
+import {
+  useResumeOnVisible,
+  type ReconnectOutcome,
+} from "@/lib/hooks/useResumeOnVisible";
 import { busyLabel, formatDuration } from "@/lib/format";
 import { createConversationId } from "@/lib/conversations";
 
@@ -26,24 +29,171 @@ function isNetworkDisconnectError(err: unknown): boolean {
   );
 }
 
+function findLastUserMessageId(messages: UIMessage[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user" && typeof messages[i].id === "string") {
+      return messages[i].id;
+    }
+  }
+  return undefined;
+}
+
 export default function Home() {
   const [chatId, setChatId] = useState(createConversationId);
-  const userStoppedRef = useRef(false);
-  const lastErrorWasNetworkRef = useRef(false);
-  const chatIdRef = useRef(chatId);
-  const activeStreamChatIdRef = useRef(chatId);
+  /** Tracks which specific `chatId` the user explicitly clicked Stop on. */
+  const stoppedChatIdRef = useRef<string | null>(null);
   const settleRef = useRef<(id: string, finalMessages?: UIMessage[]) => void>(
     () => {},
   );
 
-  useEffect(() => {
-    chatIdRef.current = chatId;
+  // Create an isolated `Chat` + abortable transport per `chatId` so:
+  //   1. `onFinish` / `onError` are permanently bound to `instanceId` and can
+  //      never clobber another thread's saved messages after a sidebar switch.
+  //   2. `GET /api/chat/:id/stream` (used by `resumeStream()`) is wired to an
+  //      `AbortController` so switching threads or clicking Stop aborts live
+  //      reconnect streams immediately.
+  //   3. HTTP `204` vs `200` reconnect status is recorded directly rather than
+  //      inferred from React-lagged refs.
+  const chatSession = useMemo(() => {
+    const instanceId = chatId;
+    let reconnectController: AbortController | null = null;
+    let lastReconnectOutcome: ReconnectOutcome = null;
+    let lastErrorWasNetwork = false;
+    let lastRequestWasHttpRejection = false;
+
+    const abortReconnect = () => {
+      if (reconnectController) {
+        reconnectController.abort();
+        reconnectController = null;
+      }
+    };
+
+    const consumeReconnectOutcome = (): ReconnectOutcome => {
+      const outcome = lastReconnectOutcome;
+      lastReconnectOutcome = null;
+      return outcome;
+    };
+
+    const transport = new DefaultChatTransport({
+      api: "/api/chat",
+      fetch: async (input, init) => {
+        const method = (init?.method ?? "GET").toUpperCase();
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        const isReconnect = method === "GET" && url.includes("/stream");
+
+        if (isReconnect) {
+          abortReconnect();
+          const ctrl = new AbortController();
+          reconnectController = ctrl;
+          lastReconnectOutcome = null;
+
+          try {
+            const response = await globalThis.fetch(input, {
+              ...init,
+              signal: ctrl.signal,
+            });
+            if (response.status === 204) {
+              lastReconnectOutcome = "empty";
+            } else if (response.ok) {
+              lastReconnectOutcome = "replayed";
+            } else {
+              lastReconnectOutcome = "error";
+            }
+            return response;
+          } catch (err) {
+            if (ctrl.signal.aborted) {
+              lastReconnectOutcome = "aborted";
+            } else if (isNetworkDisconnectError(err)) {
+              lastReconnectOutcome = "network-error";
+            } else {
+              lastReconnectOutcome = "error";
+            }
+            throw err;
+          } finally {
+            if (reconnectController === ctrl && ctrl.signal.aborted) {
+              reconnectController = null;
+            }
+          }
+        }
+
+        lastErrorWasNetwork = false;
+        lastRequestWasHttpRejection = false;
+        const response = await globalThis.fetch(input, init);
+        if (!response.ok) {
+          lastRequestWasHttpRejection = true;
+        }
+        return response;
+      },
+    });
+
+    const chat = new Chat({
+      id: instanceId,
+      transport,
+      onFinish: ({
+        messages: finishedMessages,
+        isAbort,
+        isDisconnect,
+        isError,
+        finishReason,
+      }) => {
+        const wasNetworkDrop = isDisconnect || lastErrorWasNetwork;
+        const wasHttpRejection = lastRequestWasHttpRejection;
+        lastErrorWasNetwork = false;
+        lastRequestWasHttpRejection = false;
+
+        if (stoppedChatIdRef.current === instanceId) {
+          settleRef.current(instanceId, finishedMessages);
+          return;
+        }
+        if (isAbort || wasNetworkDrop) {
+          // Detached on thread switch or dropped by network: keep `pending: true`
+          // so the thread can resume or be collected from Upstash Redis.
+          return;
+        }
+        if (isError) {
+          // Server HTTP 4xx/5xx rejections have no active Redis stream even if
+          // the tab was hidden when the error arrived.
+          if (wasHttpRejection || document.visibilityState === "visible") {
+            settleRef.current(instanceId);
+          }
+          return;
+        }
+        // If the tab is hidden and no `finish` chunk arrived (`finishReason == null`),
+        // the browser silently closed the socket — keep `pending: true` to resume.
+        if (document.visibilityState !== "visible" && finishReason == null) {
+          return;
+        }
+        settleRef.current(instanceId, finishedMessages);
+      },
+      onError: (err) => {
+        const networkDrop = isNetworkDisconnectError(err);
+        lastErrorWasNetwork = networkDrop;
+        if (
+          !networkDrop &&
+          (lastRequestWasHttpRejection ||
+            document.visibilityState === "visible")
+        ) {
+          settleRef.current(instanceId);
+        }
+      },
+    });
+
+    return { chat, abortReconnect, consumeReconnectOutcome };
   }, [chatId]);
 
-  const transport = useMemo(
-    () => new DefaultChatTransport({ api: "/api/chat" }),
-    [],
-  );
+  // Ensure any in-flight local stream or reconnect poll on a previous `Chat`
+  // instance is torn down cleanly on thread switch or unmount.
+  useEffect(() => {
+    return () => {
+      chatSession.abortReconnect();
+      void chatSession.chat.stop();
+    };
+  }, [chatSession]);
 
   const {
     messages,
@@ -54,48 +204,7 @@ export default function Home() {
     setMessages,
     resumeStream,
   } = useChat({
-    id: chatId,
-    transport,
-    onFinish: ({
-      messages: finishedMessages,
-      isAbort,
-      isDisconnect,
-      isError,
-      finishReason,
-    }) => {
-      const targetId = activeStreamChatIdRef.current;
-      const wasNetworkDrop = isDisconnect || lastErrorWasNetworkRef.current;
-      lastErrorWasNetworkRef.current = false;
-
-      if (userStoppedRef.current) {
-        settleRef.current(targetId, finishedMessages);
-        return;
-      }
-      if (isAbort || wasNetworkDrop) {
-        // Detached on thread switch or dropped by network: keep `pending: true`
-        // so the thread can resume from Upstash Redis.
-        return;
-      }
-      if (isError) {
-        if (document.visibilityState === "visible") {
-          settleRef.current(targetId);
-        }
-        return;
-      }
-      // If the tab is hidden and no `finish` chunk arrived (`finishReason == null`),
-      // the browser silently closed the socket — keep `pending: true` to resume.
-      if (document.visibilityState !== "visible" && finishReason == null) {
-        return;
-      }
-      settleRef.current(targetId, finishedMessages);
-    },
-    onError: (err) => {
-      const networkDrop = isNetworkDisconnectError(err);
-      lastErrorWasNetworkRef.current = networkDrop;
-      if (!networkDrop && document.visibilityState === "visible") {
-        settleRef.current(chatIdRef.current);
-      }
-    },
+    chat: chatSession.chat,
   });
 
   const [input, setInput] = useState("");
@@ -107,22 +216,23 @@ export default function Home() {
   const isBusy = status === "submitted" || status === "streaming";
   const hasMessages = messages.length > 0;
 
-  useEffect(() => {
-    if (isBusy) {
-      activeStreamChatIdRef.current = chatId;
-    }
-  }, [isBusy, chatId]);
-
   const { settings, updateSettings, requestBody } = useChatSettings();
 
-  const stopServer = useCallback((id: string) => {
-    void fetch(`/api/chat/${id}/stop`, { method: "POST" });
+  const stopServer = useCallback((id: string, turnId?: string) => {
+    void fetch(`/api/chat/${id}/stop`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(turnId ? { turnId } : {}),
+    });
   }, []);
 
   const detachStream = useCallback(() => {
-    userStoppedRef.current = false;
-    stop();
-  }, [stop]);
+    if (stoppedChatIdRef.current === chatId) {
+      stoppedChatIdRef.current = null;
+    }
+    chatSession.abortReconnect();
+    void stop();
+  }, [chatId, chatSession, stop]);
 
   const {
     conversations,
@@ -139,20 +249,22 @@ export default function Home() {
     messages,
     setMessages,
     isBusy,
+    stoppedChatIdRef,
     detach: detachStream,
     stopServer,
   });
 
-  useEffect(() => {
-    settleRef.current = settleConversation;
-  }, [settleConversation]);
+  settleRef.current = settleConversation;
 
   const stopGeneration = useCallback(() => {
-    userStoppedRef.current = true;
-    stopServer(chatId);
-    stop();
-    settleConversation(chatId, messages);
-  }, [chatId, messages, stop, stopServer, settleConversation]);
+    const currentMessages = chatSession.chat.messages;
+    const turnId = findLastUserMessageId(currentMessages);
+    stoppedChatIdRef.current = chatId;
+    stopServer(chatId, turnId);
+    chatSession.abortReconnect();
+    void stop();
+    settleConversation(chatId, currentMessages);
+  }, [chatId, chatSession, stop, stopServer, settleConversation]);
 
   useResumeOnVisible({
     chatId,
@@ -160,7 +272,8 @@ export default function Home() {
     messages,
     setMessages,
     resumeStream,
-    userStoppedRef,
+    consumeReconnectOutcome: chatSession.consumeReconnectOutcome,
+    stoppedChatIdRef,
     isSeeded,
     activePending,
     onNothingToResume: settleConversation,
@@ -173,11 +286,11 @@ export default function Home() {
 
   const heartbeat = useHeartbeat(isBusy, messages);
 
-  const resetUserStopped = useCallback(() => {
-    userStoppedRef.current = false;
-    lastErrorWasNetworkRef.current = false;
-    activeStreamChatIdRef.current = chatIdRef.current;
-  }, []);
+  const clearStoppedForActiveChat = useCallback(() => {
+    if (stoppedChatIdRef.current === chatId) {
+      stoppedChatIdRef.current = null;
+    }
+  }, [chatId]);
 
   const { handleEditUser, handleRegenerate, handleRetry } = useChatActions({
     messages,
@@ -185,7 +298,7 @@ export default function Home() {
     sendMessage,
     isBusy,
     requestBody,
-    onBeforeSend: resetUserStopped,
+    onBeforeSend: clearStoppedForActiveChat,
   });
 
   // Show the history sidebar by default on wider screens; keep it hidden on
@@ -205,8 +318,8 @@ export default function Home() {
   function submit(text: string) {
     const trimmed = text.trim();
     if (!trimmed || isBusy) return;
-    resetUserStopped();
-    sendMessage({ text: trimmed }, { body: requestBody() });
+    clearStoppedForActiveChat();
+    void sendMessage({ text: trimmed }, { body: requestBody() });
     setInput("");
   }
 
@@ -218,14 +331,12 @@ export default function Home() {
         open={sidebarOpen}
         settings={settings}
         onSelect={(id) => {
-          resetUserStopped();
           selectConversation(id);
           if (window.matchMedia("(max-width: 767px)").matches) {
             setSidebarOpen(false);
           }
         }}
         onNewChat={() => {
-          resetUserStopped();
           newConversation();
           setInput("");
         }}
@@ -237,7 +348,6 @@ export default function Home() {
       <div className="flex min-w-0 flex-1 flex-col">
         <Header
           onNewChat={() => {
-            resetUserStopped();
             newConversation();
             setInput("");
           }}

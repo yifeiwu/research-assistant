@@ -27,10 +27,61 @@ export const MAX_CONVERSATIONS = 20;
 
 /** Keep only the `MAX_CONVERSATIONS` most recently updated threads. */
 function capConversations(conversations: Conversation[]): Conversation[] {
-  if (conversations.length <= MAX_CONVERSATIONS) return conversations;
   return [...conversations]
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .slice(0, MAX_CONVERSATIONS);
+}
+
+/**
+ * Strip bulky research notes / legacy tool outputs from a conversation's
+ * messages while keeping answer text, queries, and structured source pills
+ * intact. Used only when `localStorage` hits its browser size quota.
+ */
+function compactConversation(conv: Conversation): Conversation {
+  let changed = false;
+  const messages = conv.messages.map((msg) => {
+    if (msg.role !== "assistant") return msg;
+    let msgChanged = false;
+    const parts = msg.parts.map((part) => {
+      if (
+        part.type === "data-research-step" &&
+        "data" in part &&
+        part.data &&
+        typeof part.data === "object" &&
+        "notes" in part.data &&
+        part.data.notes
+      ) {
+        msgChanged = true;
+        const { notes: _omit, ...restData } = part.data as Record<
+          string,
+          unknown
+        >;
+        return { ...part, data: restData } as typeof part;
+      }
+      if (
+        part.type === "dynamic-tool" &&
+        "output" in part &&
+        part.output != null
+      ) {
+        msgChanged = true;
+        return { ...part, output: undefined } as typeof part;
+      }
+      return part;
+    });
+    if (!msgChanged) return msg;
+    changed = true;
+    return { ...msg, parts };
+  });
+  return changed ? { ...conv, messages } : conv;
+}
+
+function trySetStorage(key: string, value: Conversation[]): boolean {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function createConversationId(): string {
@@ -69,21 +120,48 @@ export function loadConversations(): Conversation[] {
 
 /**
  * Persist the thread list, evicting all but the most recently updated
- * `MAX_CONVERSATIONS`. Returns the (possibly trimmed) list actually stored so
- * callers can keep their in-memory state in sync with what was saved.
+ * `MAX_CONVERSATIONS`. If `localStorage` hits `QuotaExceededError`, older
+ * research notes are compacted first, followed by progressive LRU eviction so
+ * new turns and `pending: false` settlements never silently fail to save.
  */
 export function saveConversations(
   conversations: Conversation[],
 ): Conversation[] {
   const capped = capConversations(conversations);
-  try {
-    window.localStorage.setItem(
-      CONVERSATIONS_STORAGE_KEY,
-      JSON.stringify(capped),
-    );
-  } catch {
-    // storage full or unavailable; ignore
+  if (trySetStorage(CONVERSATIONS_STORAGE_KEY, capped)) {
+    return capped;
   }
+
+  // Pass 1: compact research notes on older threads (keep top 2 untouched).
+  let working = capped.map((c, idx) =>
+    idx >= 2 ? compactConversation(c) : c,
+  );
+  if (trySetStorage(CONVERSATIONS_STORAGE_KEY, working)) {
+    return working;
+  }
+
+  // Pass 2: compact research notes on all non-active threads (keep top 1).
+  working = working.map((c, idx) => (idx >= 1 ? compactConversation(c) : c));
+  if (trySetStorage(CONVERSATIONS_STORAGE_KEY, working)) {
+    return working;
+  }
+
+  // Pass 3: progressively evict oldest threads down to 1.
+  while (working.length > 1) {
+    working = working.slice(0, -1);
+    if (trySetStorage(CONVERSATIONS_STORAGE_KEY, working)) {
+      return working;
+    }
+  }
+
+  // Pass 4: last resort — compact the remaining active thread's notes too.
+  if (working.length === 1) {
+    const minimal = [compactConversation(working[0])];
+    if (trySetStorage(CONVERSATIONS_STORAGE_KEY, minimal)) {
+      return minimal;
+    }
+  }
+
   return capped;
 }
 

@@ -94,14 +94,22 @@ export function ConversationSidebar({
                         type="button"
                         onClick={() => onSelect(conv.id)}
                         className={
-                          "flex-1 truncate px-3 py-2 text-left text-sm transition " +
+                          "flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left text-sm transition " +
                           (active
                             ? "text-foreground"
                             : "text-muted group-hover:text-foreground")
                         }
                         title={conv.title}
                       >
-                        {conv.title}
+                        {conv.pending && (
+                          <span
+                            className="loading-dot shrink-0 text-xs text-accent"
+                            aria-label="Generating response"
+                          >
+                            ●
+                          </span>
+                        )}
+                        <span className="truncate">{conv.title}</span>
                       </button>
                       <button
                         type="button"

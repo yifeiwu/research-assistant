@@ -1,8 +1,8 @@
 "use client";
 
 import { useChat } from "@ai-sdk/react";
-import { DefaultChatTransport } from "ai";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { DefaultChatTransport, type UIMessage } from "ai";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, RotateCw } from "lucide-react";
 import { Message } from "@/components/Message";
 import { Header } from "@/components/Header";
@@ -19,9 +19,31 @@ import { useResumeOnVisible } from "@/lib/hooks/useResumeOnVisible";
 import { busyLabel, formatDuration } from "@/lib/format";
 import { createConversationId } from "@/lib/conversations";
 
+function isNetworkDisconnectError(err: unknown): boolean {
+  return (
+    err instanceof TypeError &&
+    /fetch|network|load failed/i.test(err.message)
+  );
+}
+
 export default function Home() {
   const [chatId, setChatId] = useState(createConversationId);
   const userStoppedRef = useRef(false);
+  const lastErrorWasNetworkRef = useRef(false);
+  const chatIdRef = useRef(chatId);
+  const activeStreamChatIdRef = useRef(chatId);
+  const settleRef = useRef<(id: string, finalMessages?: UIMessage[]) => void>(
+    () => {},
+  );
+
+  useEffect(() => {
+    chatIdRef.current = chatId;
+  }, [chatId]);
+
+  const transport = useMemo(
+    () => new DefaultChatTransport({ api: "/api/chat" }),
+    [],
+  );
 
   const {
     messages,
@@ -33,7 +55,47 @@ export default function Home() {
     resumeStream,
   } = useChat({
     id: chatId,
-    transport: new DefaultChatTransport({ api: "/api/chat" }),
+    transport,
+    onFinish: ({
+      messages: finishedMessages,
+      isAbort,
+      isDisconnect,
+      isError,
+      finishReason,
+    }) => {
+      const targetId = activeStreamChatIdRef.current;
+      const wasNetworkDrop = isDisconnect || lastErrorWasNetworkRef.current;
+      lastErrorWasNetworkRef.current = false;
+
+      if (userStoppedRef.current) {
+        settleRef.current(targetId, finishedMessages);
+        return;
+      }
+      if (isAbort || wasNetworkDrop) {
+        // Detached on thread switch or dropped by network: keep `pending: true`
+        // so the thread can resume from Upstash Redis.
+        return;
+      }
+      if (isError) {
+        if (document.visibilityState === "visible") {
+          settleRef.current(targetId);
+        }
+        return;
+      }
+      // If the tab is hidden and no `finish` chunk arrived (`finishReason == null`),
+      // the browser silently closed the socket — keep `pending: true` to resume.
+      if (document.visibilityState !== "visible" && finishReason == null) {
+        return;
+      }
+      settleRef.current(targetId, finishedMessages);
+    },
+    onError: (err) => {
+      const networkDrop = isNetworkDisconnectError(err);
+      lastErrorWasNetworkRef.current = networkDrop;
+      if (!networkDrop && document.visibilityState === "visible") {
+        settleRef.current(chatIdRef.current);
+      }
+    },
   });
 
   const [input, setInput] = useState("");
@@ -45,28 +107,52 @@ export default function Home() {
   const isBusy = status === "submitted" || status === "streaming";
   const hasMessages = messages.length > 0;
 
+  useEffect(() => {
+    if (isBusy) {
+      activeStreamChatIdRef.current = chatId;
+    }
+  }, [isBusy, chatId]);
+
   const { settings, updateSettings, requestBody } = useChatSettings();
 
-  const stopGeneration = useCallback(() => {
-    userStoppedRef.current = true;
-    void fetch(`/api/chat/${chatId}/stop`, { method: "POST" });
+  const stopServer = useCallback((id: string) => {
+    void fetch(`/api/chat/${id}/stop`, { method: "POST" });
+  }, []);
+
+  const detachStream = useCallback(() => {
+    userStoppedRef.current = false;
     stop();
-  }, [chatId, stop]);
+  }, [stop]);
 
   const {
     conversations,
     activeId,
+    activePending,
+    isSeeded,
     selectConversation,
     newConversation,
     deleteConversation,
+    settleConversation,
   } = useConversations({
     chatId,
     setChatId,
     messages,
     setMessages,
     isBusy,
-    stop: stopGeneration,
+    detach: detachStream,
+    stopServer,
   });
+
+  useEffect(() => {
+    settleRef.current = settleConversation;
+  }, [settleConversation]);
+
+  const stopGeneration = useCallback(() => {
+    userStoppedRef.current = true;
+    stopServer(chatId);
+    stop();
+    settleConversation(chatId, messages);
+  }, [chatId, messages, stop, stopServer, settleConversation]);
 
   useResumeOnVisible({
     chatId,
@@ -75,6 +161,9 @@ export default function Home() {
     setMessages,
     resumeStream,
     userStoppedRef,
+    isSeeded,
+    activePending,
+    onNothingToResume: settleConversation,
   });
 
   const { scrollRef, atBottom, handleScroll, scrollToBottom } = useScrollAnchor(
@@ -84,12 +173,19 @@ export default function Home() {
 
   const heartbeat = useHeartbeat(isBusy, messages);
 
+  const resetUserStopped = useCallback(() => {
+    userStoppedRef.current = false;
+    lastErrorWasNetworkRef.current = false;
+    activeStreamChatIdRef.current = chatIdRef.current;
+  }, []);
+
   const { handleEditUser, handleRegenerate, handleRetry } = useChatActions({
     messages,
     setMessages,
     sendMessage,
     isBusy,
     requestBody,
+    onBeforeSend: resetUserStopped,
   });
 
   // Show the history sidebar by default on wider screens; keep it hidden on
@@ -109,7 +205,7 @@ export default function Home() {
   function submit(text: string) {
     const trimmed = text.trim();
     if (!trimmed || isBusy) return;
-    userStoppedRef.current = false;
+    resetUserStopped();
     sendMessage({ text: trimmed }, { body: requestBody() });
     setInput("");
   }
@@ -122,12 +218,14 @@ export default function Home() {
         open={sidebarOpen}
         settings={settings}
         onSelect={(id) => {
+          resetUserStopped();
           selectConversation(id);
           if (window.matchMedia("(max-width: 767px)").matches) {
             setSidebarOpen(false);
           }
         }}
         onNewChat={() => {
+          resetUserStopped();
           newConversation();
           setInput("");
         }}
@@ -139,6 +237,7 @@ export default function Home() {
       <div className="flex min-w-0 flex-1 flex-col">
         <Header
           onNewChat={() => {
+            resetUserStopped();
             newConversation();
             setInput("");
           }}

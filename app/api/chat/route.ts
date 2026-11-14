@@ -22,7 +22,8 @@ import {
   startChatStream,
   ingestSseStream,
   isChatId,
-} from "@/lib/agent/in-memory-stream";
+  type ChatStreamHandle,
+} from "@/lib/agent/chat-stream";
 import { after } from "next/server";
 
 // Allow the agentic search/crawl loop enough time to run. Vercel Functions on
@@ -105,6 +106,23 @@ export async function POST(req: Request) {
   }
   logDebug("tools", { requestId, tools: Object.keys(mcp.tools) });
 
+  let streamHandle: ChatStreamHandle | undefined;
+  if (chatId) {
+    try {
+      streamHandle = await startChatStream(chatId);
+    } catch (error) {
+      await mcp.close();
+      logError("stream-start", error, { requestId, chatId });
+      return Response.json(
+        {
+          error:
+            "Couldn't initialize the chat stream store. Check that Upstash Redis environment variables are set.",
+        },
+        { status: 500 },
+      );
+    }
+  }
+
   // Track real (non-refused) tool calls so we can both refuse further calls
   // once the budget is spent and steer the model toward its final answer.
   // The budget middleware is outermost (runs first): once spent it short-circuits
@@ -170,7 +188,7 @@ export async function POST(req: Request) {
     timeout: { totalMs: 290_000, stepMs: 120_000 },
     // Do not abort on client disconnect (tab switch drops the fetch). Only an
     // explicit Stop via `/api/chat/:id/stop` cancels generation.
-    abortSignal: chatId ? startChatStream(chatId) : undefined,
+    abortSignal: streamHandle?.abortSignal,
     onStepFinish: ({ toolCalls, finishReason, usage }) => {
       logDebug("step", {
         requestId,
@@ -201,10 +219,10 @@ export async function POST(req: Request) {
   return streamWithEmptyAnswerFallback(
     result,
     { requestId, modelInfo },
-    chatId
+    streamHandle
       ? {
           consumeSseStream: ({ stream }) => {
-            const done = ingestSseStream(chatId, stream);
+            const done = ingestSseStream(streamHandle, stream);
             after(() => done);
           },
         }

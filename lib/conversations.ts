@@ -6,6 +6,8 @@ export type Conversation = {
   id: string;
   title: string;
   messages: UIMessage[];
+  /** True while an assistant response is still generating (or uncollected) in Redis. */
+  pending?: boolean;
   createdAt: number;
   updatedAt: number;
 };
@@ -136,6 +138,7 @@ function isConversation(value: unknown): value is Conversation {
     typeof v.id === "string" &&
     typeof v.title === "string" &&
     Array.isArray(v.messages) &&
+    (v.pending === undefined || typeof v.pending === "boolean") &&
     typeof v.createdAt === "number" &&
     typeof v.updatedAt === "number"
   );

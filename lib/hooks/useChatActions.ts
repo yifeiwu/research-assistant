@@ -13,6 +13,7 @@ type ChatActionsArgs = {
   sendMessage: UseChatHelpers["sendMessage"];
   isBusy: boolean;
   requestBody: () => ChatRequestBody;
+  onBeforeSend?: () => void;
 };
 
 export type ChatActions = {
@@ -32,17 +33,22 @@ export function useChatActions({
   sendMessage,
   isBusy,
   requestBody,
+  onBeforeSend,
 }: ChatActionsArgs): ChatActions {
   // Keep the latest values accessible from the stable callbacks below without
   // re-creating them — which would break Message's memoization during streaming.
   const messagesRef = useRef(messages);
   const isBusyRef = useRef(isBusy);
+  const onBeforeSendRef = useRef(onBeforeSend);
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
   useEffect(() => {
     isBusyRef.current = isBusy;
   }, [isBusy]);
+  useEffect(() => {
+    onBeforeSendRef.current = onBeforeSend;
+  }, [onBeforeSend]);
 
   // Truncate the conversation at `userMessageId` (dropping it and everything
   // after) and resend, optionally with edited text. Powers both "edit" and
@@ -55,6 +61,7 @@ export function useChatActions({
       if (idx === -1) return;
       const text = (newText ?? getMessageText(msgs[idx])).trim();
       if (!text) return;
+      onBeforeSendRef.current?.();
       setMessages(msgs.slice(0, idx));
       sendMessage({ text }, { body: requestBody() });
     },

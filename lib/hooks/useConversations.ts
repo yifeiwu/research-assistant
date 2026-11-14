@@ -19,25 +19,33 @@ type UseConversationsArgs = {
   messages: UIMessage[];
   setMessages: (messages: UIMessage[]) => void;
   isBusy: boolean;
-  stop: () => void;
+  /** Detach the client fetch without cancelling server-side Redis generation. */
+  detach: () => void;
+  /** Explicitly cancel server-side generation for a thread (e.g. on delete). */
+  stopServer: (id: string) => void;
 };
 
 export type UseConversations = {
   conversations: Conversation[];
   activeId: string;
+  activePending: boolean;
   restored: boolean;
+  isSeeded: boolean;
   selectConversation: (id: string) => void;
   newConversation: () => void;
   deleteConversation: (id: string) => void;
+  settleConversation: (id: string, finalMessages?: UIMessage[]) => void;
 };
 
 /**
  * Manages multiple chat threads persisted in localStorage on top of the live
- * `useChat` message state. The active thread's messages live in `useChat`; this
- * hook mirrors them into the saved conversation list (debounced, once settled).
+ * `useChat` message state.
  *
- * `chatId` is owned by the page so `useChat({ id })` and the resume GET
- * (`/api/chat/:id/stream`) share the same key.
+ * When a user turn starts (`isBusy`), the prompt messages are persisted
+ * immediately with `pending: true` so reloading the page or switching threads
+ * preserves the `chatId` and reconnects to Upstash Redis via
+ * `GET /api/chat/:id/stream`. Switching threads detaches only the local fetch
+ * so background threads continue generating server-side.
  */
 export function useConversations({
   chatId,
@@ -45,15 +53,22 @@ export function useConversations({
   messages,
   setMessages,
   isBusy,
-  stop,
+  detach,
+  stopServer,
 }: UseConversationsArgs): UseConversations {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [restored, setRestored] = useState(false);
+  const [seededId, setSeededId] = useState<string | null>(null);
 
   const chatIdRef = useRef(chatId);
   useEffect(() => {
     chatIdRef.current = chatId;
   }, [chatId]);
+
+  const conversationsRef = useRef(conversations);
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  }, [conversations]);
 
   const setActive = useCallback(
     (id: string) => {
@@ -79,6 +94,7 @@ export function useConversations({
       }
     }
 
+    conversationsRef.current = list;
     setConversations(list);
 
     const activeConv = active ? list.find((c) => c.id === active) : undefined;
@@ -95,72 +111,162 @@ export function useConversations({
   }, []);
 
   // When the active thread changes (restore / sidebar), seed useChat from the
-  // saved copy. Intentionally not dependent on `conversations` so a persist
-  // write cannot overwrite an in-progress turn.
+  // saved copy and mark `seededId` once applied so resume hooks wait for it.
   useEffect(() => {
     if (!restored) return;
-    const conv = conversations.find((c) => c.id === chatId);
+    const conv = conversationsRef.current.find((c) => c.id === chatId);
     setMessages(conv?.messages ?? []);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    setSeededId(chatId);
   }, [restored, chatId, setMessages]);
 
-  // Persist the active thread once it's settled (not mid-stream). Debounced so a
-  // burst of state updates only serializes the history once.
-  useEffect(() => {
-    if (!restored || isBusy) return;
-    const handle = window.setTimeout(() => {
-      if (messages.length === 0) return;
+  const isSeeded = restored && seededId === chatId;
 
-      const id = chatIdRef.current;
+  // Immediately persist user turns as `pending: true` when generation starts so
+  // reloads, tab closes, and thread switches can resume from Upstash Redis.
+  useEffect(() => {
+    if (!isSeeded || !isBusy || messages.length === 0) return;
+
+    const id = chatIdRef.current;
+    const last = messages[messages.length - 1];
+    const promptMessages =
+      last?.role === "assistant" ? messages.slice(0, -1) : messages;
+    if (promptMessages.length === 0) return;
+
+    const lastPromptId = promptMessages[promptMessages.length - 1]?.id;
+
+    setConversations((prev) => {
+      const existing = prev.find((c) => c.id === id);
+      const existingLastId =
+        existing?.messages[existing.messages.length - 1]?.id;
+      if (
+        existing?.pending &&
+        existing.messages.length === promptMessages.length &&
+        existingLastId === lastPromptId
+      ) {
+        return prev;
+      }
+
       const now = Date.now();
+      const title = existing?.title ?? deriveTitle(promptMessages);
+      const updated: Conversation = existing
+        ? {
+            ...existing,
+            messages: promptMessages,
+            title,
+            pending: true,
+            updatedAt: now,
+          }
+        : {
+            id,
+            title,
+            messages: promptMessages,
+            pending: true,
+            createdAt: now,
+            updatedAt: now,
+          };
+      const next = saveConversations([
+        updated,
+        ...prev.filter((c) => c.id !== id),
+      ]);
+      conversationsRef.current = next;
+      return next;
+    });
+  }, [isSeeded, isBusy, messages]);
+
+  const settleConversation = useCallback(
+    (id: string, finalMessages?: UIMessage[]) => {
       setConversations((prev) => {
         const existing = prev.find((c) => c.id === id);
-        const title = existing?.title ?? deriveTitle(messages);
-        const updated: Conversation = existing
-          ? { ...existing, messages, title, updatedAt: now }
-          : { id, title, messages, createdAt: now, updatedAt: now };
-        const next = [updated, ...prev.filter((c) => c.id !== id)];
-        return saveConversations(next);
+        const now = Date.now();
+
+        if (finalMessages && finalMessages.length > 0) {
+          const title = existing?.title ?? deriveTitle(finalMessages);
+          const updated: Conversation = existing
+            ? {
+                ...existing,
+                messages: finalMessages,
+                title,
+                pending: false,
+                updatedAt: now,
+              }
+            : {
+                id,
+                title,
+                messages: finalMessages,
+                pending: false,
+                createdAt: now,
+                updatedAt: now,
+              };
+          const next = saveConversations([
+            updated,
+            ...prev.filter((c) => c.id !== id),
+          ]);
+          conversationsRef.current = next;
+          return next;
+        }
+
+        if (!existing?.pending) return prev;
+        const next = saveConversations(
+          prev.map((c) => (c.id === id ? { ...c, pending: false } : c)),
+        );
+        conversationsRef.current = next;
+        return next;
       });
-    }, 500);
-    return () => window.clearTimeout(handle);
-  }, [messages, isBusy, restored]);
+    },
+    [],
+  );
 
   const selectConversation = useCallback(
     (id: string) => {
       if (id === chatIdRef.current) return;
-      if (isBusy) stop();
+      if (isBusy) detach();
       setActive(id);
     },
-    [isBusy, stop, setActive],
+    [isBusy, detach, setActive],
   );
 
   const newConversation = useCallback(() => {
-    if (isBusy) stop();
+    if (isBusy) detach();
     setActive(createConversationId());
-  }, [isBusy, stop, setActive]);
+  }, [isBusy, detach, setActive]);
 
   const deleteConversation = useCallback(
     (id: string) => {
+      const target = conversationsRef.current.find((c) => c.id === id);
+      const isCurrent = chatIdRef.current === id;
+
+      if ((isCurrent && isBusy) || target?.pending) {
+        stopServer(id);
+      }
+
       setConversations((prev) => {
         const next = prev.filter((c) => c.id !== id);
         saveConversations(next);
+        conversationsRef.current = next;
         return next;
       });
-      if (chatIdRef.current === id) {
-        if (isBusy) stop();
+
+      if (isCurrent) {
+        if (isBusy) detach();
         setActive(createConversationId());
       }
     },
-    [isBusy, stop, setActive],
+    [isBusy, detach, stopServer, setActive],
+  );
+
+  const activePending = Boolean(
+    conversations.find((c) => c.id === chatId)?.pending,
   );
 
   return {
     conversations,
     activeId: chatId,
+    activePending,
     restored,
+    isSeeded,
     selectConversation,
     newConversation,
     deleteConversation,
+    settleConversation,
   };
 }

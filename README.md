@@ -49,6 +49,9 @@ Files:
 - `app/page.tsx` — homepage prompt box + streaming chat UI.
 - `app/api/chat/route.ts` — runs `streamText` (reduce) with the Exa MCP tools in
   a multi-step agent loop.
+- `lib/agent/chat-stream.ts` — buffers SSE streams and coordinates cancellation
+  in Upstash Redis so threads resume across tab switches, reloads, and thread
+  switches.
 - `lib/pipeline.ts` — wraps the MCP tools so large results are summarized (map)
   before re-entering context.
 - `lib/exa-mcp.ts` — connects to `https://mcp.exa.ai/mcp` over HTTP, passing the
@@ -59,6 +62,7 @@ Files:
 - Node.js 18.18+ (Node 20+ recommended)
 - A [Groq API key](https://console.groq.com/keys)
 - An [Exa API key](https://dashboard.exa.ai/api-keys)
+- An [Upstash Redis](https://console.upstash.com/redis) database
 
 ## Local development
 
@@ -77,6 +81,8 @@ Files:
    ```
    GROQ_API_KEY=...
    EXA_API_KEY=...
+   UPSTASH_REDIS_REST_URL=...
+   UPSTASH_REDIS_REST_TOKEN=...
    # optional
    # GROQ_MODEL=openai/gpt-oss-120b
    ```
@@ -95,11 +101,13 @@ Files:
 2. In the Vercel project settings, add the environment variables:
    - `GROQ_API_KEY`
    - `EXA_API_KEY`
+   - `UPSTASH_REDIS_REST_URL`
+   - `UPSTASH_REDIS_REST_TOKEN`
    - `GROQ_MODEL` (optional)
-3. Deploy. The `/api/chat` route runs as a serverless function with a 300s max
-   duration (see `maxDuration` in `app/api/chat/route.ts`). On Vercel's Fluid
-   compute (the default), 300s is available on all plans, and active-CPU billing
-   pauses while the function waits on model/tool I/O.
+3. Deploy. The `/api/chat` and `/api/chat/[id]/stream` routes run as serverless
+   functions with a 300s max duration (see `maxDuration` in `app/api/chat/route.ts`).
+   On Vercel's Fluid compute (the default), 300s is available on all plans, and
+   active-CPU billing pauses while the function waits on model/tool/Redis I/O.
 
 ## Configuration
 
@@ -107,6 +115,8 @@ Files:
 | --------------- | -------- | ------------------------------------------------------ |
 | `GROQ_API_KEY`  | conditional | Groq API key for LLM inference. Required unless you use a custom OpenAI-compatible provider in Settings. |
 | `EXA_API_KEY`   | yes      | Exa API key used for the hosted Exa MCP server.        |
+| `UPSTASH_REDIS_REST_URL` | yes | Upstash Redis REST URL used to buffer and resume active chat streams (`KV_REST_API_URL` is also supported). |
+| `UPSTASH_REDIS_REST_TOKEN` | yes | Upstash Redis REST token (`KV_REST_API_TOKEN` is also supported). |
 | `GROQ_MODEL`    | no       | Fallback Groq model id when the UI doesn't send one. Defaults to `openai/gpt-oss-120b`. |
 | `GROQ_SUMMARY_MODEL` | no  | Cheap/fast model for the map (summarization) step. Defaults to `llama-3.1-8b-instant`. |
 

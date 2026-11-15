@@ -28,6 +28,9 @@ import {
   createConversationId,
 } from "@/lib/conversations";
 import { describeChatError } from "@/lib/chat-error";
+import { activeTurnStatus } from "@/lib/turn-status";
+import { fetchWithRetryAfter } from "@/lib/retry-fetch";
+import { failIfUnfinished } from "@/lib/unfinished-stream";
 
 function isNetworkDisconnectError(err: unknown): boolean {
   return (
@@ -106,7 +109,10 @@ export default function Home() {
             } else {
               lastReconnectOutcome = "error";
             }
-            return response;
+            // Known only once the replay has been read to its end.
+            return failIfUnfinished(response, () => {
+              lastReconnectOutcome = "unfinished";
+            });
           } catch (err) {
             if (ctrl.signal.aborted) {
               lastReconnectOutcome = "aborted";
@@ -125,11 +131,16 @@ export default function Home() {
 
         lastErrorWasNetwork = false;
         lastRequestWasHttpRejection = false;
-        const response = await globalThis.fetch(input, init);
+        // A 429 with a short Retry-After (per-visitor limit, or a full
+        // research queue) is retried once here instead of becoming an error.
+        const response = await fetchWithRetryAfter(globalThis.fetch, input, init);
         if (!response.ok) {
           lastRequestWasHttpRejection = true;
         }
-        return response;
+        // A stream the server ends before the turn is over (it hands long
+        // turns on to a later request) is treated as a dropped connection,
+        // so the turn stays `pending` and is reconnected to.
+        return failIfUnfinished(response);
       },
     });
 
@@ -310,6 +321,14 @@ export default function Home() {
 
   const heartbeat = useHeartbeat(isBusy, messages);
 
+  // True while the live turn is queued or waiting on a rate limit; the
+  // message itself shows the reason, so the busy line only says "Waiting…".
+  const lastMessage = messages[messages.length - 1];
+  const turnPaused =
+    status === "streaming" &&
+    lastMessage?.role === "assistant" &&
+    activeTurnStatus(lastMessage) !== null;
+
   const clearStoppedForActiveChat = useCallback(() => {
     turnDispatch({ type: "SEND", chatId });
   }, [chatId, turnDispatch]);
@@ -361,6 +380,9 @@ export default function Home() {
         onNewChat={() => {
           newConversation();
           setInput("");
+          if (window.matchMedia("(max-width: 767px)").matches) {
+            setSidebarOpen(false);
+          }
         }}
         onDelete={deleteConversation}
         onClose={() => setSidebarOpen(false)}
@@ -419,7 +441,7 @@ export default function Home() {
                     className="flex items-center gap-2 text-sm text-muted"
                   >
                     <span className="loading-dot text-accent">●</span>
-                    <span>{busyLabel(status, heartbeat.idle)}</span>
+                    <span>{busyLabel(status, heartbeat.idle, turnPaused)}</span>
                     <span className="text-xs text-muted/70 tabular-nums">
                       {formatDuration(heartbeat.elapsed)}
                     </span>

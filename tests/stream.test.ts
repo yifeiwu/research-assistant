@@ -8,9 +8,10 @@ import {
   type UIMessage,
 } from "ai";
 import { describe, expect, it } from "vitest";
-import { createPipelineStreamResponse, type StreamResult } from "@/lib/agent/stream";
+import { createPipelineStream, type StreamResult } from "@/lib/agent/stream";
 import { CHAT_STREAM_THROTTLE_MS } from "@/lib/conversations";
 import { useChatState } from "@/lib/hooks/useChatState";
+import { readAll } from "./turn-fakes";
 
 function chunkStream(chunks: unknown[]): ReadableStream<unknown> {
   return new ReadableStream({
@@ -21,18 +22,25 @@ function chunkStream(chunks: unknown[]): ReadableStream<unknown> {
   });
 }
 
-async function runChunks(chunks: unknown[]): Promise<string> {
+type Event = Record<string, unknown>;
+
+/** What the pipeline stream emits for a model stream of `chunks`. */
+async function runChunks(chunks: unknown[]): Promise<Event[]> {
   const result = {
     toUIMessageStream: () => chunkStream(chunks),
     finishReason: Promise.resolve("stop"),
   } as unknown as StreamResult;
-  const response = createPipelineStreamResponse(async () => result, {
+  const { stream } = createPipelineStream(async () => result, {
     requestId: "test1234",
     modelInfo: "groq test",
     getAllowedSources: () => [{ url: "https://example.com/a" }],
+    emitStart: true,
   });
-  return response.text();
+  return (await readAll(stream)) as Event[];
 }
+
+/** All the text an event list would show, for substring checks. */
+const textOf = (events: Event[]) => JSON.stringify(events);
 
 const textChunks = (deltas: string[]) => [
   { type: "text-start", id: "t1" },
@@ -40,39 +48,41 @@ const textChunks = (deltas: string[]) => [
   { type: "text-end", id: "t1" },
 ];
 
-describe("createPipelineStreamResponse citation verification", () => {
+describe("createPipelineStream citation verification", () => {
   it("preserves URLs inside a fenced block split across flushes", async () => {
-    const sse = await runChunks(
-      textChunks([
-        "Before\n```\n",
-        "fetch('https://nope.example/x')\n",
-        "```\n",
-        "See https://example.com/a.\n",
-      ]),
+    const text = textOf(
+      await runChunks(
+        textChunks([
+          "Before\n```\n",
+          "fetch('https://nope.example/x')\n",
+          "```\n",
+          "See https://example.com/a.\n",
+        ]),
+      ),
     );
-    expect(sse).toContain("nope.example");
-    expect(sse).toContain("https://example.com/a");
+    expect(text).toContain("nope.example");
+    expect(text).toContain("https://example.com/a");
   });
 
   it("streams very long single lines instead of waiting for text-end", async () => {
     const longLine = `Start ${"word ".repeat(1_200)}https://example.com/a`;
-    const sse = await runChunks(textChunks([longLine]));
-    expect(sse).toContain("https://example.com/a");
-    // Multiple text-delta frames prove the cap flush emitted mid-line.
-    expect(sse.match(/text-delta/g)?.length).toBeGreaterThan(1);
+    const events = await runChunks(textChunks([longLine]));
+    expect(textOf(events)).toContain("https://example.com/a");
+    // Multiple text-delta chunks prove the cap flush emitted mid-line.
+    expect(events.filter((e) => e.type === "text-delta").length).toBeGreaterThan(1);
   });
 
   it("strips invented citations in prose", async () => {
-    const sse = await runChunks(
-      textChunks(["Claim [Fake](https://evil.example/x) here.\n"]),
+    const text = textOf(
+      await runChunks(textChunks(["Claim [Fake](https://evil.example/x) here.\n"])),
     );
-    expect(sse).not.toContain("evil.example");
-    expect(sse).toContain("Fake");
+    expect(text).not.toContain("evil.example");
+    expect(text).toContain("Fake");
   });
 
   it("coalesces per-token reasoning-delta chunks without losing text or ordering", async () => {
     const tokens = Array.from({ length: 80 }, (_, i) => `t${i} `);
-    const sse = await runChunks([
+    const events = await runChunks([
       { type: "reasoning-start", id: "r1" },
       ...tokens.map((delta, i) => ({
         type: "reasoning-delta",
@@ -83,11 +93,6 @@ describe("createPipelineStreamResponse citation verification", () => {
       { type: "reasoning-end", id: "r1" },
       ...textChunks(["Final answer.\n"]),
     ]);
-
-    const events = sse
-      .split("\n")
-      .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
-      .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>);
 
     const reasoningDeltas = events.filter((e) => e.type === "reasoning-delta");
     expect(reasoningDeltas.length).toBeGreaterThan(0);
@@ -104,7 +109,7 @@ describe("createPipelineStreamResponse citation verification", () => {
 
   it("streams data-model-fallback parts and resolves dynamic modelInfo on error", async () => {
     let activeModel = "groq openai/gpt-oss-120b";
-    const response = createPipelineStreamResponse(
+    const { stream, deferral } = createPipelineStream(
       async (writer) => {
         activeModel = "groq openai/gpt-oss-20b";
         writer.write({
@@ -122,12 +127,15 @@ describe("createPipelineStreamResponse citation verification", () => {
       {
         requestId: "test1234",
         modelInfo: () => activeModel,
+        emitStart: true,
       },
     );
-    const sse = await response.text();
-    expect(sse).toContain("data-model-fallback");
-    expect(sse).toContain("GPT-OSS 20B");
-    expect(sse).toContain("You've hit the rate limit for GPT-OSS 20B");
+    const text = textOf((await readAll(stream)) as Event[]);
+    expect(text).toContain("data-model-fallback");
+    expect(text).toContain("GPT-OSS 20B");
+    expect(text).toContain("You've hit the rate limit for GPT-OSS 20B");
+    // A failed turn is over, not handed back to the queue.
+    expect(await deferral).toBeUndefined();
   });
 });
 

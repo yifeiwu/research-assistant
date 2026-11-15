@@ -3,6 +3,7 @@ import type { GroqProviderSettings } from "@ai-sdk/groq";
 import { redis } from "@/lib/redis";
 import { serverConfig } from "@/lib/config";
 import { logError, logInfo } from "@/lib/logger";
+import type { BudgetDimension, GroqBudget } from "./groq-budget";
 import {
   groqReasoningOptions,
   maxSynthesisOutputTokens,
@@ -28,9 +29,21 @@ export type GroqFallbackEvent = {
   retryAfterMs: number;
 };
 
-type CooldownEntry = {
+export type CooldownEntry = {
   untilMs: number;
   daily: boolean;
+};
+
+/** Groq's rate-limit response headers, parsed. */
+export type GroqRateLimitHeaders = {
+  /** Combined tokens-per-minute limit and what is left of it. */
+  limitTokens?: number;
+  remainingTokens?: number;
+  resetTokensMs?: number;
+  /** Requests-per-day limit and what is left of it. */
+  limitRequests?: number;
+  remainingRequests?: number;
+  resetRequestsMs?: number;
 };
 
 const COOLDOWN_KEY_PREFIX = "ratelimit:groq:cooldown:";
@@ -72,6 +85,40 @@ export function parseGroqDurationMs(raw: string | null | undefined): number | un
   }
 
   return matched && totalMs > 0 ? Math.ceil(totalMs) : undefined;
+}
+
+function headerNumber(headers: Headers, name: string): number | undefined {
+  const raw = headers.get(name)?.trim();
+  if (!raw) return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * Read Groq's `x-ratelimit-*` headers. Per Groq's docs the `-tokens` headers
+ * always describe the combined tokens-per-minute (TPM) limit and the
+ * `-requests` headers always describe requests per day (RPD); separate
+ * input/output per-minute limits (ITPM/OTPM) are not reported in headers.
+ */
+export function parseGroqRateLimitHeaders(headers: Headers): GroqRateLimitHeaders {
+  return {
+    limitTokens: headerNumber(headers, "x-ratelimit-limit-tokens"),
+    remainingTokens: headerNumber(headers, "x-ratelimit-remaining-tokens"),
+    resetTokensMs: parseGroqDurationMs(headers.get("x-ratelimit-reset-tokens")),
+    limitRequests: headerNumber(headers, "x-ratelimit-limit-requests"),
+    remainingRequests: headerNumber(headers, "x-ratelimit-remaining-requests"),
+    resetRequestsMs: parseGroqDurationMs(headers.get("x-ratelimit-reset-requests")),
+  };
+}
+
+/** Which per-minute token window a 429 body says was exhausted, if any. */
+export function parseExhaustedWindow(bodyText: string): BudgetDimension | undefined {
+  const tagged = /\((OTPM|ITPM|TPM)\)/.exec(bodyText)?.[1];
+  if (tagged) return tagged.toLowerCase() as BudgetDimension;
+  if (/output tokens per minute/i.test(bodyText)) return "otpm";
+  if (/input tokens per minute/i.test(bodyText)) return "itpm";
+  if (/tokens per minute/i.test(bodyText)) return "tpm";
+  return undefined;
 }
 
 /**
@@ -118,7 +165,8 @@ function decodeCooldown(raw: unknown): CooldownEntry | undefined {
   return { untilMs, daily };
 }
 
-async function readCooldowns(
+/** Active per-model cooldowns (model id -> entry), skipping expired ones. */
+export async function readCooldowns(
   models: string[],
   now: number,
   resolveDb: () => GroqCooldownDb | undefined,
@@ -169,7 +217,7 @@ async function writeCooldown(
 }
 
 /** Abort-aware sleep that rejects with `AbortError` immediately if `signal` aborts. */
-function abortableSleep(
+export function abortableSleep(
   ms: number,
   signal: AbortSignal | null | undefined,
   sleepImpl?: (ms: number) => Promise<void>,
@@ -272,6 +320,8 @@ export type ResilientGroqFetchOptions = {
   maxCooldownSeconds?: number;
   synthesisMaxOutputTokens?: number;
   db?: GroqCooldownDb | null;
+  /** Shared token budgets to reconcile against each response's headers. */
+  budget?: Pick<GroqBudget, "observe">;
   baseFetch?: GroqFetch;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -359,6 +409,14 @@ export function createResilientGroqFetch(
       };
       cooldowns.set(model, entry);
       await writeCooldown(model, entry, currentNow, maxCooldownSeconds, resolveDb);
+      // Drain the window Groq says is exhausted so the scheduler stops
+      // granting against it; the cooldown above covers the time to reset.
+      const headers = parseGroqRateLimitHeaders(response.headers);
+      await opts.budget?.observe(model, {
+        limitTokens: headers.limitTokens,
+        remainingTokens: headers.remainingTokens,
+        exhausted: parsed.daily ? undefined : parseExhaustedWindow(bodyText),
+      });
       logInfo("groq-rate-limited", {
         stage: opts.stage,
         model,
@@ -379,6 +437,23 @@ export function createResilientGroqFetch(
     let primaryTriggerWaitMs = 0;
     const dispatchAndTrack = async (model: string): Promise<Response> => {
       const response = await callModel(model);
+      const rate = parseGroqRateLimitHeaders(response.headers);
+      if (rate.limitTokens != null || rate.remainingTokens != null) {
+        // Logged on every response so real limits can be read off the logs.
+        logInfo("groq-rate-headers", {
+          stage: opts.stage,
+          model,
+          status: response.status,
+          ...rate,
+        });
+        if (response.status !== 429) {
+          // 429s are reconciled in `record429`, which also reads the body.
+          void opts.budget?.observe(model, {
+            limitTokens: rate.limitTokens,
+            remainingTokens: rate.remainingTokens,
+          });
+        }
+      }
       if (response.status !== 429 && model !== opts.primaryModel && response.ok) {
         logInfo("groq-fallback", {
           stage: opts.stage,

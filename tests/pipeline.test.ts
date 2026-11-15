@@ -8,6 +8,7 @@ vi.mock("ai", async (importOriginal) => {
 import { generateText } from "ai";
 import { condenseSourcesDetailed, parseBatchNotes } from "@/lib/pipeline";
 import type { ExaDocument } from "@/lib/exa";
+import type { StageRunner } from "@/lib/agent/stage";
 
 const mockGenerate = vi.mocked(generateText);
 
@@ -17,7 +18,13 @@ const longDoc = (url: string, fill = "x", chars = 5_000): ExaDocument => ({
   text: fill.repeat(chars),
 });
 
-const opts = { model: {} as never, query: "q", disableCache: true as const };
+/** A summary stage that always grants `modelId` straight away. */
+const stageFor = (modelId: string): StageRunner => ({
+  primaryModelId: modelId,
+  lease: async () => ({ model: {} as never, modelId, waitedMs: 0 }),
+});
+
+const opts = { stage: stageFor("summary"), query: "q", disableCache: true as const };
 
 beforeEach(() => {
   mockGenerate.mockReset();
@@ -99,7 +106,7 @@ describe("condenseSourcesDetailed (batched)", () => {
     mockGenerate.mockResolvedValue({ text: "### Source 1\n- a" } as never);
     await condenseSourcesDetailed([longDoc("https://a.com")], {
       ...opts,
-      modelId: "qwen/qwen3.8-27b",
+      stage: stageFor("qwen/qwen3.8-27b"),
     });
     expect(mockGenerate.mock.calls[0][0].providerOptions).toEqual({
       groq: { reasoningEffort: "none", reasoningFormat: "hidden" },
@@ -109,7 +116,7 @@ describe("condenseSourcesDetailed (batched)", () => {
     mockGenerate.mockResolvedValue({ text: "### Source 1\n- b" } as never);
     await condenseSourcesDetailed([longDoc("https://b.com")], {
       ...opts,
-      modelId: "openai/gpt-oss-20b",
+      stage: stageFor("openai/gpt-oss-20b"),
     });
     expect(mockGenerate.mock.calls[0][0].providerOptions).toEqual({
       groq: { reasoningEffort: "low", reasoningFormat: "parsed" },

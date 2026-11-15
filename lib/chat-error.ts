@@ -92,6 +92,17 @@ export function describeChatError(err: unknown): ChatErrorInfo {
     };
   }
 
+  // The research queue was full, or this turn waited in it too long.
+  if (/server is busy with other research requests/i.test(message)) {
+    return {
+      title: "The server is busy",
+      detail:
+        "Only a few research requests run at once so they don't exhaust the shared model quota together. The queue was full, or this request waited in it too long.",
+      hint: "Wait a minute, then retry.",
+      technical: truncate(message),
+    };
+  }
+
   const rateLimit = describeRateLimit(message);
   if (rateLimit) return rateLimit;
 

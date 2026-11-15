@@ -21,6 +21,20 @@ export type GroqModel = {
    * tighter than the default synthesis cap (Qwen 3.8 27B allows 1,000 OTPM).
    */
   maxSynthesisTokens?: number;
+  /**
+   * Per-minute token limits used to seed the shared budgets in
+   * `lib/agent/scheduler.ts`. `tpm` is Groq's combined limit and is corrected
+   * at runtime from the `x-ratelimit-limit-tokens` response header; `itpm` /
+   * `otpm` are the org-specific input/output split, which Groq does not
+   * report in headers, so they are only as accurate as these values.
+   */
+  limits?: GroqModelLimits;
+};
+
+export type GroqModelLimits = {
+  tpm?: number;
+  itpm?: number;
+  otpm?: number;
 };
 
 export type GroqModelRole = "synthesis" | "auxiliary";
@@ -40,20 +54,30 @@ export const GROQ_MODELS: GroqModel[] = [
     reasoning: true,
     supportsZeroReasoning: true,
     maxSynthesisTokens: 900,
+    limits: { tpm: 8_000, itpm: 7_000, otpm: 1_000 },
   },
   {
     id: "openai/gpt-oss-120b",
     label: "GPT-OSS 120B",
     hint: "Most capable open model",
     reasoning: true,
+    limits: { tpm: 8_000 },
   },
   {
     id: "openai/gpt-oss-20b",
     label: "GPT-OSS 20B",
     hint: "Light & fast",
     reasoning: true,
+    limits: { tpm: 8_000 },
   },
 ];
+
+/** Seed per-minute limits for a model; `undefined` for unknown custom models. */
+export function groqModelLimits(
+  id: string | undefined | null,
+): GroqModelLimits | undefined {
+  return id ? GROQ_MODELS.find((m) => m.id === id)?.limits : undefined;
+}
 
 export const DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b";
 

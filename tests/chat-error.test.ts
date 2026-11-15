@@ -24,6 +24,25 @@ describe("describeChatError", () => {
     expect(info.title).toContain("React #185");
   });
 
+  it("explains a full or slow research queue as a busy server, not a failure", () => {
+    // The HTTP 429 body when the queue is full...
+    const rejected = describeChatError(
+      new Error(
+        '{"error":"The server is busy with other research requests right now. Please try again in a moment."}',
+      ),
+    );
+    // ...and the in-stream error when a queued turn waited too long.
+    const timedOut = describeChatError(
+      new Error(
+        "The server is busy with other research requests right now, and this one waited too long in the queue. Please try again in a minute.",
+      ),
+    );
+    for (const info of [rejected, timedOut]) {
+      expect(info.title).toBe("The server is busy");
+      expect(info.hint).toContain("retry");
+    }
+  });
+
   it("labels unknown React codes generically but descriptively", () => {
     const info = describeChatError(new Error("Minified React error #999; visit https://react.dev/errors/999"));
     expect(info.title).toBe("Client-side rendering error (React #999)");

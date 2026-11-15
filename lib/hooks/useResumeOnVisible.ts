@@ -8,6 +8,8 @@ type ChatStatus = ReturnType<typeof useChat>["status"];
 
 export type ReconnectOutcome =
   | "replayed"
+  /** Replayed, but the stream ended before the turn did. */
+  | "unfinished"
   | "empty"
   | "aborted"
   | "network-error"
@@ -15,12 +17,22 @@ export type ReconnectOutcome =
   | null;
 
 /**
+ * How often in a row a reconnect whose stream ended before its turn did is
+ * followed by another, and how long to wait before each.
+ */
+const MAX_UNFINISHED_RECONNECTS = 4;
+const UNFINISHED_RECONNECT_DELAY_MS = 500;
+
+/**
  * Reconnects `useChat` to an Upstash Redis-backed SSE stream (`/api/chat/:id/stream`)
- * across three scenarios:
+ * across four scenarios:
  *   1. Page reload while a conversation turn is still `pending`.
  *   2. Switching back to a background `pending` thread in the sidebar.
  *   3. Returning to a backgrounded tab (`visibilitychange` / `focus` / `online`)
  *      after the browser dropped the active fetch stream.
+ *   4. The server ending a stream before the turn is over, because the
+ *      request behind it could not carry the turn further. The turn waits
+ *      for the next request to tail it, so reconnecting is what continues it.
  *
  * `resumeStream()` always replays from chunk 0, so any partial trailing
  * assistant message is stripped before reconnecting. Instead of inspecting
@@ -66,6 +78,9 @@ export function useResumeOnVisible({
   const inflightRef = useRef(false);
   const reconnectingChatIdRef = useRef<string | null>(null);
   const attemptedPendingChatIdRef = useRef<string | null>(null);
+  const unfinishedReconnectsRef = useRef(0);
+  const unfinishedTimerRef = useRef<number | null>(null);
+  const reconnectRef = useRef<(id: string) => Promise<void>>(async () => {});
 
   // Keep refs updated synchronously during render so callbacks never observe a
   // pre-commit value.
@@ -81,6 +96,13 @@ export function useResumeOnVisible({
   useEffect(() => {
     inflightRef.current = false;
     attemptedPendingChatIdRef.current = null;
+    unfinishedReconnectsRef.current = 0;
+    return () => {
+      if (unfinishedTimerRef.current !== null) {
+        window.clearTimeout(unfinishedTimerRef.current);
+        unfinishedTimerRef.current = null;
+      }
+    };
   }, [chatId]);
 
   useEffect(() => {
@@ -132,6 +154,22 @@ export function useResumeOnVisible({
 
       const outcome = consumeOutcomeRef.current();
 
+      if (outcome === "unfinished") {
+        // The turn is still pending and waits for a request to continue it.
+        // The limit is for a server that keeps cutting streams short; past
+        // it, returning to the tab reconnects again.
+        inflightRef.current = true;
+        if (unfinishedReconnectsRef.current < MAX_UNFINISHED_RECONNECTS) {
+          unfinishedReconnectsRef.current += 1;
+          unfinishedTimerRef.current = window.setTimeout(() => {
+            unfinishedTimerRef.current = null;
+            void reconnectRef.current(targetChatId);
+          }, UNFINISHED_RECONNECT_DELAY_MS);
+        }
+        return;
+      }
+      unfinishedReconnectsRef.current = 0;
+
       if (outcome === "empty") {
         // Authoritative HTTP 204: nothing in Redis to replay.
         if (hadTrailingAssistant) {
@@ -176,6 +214,10 @@ export function useResumeOnVisible({
     },
     [isStopped, onResumeStart],
   );
+  // For the timer above, which cannot name `reconnect` from inside it.
+  useEffect(() => {
+    reconnectRef.current = reconnect;
+  }, [reconnect]);
 
   // Resume automatically when restoring from reload or selecting a pending
   // background thread in the sidebar once its messages have been seeded.

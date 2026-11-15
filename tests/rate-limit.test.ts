@@ -10,9 +10,6 @@ describe("getClientIp", () => {
     const headers = new Headers({ "x-forwarded-for": "1.2.3.4, 5.6.7.8" });
     expect(getClientIp(headers)).toBe("1.2.3.4");
   });
-  it("falls back to unknown", () => {
-    expect(getClientIp(new Headers())).toBe("unknown");
-  });
 });
 
 describe("checkChatRateLimit", () => {

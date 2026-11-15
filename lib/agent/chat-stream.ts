@@ -7,10 +7,11 @@ import { logError, logInfo } from "@/lib/logger";
  * Distributed SSE stream buffer and cancellation coordinator backed by Upstash
  * Redis.
  *
- * Allows `POST /api/chat` on one serverless isolate to keep streaming into
- * Redis after the client disconnects (tab switch, reload, thread switch), while
- * `GET /api/chat/:id/stream` and `POST /api/chat/:id/stop` on any isolate can
- * replay/tail chunks, poll background completion, or signal cancellation.
+ * A turn is streamed into Redis (lib/agent/detached.ts), so it carries on
+ * after the client disconnects (tab switch, reload, thread switch), while
+ * `POST /api/chat`, `GET /api/chat/:id/stream` and
+ * `POST /api/chat/:id/stop` on any isolate can replay/tail chunks, poll
+ * background completion, or signal cancellation.
  *
  * Each generation gets a unique `runId` so a superseding turn on the same
  * `chatId` never collides with or appends stray bytes to the newer run:
@@ -18,31 +19,58 @@ import { logError, logInfo } from "@/lib/logger";
  *   - `chat:run:{runId}:meta` (Hash, TTL 600s)  -> { status, stopped, updatedAt }
  *   - `chat:run:{runId}:chunks` (List, TTL 600s) -> coalesced SSE string batches
  *   - `chat:stop-turn:{chatId}:{turnId}` (String, TTL 120s) -> pre-start stop marker
+ *
+ * A run can span several attempts. Between attempts its status is `waiting`,
+ * and `chat:run:{runId}:lease` (String, short TTL) names the invocation
+ * driving it.
  */
 
 const STREAM_TTL_SECONDS = 10 * 60;
 const STOP_TURN_TTL_SECONDS = 2 * 60;
-const STOP_PENDING_TTL_SECONDS = 15;
 const FLUSH_INTERVAL_MS = 150;
 const FLUSH_CHAR_THRESHOLD = 16_384;
 const HEARTBEAT_INTERVAL_MS = 1_000;
 const POLL_FAST_MS = 200;
 const STALE_STREAM_MS = 45_000;
 
+/**
+ * The AI SDK's wire format for a UI message stream: one `data:` frame per
+ * chunk, then a closing frame.
+ */
+const sseFrame = (chunk: unknown) => `data: ${JSON.stringify(chunk)}\n\n`;
+const DONE_FRAME = "data: [DONE]\n\n";
+
 const encoder = new TextEncoder();
 
 type RunMeta = {
-  status?: "streaming" | "done";
+  /** `waiting`: no attempt is running, and the next is due at `wakeAt`. */
+  status?: "streaming" | "waiting" | "done";
   stopped?: string | number;
   updatedAt?: string | number;
   turnId?: string;
+  wakeAt?: string | number;
+  /** "1" once answer text or reasoning has been buffered. */
+  answerStarted?: string | number;
+  /** Attempts made so far. */
+  attempts?: string | number;
 };
 
-export type ChatStreamHandle = {
+/**
+ * True when an unfinished run has shown no sign of life for too long: its
+ * producer died, or its next attempt never came.
+ */
+function isStaleRun(meta: RunMeta, now: number): boolean {
+  if (meta.status === "done") return false;
+  const lastSeen = Math.max(Number(meta.updatedAt) || 0, Number(meta.wakeAt) || 0);
+  return lastSeen > 0 && now - lastSeen > STALE_STREAM_MS;
+}
+
+/** A run being streamed by an attempt, and the switch that stops its work. */
+export type ChatRun = {
   chatId: string;
   runId: string;
+  /** Aborted by the ingester when the run is stopped or replaced. */
   abortController: AbortController;
-  abortSignal: AbortSignal;
 };
 
 function activeKey(chatId: string): string {
@@ -59,10 +87,6 @@ function chunksKey(runId: string): string {
 
 function stopTurnKey(chatId: string, turnId: string): string {
   return `chat:stop-turn:${chatId}:${turnId}`;
-}
-
-function stopPendingKey(chatId: string): string {
-  return `chat:stop-pending:${chatId}`;
 }
 
 export function isChatId(value: string): boolean {
@@ -88,7 +112,7 @@ function createSerialRunner(): <T>(fn: () => Promise<T>) => Promise<T> {
 type ChatRedis = ReturnType<typeof redis>;
 
 /** Bounded exponential backoff with jitter for resume tail polling. */
-export function resumePollDelayMs(emptyPolls: number): number {
+function resumePollDelayMs(emptyPolls: number): number {
   const exponent = Math.min(Math.max(emptyPolls, 0), 3);
   const base = Math.min(1_000, POLL_FAST_MS * 2 ** exponent);
   return Math.round(base * (0.8 + Math.random() * 0.4));
@@ -111,46 +135,36 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 
 /**
  * Register a new generation run for `chatId` in Redis, marking any previous
- * active run on the same thread as stopped so its isolate aborts promptly.
- * Also checks whether an explicit Stop arrived for `turnId` before this isolate
- * finished booting.
+ * active run on the same thread as stopped so the attempt streaming it aborts
+ * promptly. `preStopped` reports that an explicit Stop for `turnId` got here
+ * before the turn did: the run is registered as already over.
  */
 export async function startChatStream(
   chatId: string,
   turnId?: string,
   db: ChatRedis = redis(),
-): Promise<ChatStreamHandle> {
+): Promise<{ runId: string; preStopped: boolean }> {
   const runId = `r_${crypto.randomUUID()}`;
-  const abortController = new AbortController();
   const now = String(Date.now());
   const validTurnId = isTurnId(turnId) ? turnId : undefined;
 
   const lookupPipe = db.pipeline();
   lookupPipe.get<string>(activeKey(chatId));
-  lookupPipe.get<string>(stopPendingKey(chatId));
   if (validTurnId) {
     lookupPipe.get<string>(stopTurnKey(chatId, validTurnId));
   }
   const lookupResults = await lookupPipe.exec();
 
   const prevRunId = lookupResults[0] as string | null;
-  const pendingStop = String(lookupResults[1] ?? "") === "1";
-  const turnStopped = validTurnId
-    ? String(lookupResults[2] ?? "") === "1"
+  // Stop was pressed for this turn before the request for it got here.
+  const preStopped = validTurnId
+    ? String(lookupResults[1] ?? "") === "1"
     : false;
-  const preStopped = pendingStop || turnStopped;
-
-  if (preStopped) {
-    abortController.abort();
-  }
 
   const pipe = db.pipeline();
   if (prevRunId) {
     pipe.hset(metaKey(prevRunId), { stopped: "1", updatedAt: now });
     pipe.expire(metaKey(prevRunId), STREAM_TTL_SECONDS);
-  }
-  if (pendingStop) {
-    pipe.del(stopPendingKey(chatId));
   }
   pipe.hset(metaKey(runId), {
     status: preStopped ? "done" : "streaming",
@@ -171,48 +185,46 @@ export async function startChatStream(
     preStopped,
   });
 
-  return {
-    chatId,
-    runId,
-    abortController,
-    abortSignal: abortController.signal,
-  };
+  return { runId, preStopped };
+}
+
+/** The run currently registered for a chat, if any. */
+export async function activeChatRun(
+  chatId: string,
+  db: ChatRedis = redis(),
+): Promise<string | null> {
+  return db.get<string>(activeKey(chatId));
 }
 
 /**
- * Cleanly finalize a run that failed before `ingestSseStream` could start so it
- * never lingers as a stale `"streaming"` entry with 0 chunks.
+ * Cleanly finalize a run that could not be started, so it never lingers as
+ * a stale `"streaming"` entry with 0 chunks.
  */
 export async function abortChatStream(
-  handle: ChatStreamHandle,
+  chatId: string,
+  runId: string,
   db: ChatRedis = redis(),
 ): Promise<void> {
-  if (!handle.abortController.signal.aborted) {
-    handle.abortController.abort();
-  }
   try {
     const now = String(Date.now());
     await db
       .pipeline()
-      .hset(metaKey(handle.runId), {
+      .hset(metaKey(runId), {
         status: "done",
         stopped: "1",
         updatedAt: now,
       })
-      .expire(metaKey(handle.runId), STREAM_TTL_SECONDS)
+      .expire(metaKey(runId), STREAM_TTL_SECONDS)
       .exec();
   } catch (error) {
-    logError("stream-abort-cleanup", error, {
-      chatId: handle.chatId,
-      runId: handle.runId,
-    });
+    logError("stream-abort-cleanup", error, { chatId, runId });
   }
 }
 
 /**
- * Explicit Stop — signals the active run on any isolate to abort, and records a
- * short-lived turn tombstone in case `POST /api/chat` has not called
- * `startChatStream` yet.
+ * Explicit Stop — signals the attempt streaming the active run to abort, and
+ * records a short-lived turn tombstone in case `POST /api/chat` has not
+ * called `startChatStream` yet.
  */
 export async function stopChatStream(
   chatId: string,
@@ -233,6 +245,15 @@ export async function stopChatStream(
     if (storedTurnId && storedTurnId !== validTurnId) stopActive = false;
   }
 
+  // A waiting run has no attempt running to notice the stop flag, so end
+  // it here; anyone tailing it is released straight away.
+  if (runId && stopActive) {
+    const status = await db.hget<string>(metaKey(runId), "status");
+    if (status === "waiting") {
+      await endChatRun(chatId, runId, { type: "abort" }, db);
+    }
+  }
+
   const pipe = db.pipeline();
   if (runId && stopActive) {
     pipe.hset(metaKey(runId), { stopped: "1", updatedAt: String(Date.now()) });
@@ -242,8 +263,6 @@ export async function stopChatStream(
     pipe.set(stopTurnKey(chatId, validTurnId), "1", {
       ex: STOP_TURN_TTL_SECONDS,
     });
-  } else if (!runId) {
-    pipe.set(stopPendingKey(chatId), "1", { ex: STOP_PENDING_TTL_SECONDS });
   }
   await pipe.exec();
 
@@ -252,16 +271,144 @@ export async function stopChatStream(
 }
 
 /**
- * Consume a teed SSE string stream, batching writes to Redis every ~150ms (or
- * 16 KB) while polling for remote stop / supersede signals at least once per
- * second even during quiet retrieval/condensation stages.
+ * End a run with a final frame when no attempt is streaming it: a stop while
+ * it was waiting, or an attempt that cannot go ahead.
  */
-export async function ingestSseStream(
-  handle: ChatStreamHandle,
-  stream: ReadableStream<string>,
+export async function endChatRun(
+  chatId: string,
+  runId: string,
+  end: { type: "abort" } | { type: "error"; errorText: string },
   db: ChatRedis = redis(),
 ): Promise<void> {
-  const { chatId, runId, abortController } = handle;
+  const now = String(Date.now());
+  await db
+    .pipeline()
+    .rpush(chunksKey(runId), sseFrame(end) + DONE_FRAME)
+    .expire(chunksKey(runId), STREAM_TTL_SECONDS)
+    // Chunks are pushed before the status flips, as in `ingestChunkStream`.
+    .hset(metaKey(runId), {
+      status: "done",
+      updatedAt: now,
+      ...(end.type === "abort" ? { stopped: "1" } : {}),
+    })
+    .expire(metaKey(runId), STREAM_TTL_SECONDS)
+    .exec();
+  logInfo("stream-end", { chatId, runId, end: end.type });
+}
+
+/** What an attempt needs to know before continuing a run. */
+export type ChatRunState = {
+  status: "streaming" | "waiting" | "done";
+  /** Stopped by the user, or replaced by a newer turn on the same chat. */
+  cancelled: boolean;
+  answerStarted: boolean;
+  attempts: number;
+  /** Batches already buffered; 0 means the message has not been opened. */
+  chunkCount: number;
+  /** When a `waiting` run's next attempt is due; 0 if none was scheduled. */
+  wakeAt: number;
+};
+
+export async function readChatRunState(
+  chatId: string,
+  runId: string,
+  db: ChatRedis = redis(),
+): Promise<ChatRunState | null> {
+  const [meta, active, chunkCount] = (await db
+    .pipeline()
+    .hgetall<RunMeta>(metaKey(runId))
+    .get<string>(activeKey(chatId))
+    .llen(chunksKey(runId))
+    .exec()) as [RunMeta | null, string | null, number];
+  if (!meta?.status) return null;
+  return {
+    status: meta.status,
+    cancelled: String(meta.stopped) === "1" || Boolean(active && active !== runId),
+    answerStarted: String(meta.answerStarted) === "1",
+    attempts: Number(meta.attempts) || 0,
+    chunkCount: Number(chunkCount) || 0,
+    wakeAt: Number(meta.wakeAt) || 0,
+  };
+}
+
+/** Mark a run as being streamed again and count the attempt. */
+export async function beginChatRunAttempt(
+  runId: string,
+  db: ChatRedis = redis(),
+): Promise<number> {
+  const results = await db
+    .pipeline()
+    .hincrby(metaKey(runId), "attempts", 1)
+    .hset(metaKey(runId), { status: "streaming", updatedAt: String(Date.now()) })
+    .expire(metaKey(runId), STREAM_TTL_SECONDS)
+    .exec();
+  return Number(results[0]) || 1;
+}
+
+/** Give back an attempt that did no work (it only waited in the queue). */
+export async function refundChatRunAttempt(
+  runId: string,
+  db: ChatRedis = redis(),
+): Promise<void> {
+  await db.hincrby(metaKey(runId), "attempts", -1);
+}
+
+/**
+ * Leave an unfinished run for a later attempt, due at `wakeAt`, when no
+ * attempt's stream is open to record that (see `AttemptIngest.wakeAt`).
+ */
+export async function parkChatRun(
+  runId: string,
+  wakeAt: number,
+  db: ChatRedis = redis(),
+): Promise<void> {
+  await db
+    .pipeline()
+    .hset(metaKey(runId), {
+      status: "waiting",
+      wakeAt: String(wakeAt),
+      updatedAt: String(Date.now()),
+    })
+    .expire(metaKey(runId), STREAM_TTL_SECONDS)
+    .exec();
+}
+
+export function runLeaseKey(runId: string): string {
+  return `chat:run:${runId}:lease`;
+}
+
+/**
+ * One run may be streamed by several attempts in turn (see
+ * lib/agent/detached.ts), so the end of one attempt's stream is not
+ * necessarily the end of the run.
+ */
+export type AttemptIngest = {
+  /**
+   * Lease of the invocation driving the run. Kept alive while the attempt
+   * streams; releasing it is up to its holder.
+   */
+  lease: { key: string; token: string; ttlSeconds: number };
+  /**
+   * Settles once the attempt's stream has closed. A time parks the run (no
+   * closing frame is written) for a later attempt to continue then;
+   * `undefined` means the run is over.
+   */
+  wakeAt: Promise<number | undefined>;
+};
+
+/**
+ * Consume one attempt's UI message chunks into the run's SSE buffer,
+ * batching writes to Redis every ~150ms (or 16 KB) while polling for remote
+ * stop / supersede signals at least once per second even during quiet
+ * retrieval/condensation stages.
+ */
+export async function ingestChunkStream(
+  run: ChatRun,
+  stream: ReadableStream<{ type: string }>,
+  attempt: AttemptIngest,
+  db: ChatRedis = redis(),
+): Promise<void> {
+  const { chatId, runId, abortController } = run;
   const runSerial = createSerialRunner();
 
   let pending = "";
@@ -270,6 +417,13 @@ export async function ingestSseStream(
   let finished = false;
   let finalized = false;
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  let answerStarted = false;
+  let answerStartRecorded = false;
+
+  const answerStartFields = (): Record<string, string> => {
+    if (!answerStarted || answerStartRecorded) return {};
+    return { answerStarted: "1" };
+  };
 
   async function syncToRedis(finalize: boolean): Promise<void> {
     // Finalize is idempotent, and no heartbeat/flush may touch a done run.
@@ -287,22 +441,31 @@ export async function ingestSseStream(
       }
     }
 
-    const batch = pending;
-    pending = "";
-    const now = String(Date.now());
+    // The stream has closed by the time of the final sync, so this is
+    // already settled.
+    const wakeAt = finalize ? await attempt.wakeAt : undefined;
 
-    // If the pipeline fails (transient Redis error), restore the batch to the
-    // front of `pending` so the next flush/finalize retries it instead of
-    // leaving a hole in the buffered stream that resume clients replay.
+    const taken = pending;
+    pending = "";
+    // The closing frame goes out with the last batch, and only if the run is
+    // over: a parked run's stream is continued by a later attempt.
+    const batch = finalize && wakeAt === undefined ? taken + DONE_FRAME : taken;
+    const now = String(Date.now());
+    const metaExtras = answerStartFields();
+
+    // If the pipeline fails (transient Redis error), put what was taken back
+    // at the front of `pending` so the next flush/finalize retries it instead
+    // of leaving a hole in the buffered stream that resume clients replay.
     const execOrRestore = async (
       pipe: ReturnType<ChatRedis["pipeline"]>,
     ): Promise<unknown[]> => {
       try {
         const results = await pipe.exec();
         if (batch.length > 0) flushedBatches += 1;
+        if (metaExtras.answerStarted) answerStartRecorded = true;
         return results;
       } catch (error) {
-        pending = batch + pending;
+        pending = taken + pending;
         throw error;
       }
     };
@@ -315,7 +478,12 @@ export async function ingestSseStream(
       }
       // Always RPUSH final bytes BEFORE marking status="done" in the pipeline
       // so readers polling HGETALL before LRANGE never miss trailing frames.
-      pipe.hset(metaKey(runId), { status: "done", updatedAt: now });
+      pipe.hset(
+        metaKey(runId),
+        wakeAt !== undefined
+          ? { status: "waiting", wakeAt: String(wakeAt), updatedAt: now, ...metaExtras }
+          : { status: "done", updatedAt: now, ...metaExtras },
+      );
       pipe.expire(metaKey(runId), STREAM_TTL_SECONDS);
       pipe.expire(activeKey(chatId), STREAM_TTL_SECONDS);
       await execOrRestore(pipe);
@@ -329,9 +497,13 @@ export async function ingestSseStream(
       pipe.rpush(chunksKey(runId), batch);
       pipe.expire(chunksKey(runId), STREAM_TTL_SECONDS);
     }
-    pipe.hset(metaKey(runId), { updatedAt: now });
+    pipe.hset(metaKey(runId), { updatedAt: now, ...metaExtras });
     pipe.expire(metaKey(runId), STREAM_TTL_SECONDS);
     pipe.expire(activeKey(chatId), STREAM_TTL_SECONDS);
+    // Keep the driving invocation's claim on the run alive while it streams.
+    pipe.set(attempt.lease.key, attempt.lease.token, {
+      ex: attempt.lease.ttlSeconds,
+    });
     pipe.hget<string | number>(metaKey(runId), "stopped");
     pipe.get<string>(activeKey(chatId));
 
@@ -377,7 +549,10 @@ export async function ingestSseStream(
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      pending += value;
+      if (value.type === "text-start" || value.type === "reasoning-start") {
+        answerStarted = true;
+      }
+      pending += sseFrame(value);
 
       if (pending.length >= FLUSH_CHAR_THRESHOLD) {
         await runSerial(async () => {
@@ -439,10 +614,16 @@ export async function ingestSseStream(
 export async function resumeChatStream(
   chatId: string,
   signal?: AbortSignal,
-  opts?: { onlyDone?: boolean },
+  opts?: {
+    onlyDone?: boolean;
+    /** Tail this run instead of whichever is active on the chat. */
+    runId?: string;
+    /** Called when a returned tail stops following the run, however it ends. */
+    onClose?: () => void;
+  },
   db: ChatRedis = redis(),
 ): Promise<Response | null> {
-  const runId = await db.get<string>(activeKey(chatId));
+  const runId = opts?.runId ?? (await db.get<string>(activeKey(chatId)));
   if (!runId) return null;
 
   if (opts?.onlyDone) {
@@ -450,9 +631,7 @@ export async function resumeChatStream(
     if (!meta?.status) return null;
 
     const done = meta.status === "done";
-    const updatedAt = Number(meta.updatedAt) || 0;
-    const stale =
-      !done && updatedAt > 0 && Date.now() - updatedAt > STALE_STREAM_MS;
+    const stale = isStaleRun(meta, Date.now());
 
     if (!done && !stale) {
       return new Response(null, { status: 202 });
@@ -483,11 +662,7 @@ export async function resumeChatStream(
 
   const initialDone = initialMeta.status === "done";
   const initialStopped = String(initialMeta.stopped) === "1";
-  const initialUpdatedAt = Number(initialMeta.updatedAt) || 0;
-  const initialStale =
-    !initialDone &&
-    initialUpdatedAt > 0 &&
-    Date.now() - initialUpdatedAt > STALE_STREAM_MS;
+  const initialStale = isStaleRun(initialMeta, Date.now());
 
   if (
     (initialDone || initialStopped || initialStale) &&
@@ -560,8 +735,7 @@ export async function resumeChatStream(
             break;
           }
 
-          const updatedAt = Number(meta.updatedAt) || 0;
-          if (updatedAt > 0 && Date.now() - updatedAt > STALE_STREAM_MS) {
+          if (isStaleRun(meta, Date.now())) {
             logInfo("stream-resume-stale", { chatId, runId });
             break;
           }
@@ -570,10 +744,12 @@ export async function resumeChatStream(
         logError("stream-resume", error, { chatId, runId });
       } finally {
         safeClose();
+        opts?.onClose?.();
       }
     },
     cancel() {
       cancelled = true;
+      opts?.onClose?.();
     },
   });
 

@@ -19,8 +19,8 @@ describe("resolveModels stage separation", () => {
       if (isResolutionError(resolved)) continue;
 
       expect(resolved.selectedModel).toBe(model.id);
-      expect(resolved.plannerModelId).not.toBe(model.id);
-      expect(resolved.summaryModelId).not.toBe(model.id);
+      expect(resolved.stages.planner.primaryModelId).not.toBe(model.id);
+      expect(resolved.stages.summary.primaryModelId).not.toBe(model.id);
     }
   });
 
@@ -33,8 +33,8 @@ describe("resolveModels stage separation", () => {
     if (isResolutionError(resolved)) throw new Error(resolved.error);
 
     expect(resolved.selectedModel).toBe("openai/gpt-oss-120b");
-    expect(resolved.plannerModelId).toBe("openai/gpt-oss-20b");
-    expect(resolved.summaryModelId).toBe("qwen/qwen3.8-27b");
+    expect(resolved.stages.planner.primaryModelId).toBe("openai/gpt-oss-20b");
+    expect(resolved.stages.summary.primaryModelId).toBe("qwen/qwen3.8-27b");
   });
 
   it("shifts summarizer off Qwen when the user selects Qwen 3.8 27B for synthesis", () => {
@@ -46,8 +46,8 @@ describe("resolveModels stage separation", () => {
     if (isResolutionError(resolved)) throw new Error(resolved.error);
 
     expect(resolved.selectedModel).toBe("qwen/qwen3.8-27b");
-    expect(resolved.summaryModelId).toBe("openai/gpt-oss-20b");
-    expect(resolved.plannerModelId).toBe("openai/gpt-oss-20b");
+    expect(resolved.stages.summary.primaryModelId).toBe("openai/gpt-oss-20b");
+    expect(resolved.stages.planner.primaryModelId).toBe("openai/gpt-oss-20b");
   });
 });
 

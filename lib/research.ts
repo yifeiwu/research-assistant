@@ -2,7 +2,6 @@ import "server-only";
 import { isAbortError } from "./errors";
 import {
   generateText,
-  type LanguageModel,
   type ModelMessage,
   type UIMessageStreamWriter,
 } from "ai";
@@ -15,6 +14,7 @@ import { buildGapCheckPrompt, buildQueryPlanPrompt } from "./prompts";
 import { extractUrls, normalizeUrlKey } from "./sources";
 import { serverConfig } from "./config";
 import { estimateTokens, truncateToTokenBudget } from "./tokens";
+import type { StageRunner } from "./agent/stage";
 import type {
   Condenser,
   Planner,
@@ -126,20 +126,27 @@ function toResearchSource(doc: ExaDocument): ResearchSource {
   return { url: doc.url, title: doc.title, publishedDate: doc.publishedDate };
 }
 
-/** Planner adapter backed by plain-text `generateText` calls. */
-function createTextPlanner(opts: {
-  model: LanguageModel;
-  modelId?: string;
-}): Planner {
-  const reasoningOpts = groqReasoningOptions(opts.modelId, "auxiliary");
+/**
+ * Planner adapter backed by plain-text `generateText` calls. Each call first
+ * leases its tokens from the shared model budgets (waiting for the window or
+ * switching model); a denied lease throws and the pipeline degrades exactly
+ * as it does for a failed planner call.
+ */
+function createTextPlanner(stage: StageRunner): Planner {
   return {
     async planQueries({ messages, maxQueries, signal }) {
+      const system = buildQueryPlanPrompt(maxQueries);
+      const leased = await stage.lease({
+        estInputTokens: estimateTokens(system) + estimateTokens(JSON.stringify(messages)),
+        maxOutputTokens: serverConfig.planner.maxOutputTokens,
+        signal,
+      });
       const result = await generateText({
-        model: opts.model,
-        system: buildQueryPlanPrompt(maxQueries),
+        model: leased.model,
+        system,
         messages,
         maxOutputTokens: serverConfig.planner.maxOutputTokens,
-        providerOptions: reasoningOpts,
+        providerOptions: groqReasoningOptions(leased.modelId, "auxiliary"),
         abortSignal: signal,
         timeout: { totalMs: serverConfig.planner.timeoutMs },
         maxRetries: 0,
@@ -148,15 +155,22 @@ function createTextPlanner(opts: {
       return { stopped: parsed.stopped, queries: parsed.lines };
     },
     async planFollowUps({ query, priorQueries, notes, maxQueries, signal }) {
-      const result = await generateText({
-        model: opts.model,
-        system: buildGapCheckPrompt(maxQueries),
+      const system = buildGapCheckPrompt(maxQueries);
+      const prompt = `User question:\n${query}\n\nQueries already run:\n${priorQueries.map((q) => `- ${q}`).join("\n")}\n\nGathered research notes so far:\n${notes}\n\nDecide whether these notes are sufficient ("DONE") or list up to ${maxQueries} follow-up search queries (one per line).`;
+      const leased = await stage.lease({
+        estInputTokens: estimateTokens(system) + estimateTokens(prompt),
         maxOutputTokens: serverConfig.gapCheck.maxOutputTokens,
-        providerOptions: reasoningOpts,
+        signal,
+      });
+      const result = await generateText({
+        model: leased.model,
+        system,
+        maxOutputTokens: serverConfig.gapCheck.maxOutputTokens,
+        providerOptions: groqReasoningOptions(leased.modelId, "auxiliary"),
         abortSignal: signal,
         timeout: { totalMs: serverConfig.gapCheck.timeoutMs },
         maxRetries: 0,
-        prompt: `User question:\n${query}\n\nQueries already run:\n${priorQueries.map((q) => `- ${q}`).join("\n")}\n\nGathered research notes so far:\n${notes}\n\nDecide whether these notes are sufficient ("DONE") or list up to ${maxQueries} follow-up search queries (one per line).`,
+        prompt,
       });
       const parsed = parsePlainTextLines(result.text, { stopToken: "DONE", maxLines: maxQueries });
       return { stopped: parsed.stopped, queries: parsed.lines };
@@ -165,8 +179,12 @@ function createTextPlanner(opts: {
 }
 
 /** SearchProvider adapter backed by the cached Exa client. */
-function createExaSearchProvider(ctx: PortContext): SearchProvider {
-  const exa = createExaClient({ signal: ctx.signal, requestId: ctx.requestId });
+function createExaSearchProvider(ctx: PortContext & { threadId?: string }): SearchProvider {
+  const exa = createExaClient({
+    signal: ctx.signal,
+    requestId: ctx.requestId,
+    threadId: ctx.threadId,
+  });
   return {
     search: (query, numResults) => exa.searchDetailed(query, numResults),
     fetchContents: (urls) => exa.fetchDetailed(urls),
@@ -174,18 +192,14 @@ function createExaSearchProvider(ctx: PortContext): SearchProvider {
 }
 
 /** Condenser adapter backed by the Groq summary model. */
-function createModelCondenser(opts: {
-  model: LanguageModel;
-  modelId?: string;
-}): Condenser {
+function createModelCondenser(stage: StageRunner): Condenser {
   return {
     condense: (docs, input) =>
       condenseSourcesDetailed(docs, {
-        model: opts.model,
+        stage,
         query: input.query,
         signal: input.signal,
         requestId: input.requestId,
-        modelId: opts.modelId,
       }),
   };
 }
@@ -199,26 +213,34 @@ export async function runResearchPipeline(opts: {
   messages: ModelMessage[];
   query: string;
   effort: EffortConfig;
-  plannerModel: LanguageModel;
-  plannerModelId?: string;
-  summaryModel: LanguageModel;
-  summaryModelId?: string;
+  /**
+   * Where the pipeline gets its models (see lib/agent/stage.ts): `planner`
+   * for query planning and gap checks, `summary` for the batched summariser.
+   */
+  stages: { planner: StageRunner; summary: StageRunner };
   writer: UIMessageStreamWriter<ChatUIMessage>;
   signal?: AbortSignal;
   requestId: string;
+  /**
+   * Conversation the turn belongs to. Searches are limited to 2 in parallel
+   * per thread (see lib/exa.ts); without one the limit is per call.
+   */
+  threadId?: string;
   deps?: Partial<ResearchDeps>;
 }): Promise<ResearchOutcome> {
   const { messages, query, effort, writer, signal, requestId } = opts;
+  const { initialQueries, resultsPerQuery, sourcesPerRound, maxSources } =
+    serverConfig.research;
 
   if (effort.rounds === 0 || !query.trim()) {
     return { searched: false, evidenceBlock: "", totalSources: 0, sources: [] };
   }
 
-  const planner =
-    opts.deps?.planner ??
-    createTextPlanner({ model: opts.plannerModel, modelId: opts.plannerModelId });
-  const search = opts.deps?.search ?? createExaSearchProvider({ signal, requestId });
-  const condenser = opts.deps?.condenser ?? createModelCondenser({ model: opts.summaryModel, modelId: opts.summaryModelId });
+  const planner = opts.deps?.planner ?? createTextPlanner(opts.stages.planner);
+  const search =
+    opts.deps?.search ??
+    createExaSearchProvider({ signal, requestId, threadId: opts.threadId });
+  const condenser = opts.deps?.condenser ?? createModelCondenser(opts.stages.summary);
 
   const explicitUrls = extractUrls(query).slice(0, MAX_EXPLICIT_URLS);
   const seenUrlKeys = new Set<string>();
@@ -262,7 +284,7 @@ export async function runResearchPipeline(opts: {
   let round1Queries: string[] = [];
   let skipSearch = false;
   try {
-    const parsed = await planner.planQueries({ messages, maxQueries: effort.queriesPerRound, signal, requestId });
+    const parsed = await planner.planQueries({ messages, maxQueries: initialQueries, signal, requestId });
     if (parsed.stopped && explicitUrls.length === 0) {
       skipSearch = true;
     } else if (parsed.queries.length > 0) {
@@ -285,11 +307,10 @@ export async function runResearchPipeline(opts: {
   }
 
   // --- Sequential retrieval rounds ---
-  // Each round runs at most `queriesPerRound` / `followUpQueries` searches in
-  // parallel (further bounded by the Exa client's per-request concurrency
-  // cap); depth comes from looping — a gap check over all notes so far
-  // decides whether another, narrower round is worth running — rather than
-  // widening any single round's parallel burst.
+  // A round issues all of its searches at once; the Exa client lets at most
+  // 2 run in parallel per thread and queues the rest. Depth comes from
+  // looping: a gap check over all notes so far decides whether another,
+  // narrower round is worth running.
   const allQueries: string[] = [];
   const evidenceBudget = serverConfig.synthesis.evidenceTokenBudget;
   let nextQueries = round1Queries;
@@ -305,7 +326,7 @@ export async function runResearchPipeline(opts: {
       round === 1 && explicitUrls.length > 0
         ? search.fetchContents(explicitUrls, { signal, requestId })
         : Promise.resolve<{ docs: ExaDocument[]; error?: string }>({ docs: [] }),
-      ...queries.map((q) => search.search(q, effort.resultsPerQuery, { signal, requestId })),
+      ...queries.map((q) => search.search(q, resultsPerQuery, { signal, requestId })),
     ]);
     if (round === 1) {
       if (explicitOutcome.error) failedContents = true;
@@ -323,7 +344,7 @@ export async function runResearchPipeline(opts: {
       round === 1 ? explicitOutcome.docs : [],
       searchOutcomes.map((o) => o.docs),
       seenUrlKeys,
-      Math.min(effort.sourcesPerRound, effort.maxSources - totalSources),
+      Math.min(sourcesPerRound, maxSources - totalSources),
     );
 
     if (roundDocs.length === 0) {
@@ -366,7 +387,7 @@ export async function runResearchPipeline(opts: {
     // further rounds cannot be used by the answer anyway — stop instead of
     // spending more planner/summarizer calls (and TPM) on trimmed evidence.
     const evidenceFull = estimateTokens(allNotes.join("\n\n")) >= evidenceBudget;
-    const isLastRound = round >= effort.rounds || totalSources >= effort.maxSources || evidenceFull;
+    const isLastRound = round >= effort.rounds || totalSources >= maxSources || evidenceFull;
     if (isLastRound || effort.followUpQueries <= 0) {
       emitStep(roundId, { round, phase: "done", queries, sources: roundSources, notes: notesText, degraded: currentDegraded() });
       break;

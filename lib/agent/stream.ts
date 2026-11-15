@@ -4,15 +4,16 @@ import {
   APICallError,
   RetryError,
   createUIMessageStream,
-  createUIMessageStreamResponse,
   streamText,
   type FinishReason,
+  type InferUIMessageChunk,
   type UIMessageStreamWriter,
 } from "ai";
 import { logInfo, logError, extractFailedGeneration } from "@/lib/logger";
 import { groqModelLabel } from "@/lib/models";
 import { verifyCitations } from "@/lib/citations";
 import type { ChatUIMessage, ResearchSource } from "@/lib/types/chat";
+import { isTurnDeferred, type TurnDeferredError } from "./defer";
 
 /** The parts of a `streamText` result this module consumes. */
 export type StreamResult = Pick<
@@ -20,6 +21,18 @@ export type StreamResult = Pick<
   "toUIMessageStream" | "finishReason"
 >;
 
+export type ChatChunk = InferUIMessageChunk<ChatUIMessage>;
+
+/** One attempt's output. */
+export type PipelineStream = {
+  stream: ReadableStream<ChatChunk>;
+  /**
+   * Settles once `stream` has closed, with the deferral if the turn was
+   * left for a later attempt. The stream then holds no `finish`, `abort` or
+   * `error`, so a later attempt can append to it.
+   */
+  deferral: Promise<TurnDeferredError | undefined>;
+};
 
 /**
  * Unwrap the most relevant underlying error. `streamText` retries transient
@@ -100,10 +113,12 @@ function noAnswerMessage(finishReason: string | undefined): string {
 /**
  * Run the deterministic research + synthesis pipeline inside a single typed
  * `UIMessageStream`. Emits `{ type: "start" }` immediately so live research
- * progress cards stream to the client (and Upstash Redis) before final answer
- * synthesis begins, and appends a fallback note if the model finishes empty.
+ * progress cards reach the run buffer before final answer synthesis begins,
+ * and appends a fallback note if the model finishes empty.
+ *
+ * `run` may throw `TurnDeferredError` to leave the turn for a later attempt.
  */
-export function createPipelineStreamResponse(
+export function createPipelineStream(
   run: (writer: UIMessageStreamWriter<ChatUIMessage>) => Promise<StreamResult>,
   ctx: {
     requestId: string;
@@ -111,209 +126,248 @@ export function createPipelineStreamResponse(
     signal?: AbortSignal;
     /** Live lookup for this turn's retrieved sources (citation allowlist). */
     getAllowedSources?: () => ResearchSource[];
+    /**
+     * Whether to open the message with a `start` chunk. An attempt that
+     * continues an earlier attempt's stream must not.
+     */
+    emitStart: boolean;
+    /**
+     * Always runs once the turn's work is over, however it ended; given the
+     * deferral if the turn was left for a later attempt.
+     */
+    onSettled?: (deferral: TurnDeferredError | undefined) => void | Promise<void>;
   },
-  options?: {
-    consumeSseStream?: (options: {
-      stream: ReadableStream<string>;
-    }) => void | PromiseLike<void>;
-  },
-): Response {
+): PipelineStream {
   const currentModelInfo = () =>
     typeof ctx.modelInfo === "function" ? ctx.modelInfo() : ctx.modelInfo;
 
-  const stream = createUIMessageStream<ChatUIMessage>({
-    execute: async ({ writer }) => {
+  let deferral: TurnDeferredError | undefined;
+  let settle!: (value: TurnDeferredError | undefined) => void;
+  const settled = new Promise<TurnDeferredError | undefined>((resolve) => {
+    settle = resolve;
+  });
+
+  const execute = async (
+    writer: UIMessageStreamWriter<ChatUIMessage>,
+  ): Promise<void> => {
+    if (ctx.emitStart) {
       writer.write({ type: "start" });
+    }
 
-      let result: StreamResult;
-      try {
-        result = await run(writer);
-      } catch (error) {
-        if (isAbortError(error) || ctx.signal?.aborted) {
-          logInfo("abort", { requestId: ctx.requestId, model: currentModelInfo() });
-          writer.write({ type: "abort" });
-          return;
-        }
-        throw error;
-      }
-
-      const reader = result
-        .toUIMessageStream<ChatUIMessage>({
-          sendStart: false,
-          sendFinish: false,
-        })
-        .getReader();
-
-      let sawText = false;
-      let sawTerminal = false;
-      let strippedCitations = 0;
-      // Per-text-part buffer plus fenced-code state. Citation verification is
-      // line-buffered (so markdown links are never split across flushes), but
-      // a fence opened in one flush and closed in a later one must still be
-      // treated as code throughout, and very long lines must not stall the
-      // stream until text-end.
-      const FLUSH_CHAR_CAP = 4_096;
-      const REASONING_FLUSH_CHARS = 120;
-      type TextState = { buffer: string; inFence: boolean };
-      type ReasoningState = {
-        buffer: string;
-        providerMetadata?: Record<string, Record<string, unknown>>;
-      };
-      const textBuffers = new Map<string, TextState>();
-      const reasoningBuffers = new Map<string, ReasoningState>();
-
-      const flushReasoning = (id: string, force: boolean) => {
-        const state = reasoningBuffers.get(id);
-        if (!state || !state.buffer) return;
-        if (
-          !force &&
-          !state.buffer.includes("\n") &&
-          state.buffer.length < REASONING_FLUSH_CHARS
-        ) {
-          return;
-        }
-        const delta = state.buffer;
-        const providerMetadata = state.providerMetadata;
-        state.buffer = "";
-        state.providerMetadata = undefined;
-        if (force) reasoningBuffers.delete(id);
-        writer.write({
-          type: "reasoning-delta",
-          id,
-          delta,
-          ...(providerMetadata != null ? { providerMetadata } : {}),
-        } as Parameters<typeof writer.write>[0]);
-      };
-
-      const verifyFragment = (state: TextState, emit: string): string => {
-        if (state.inFence) {
-          const closeIdx = emit.indexOf("```");
-          if (closeIdx === -1) return emit; // still inside the fence
-          state.inFence = false;
-          const head = emit.slice(0, closeIdx + 3);
-          return head + verifyFragment(state, emit.slice(closeIdx + 3));
-        }
-        const fenceCount = (emit.match(/```/g) ?? []).length;
-        if (fenceCount % 2 === 1) state.inFence = true;
-        const verified = verifyCitations(emit, ctx.getAllowedSources?.() ?? []);
-        strippedCitations += verified.strippedCount;
-        return verified.text;
-      };
-
-      const flushText = (id: string, force: boolean) => {
-        const state = textBuffers.get(id);
-        if (!state || !state.buffer) return;
-        const buffer = state.buffer;
-        let emit = buffer;
-        if (!force) {
-          // Prefer a newline boundary; for very long single lines, fall back
-          // to the last space once past the cap (spaces never occur inside a
-          // bare URL, so this cannot split a citation URL).
-          let boundary = buffer.lastIndexOf("\n");
-          if (boundary === -1 && buffer.length >= FLUSH_CHAR_CAP) {
-            boundary = buffer.lastIndexOf(" ");
-          }
-          if (boundary === -1) return;
-          emit = buffer.slice(0, boundary + 1);
-          state.buffer = buffer.slice(boundary + 1);
-        } else {
-          state.buffer = "";
-          textBuffers.delete(id);
-        }
-        const text = verifyFragment(state, emit);
-        if (text) {
-          writer.write({ type: "text-delta", id, delta: text });
-        }
-      };
-
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value.type === "reasoning-delta") {
-            const r = value as {
-              id: string;
-              delta: string;
-              providerMetadata?: Record<string, Record<string, unknown>>;
-            };
-            const state = reasoningBuffers.get(r.id) ?? { buffer: "" };
-            state.buffer += r.delta;
-            if (r.providerMetadata != null) {
-              state.providerMetadata = r.providerMetadata;
-            }
-            reasoningBuffers.set(r.id, state);
-            flushReasoning(r.id, false);
-            continue;
-          }
-          if (reasoningBuffers.size > 0) {
-            for (const id of [...reasoningBuffers.keys()]) {
-              flushReasoning(id, true);
-            }
-          }
-          if (value.type === "text-delta") {
-            sawText = true;
-            const id = (value as { id: string }).id;
-            const state = textBuffers.get(id) ?? { buffer: "", inFence: false };
-            state.buffer += value.delta;
-            textBuffers.set(id, state);
-            flushText(id, false);
-            continue;
-          }
-          if (value.type === "text-end") {
-            flushText((value as { id: string }).id, true);
-          }
-          if (value.type === "abort" || value.type === "error") {
-            sawTerminal = true;
-          }
-          writer.write(value);
-        }
-        for (const id of [...reasoningBuffers.keys()]) flushReasoning(id, true);
-        for (const id of [...textBuffers.keys()]) flushText(id, true);
-        if (strippedCitations > 0) {
-          logInfo("citation-verification", {
-            requestId: ctx.requestId,
-            stripped: strippedCitations,
-          });
-        }
-      } catch (error) {
-        if (isAbortError(error) || ctx.signal?.aborted) {
-          writer.write({ type: "abort" });
-          return;
-        }
-        throw error;
-      }
-
-      if (sawTerminal || ctx.signal?.aborted) {
-        if (!sawTerminal && ctx.signal?.aborted) {
-          writer.write({ type: "abort" });
-        }
+    let result: StreamResult;
+    try {
+      result = await run(writer);
+    } catch (error) {
+      if (isTurnDeferred(error)) {
+        logInfo("turn-deferred", {
+          requestId: ctx.requestId,
+          reason: error.reason,
+          delayMs: error.delayMs,
+        });
+        deferral = error;
         return;
       }
-
-      const finishReason: FinishReason | undefined = await Promise.resolve(
-        result.finishReason,
-      ).catch(() => undefined);
-
-      if (!sawText) {
-        logInfo("empty-answer", {
-          requestId: ctx.requestId,
-          modelInfo: currentModelInfo(),
-          finishReason,
-        });
-        const id = crypto.randomUUID();
-        writer.write({ type: "text-start", id });
-        writer.write({
-          type: "text-delta",
-          id,
-          delta: noAnswerMessage(finishReason),
-        });
-        writer.write({ type: "text-end", id });
+      if (isAbortError(error) || ctx.signal?.aborted) {
+        logInfo("abort", { requestId: ctx.requestId, model: currentModelInfo() });
+        writer.write({ type: "abort" });
+        return;
       }
+      throw error;
+    }
 
+    const reader = result
+      .toUIMessageStream<ChatUIMessage>({
+        sendStart: false,
+        sendFinish: false,
+      })
+      .getReader();
+
+    let sawText = false;
+    let sawTerminal = false;
+    let strippedCitations = 0;
+    // Per-text-part buffer plus fenced-code state. Citation verification is
+    // line-buffered (so markdown links are never split across flushes), but
+    // a fence opened in one flush and closed in a later one must still be
+    // treated as code throughout, and very long lines must not stall the
+    // stream until text-end.
+    const FLUSH_CHAR_CAP = 4_096;
+    const REASONING_FLUSH_CHARS = 120;
+    type TextState = { buffer: string; inFence: boolean };
+    type ReasoningState = {
+      buffer: string;
+      providerMetadata?: Record<string, Record<string, unknown>>;
+    };
+    const textBuffers = new Map<string, TextState>();
+    const reasoningBuffers = new Map<string, ReasoningState>();
+
+    const flushReasoning = (id: string, force: boolean) => {
+      const state = reasoningBuffers.get(id);
+      if (!state || !state.buffer) return;
+      if (
+        !force &&
+        !state.buffer.includes("\n") &&
+        state.buffer.length < REASONING_FLUSH_CHARS
+      ) {
+        return;
+      }
+      const delta = state.buffer;
+      const providerMetadata = state.providerMetadata;
+      state.buffer = "";
+      state.providerMetadata = undefined;
+      if (force) reasoningBuffers.delete(id);
       writer.write({
-        type: "finish",
-        finishReason: finishReason ?? "stop",
+        type: "reasoning-delta",
+        id,
+        delta,
+        ...(providerMetadata != null ? { providerMetadata } : {}),
+      } as Parameters<typeof writer.write>[0]);
+    };
+
+    const verifyFragment = (state: TextState, emit: string): string => {
+      if (state.inFence) {
+        const closeIdx = emit.indexOf("```");
+        if (closeIdx === -1) return emit; // still inside the fence
+        state.inFence = false;
+        const head = emit.slice(0, closeIdx + 3);
+        return head + verifyFragment(state, emit.slice(closeIdx + 3));
+      }
+      const fenceCount = (emit.match(/```/g) ?? []).length;
+      if (fenceCount % 2 === 1) state.inFence = true;
+      const verified = verifyCitations(emit, ctx.getAllowedSources?.() ?? []);
+      strippedCitations += verified.strippedCount;
+      return verified.text;
+    };
+
+    const flushText = (id: string, force: boolean) => {
+      const state = textBuffers.get(id);
+      if (!state || !state.buffer) return;
+      const buffer = state.buffer;
+      let emit = buffer;
+      if (!force) {
+        // Prefer a newline boundary; for very long single lines, fall back
+        // to the last space once past the cap (spaces never occur inside a
+        // bare URL, so this cannot split a citation URL).
+        let boundary = buffer.lastIndexOf("\n");
+        if (boundary === -1 && buffer.length >= FLUSH_CHAR_CAP) {
+          boundary = buffer.lastIndexOf(" ");
+        }
+        if (boundary === -1) return;
+        emit = buffer.slice(0, boundary + 1);
+        state.buffer = buffer.slice(boundary + 1);
+      } else {
+        state.buffer = "";
+        textBuffers.delete(id);
+      }
+      const text = verifyFragment(state, emit);
+      if (text) {
+        writer.write({ type: "text-delta", id, delta: text });
+      }
+    };
+
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value.type === "reasoning-delta") {
+          const r = value as {
+            id: string;
+            delta: string;
+            providerMetadata?: Record<string, Record<string, unknown>>;
+          };
+          const state = reasoningBuffers.get(r.id) ?? { buffer: "" };
+          state.buffer += r.delta;
+          if (r.providerMetadata != null) {
+            state.providerMetadata = r.providerMetadata;
+          }
+          reasoningBuffers.set(r.id, state);
+          flushReasoning(r.id, false);
+          continue;
+        }
+        if (reasoningBuffers.size > 0) {
+          for (const id of [...reasoningBuffers.keys()]) {
+            flushReasoning(id, true);
+          }
+        }
+        if (value.type === "text-delta") {
+          sawText = true;
+          const id = (value as { id: string }).id;
+          const state = textBuffers.get(id) ?? { buffer: "", inFence: false };
+          state.buffer += value.delta;
+          textBuffers.set(id, state);
+          flushText(id, false);
+          continue;
+        }
+        if (value.type === "text-end") {
+          flushText((value as { id: string }).id, true);
+        }
+        if (value.type === "abort" || value.type === "error") {
+          sawTerminal = true;
+        }
+        writer.write(value);
+      }
+      for (const id of [...reasoningBuffers.keys()]) flushReasoning(id, true);
+      for (const id of [...textBuffers.keys()]) flushText(id, true);
+      if (strippedCitations > 0) {
+        logInfo("citation-verification", {
+          requestId: ctx.requestId,
+          stripped: strippedCitations,
+        });
+      }
+    } catch (error) {
+      if (isAbortError(error) || ctx.signal?.aborted) {
+        writer.write({ type: "abort" });
+        return;
+      }
+      throw error;
+    }
+
+    if (sawTerminal || ctx.signal?.aborted) {
+      if (!sawTerminal && ctx.signal?.aborted) {
+        writer.write({ type: "abort" });
+      }
+      return;
+    }
+
+    const finishReason: FinishReason | undefined = await Promise.resolve(
+      result.finishReason,
+    ).catch(() => undefined);
+
+    if (!sawText) {
+      logInfo("empty-answer", {
+        requestId: ctx.requestId,
+        modelInfo: currentModelInfo(),
+        finishReason,
       });
+      const id = crypto.randomUUID();
+      writer.write({ type: "text-start", id });
+      writer.write({
+        type: "text-delta",
+        id,
+        delta: noAnswerMessage(finishReason),
+      });
+      writer.write({ type: "text-end", id });
+    }
+
+    writer.write({
+      type: "finish",
+      finishReason: finishReason ?? "stop",
+    });
+  };
+
+  const stream = createUIMessageStream<ChatUIMessage>({
+    execute: async ({ writer }) => {
+      try {
+        await execute(writer);
+      } finally {
+        try {
+          await ctx.onSettled?.(deferral);
+        } catch (error) {
+          logError("stream-settle", error, { requestId: ctx.requestId });
+        }
+        // The SDK closes the stream only after this function returns, so
+        // whoever reads the stream to its end finds this already settled.
+        settle(deferral);
+      }
     },
     onError: (error) => {
       const info = currentModelInfo();
@@ -325,8 +379,5 @@ export function createPipelineStreamResponse(
     },
   });
 
-  return createUIMessageStreamResponse({
-    stream,
-    consumeSseStream: options?.consumeSseStream,
-  });
+  return { stream, deferral: settled };
 }

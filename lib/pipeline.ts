@@ -1,11 +1,13 @@
 import "server-only";
 import { isAbortError } from "./errors";
-import { generateText, type LanguageModel } from "ai";
+import { generateText } from "ai";
 import type { ExaDocument } from "./exa";
 import { logDebug, logError } from "./logger";
 import { serverConfig } from "./config";
 import { groqReasoningOptions } from "./models";
 import { normalizeCacheText, requestCache, type RequestCache } from "./cache";
+import { estimateTokens } from "./tokens";
+import type { StageRunner } from "./agent/stage";
 
 const PASSTHROUGH_CHAR_LIMIT = serverConfig.summary.passthroughCharLimit;
 const BATCH_INPUT_CHAR_CAP = serverConfig.summary.batchInputCharCap;
@@ -47,11 +49,11 @@ Rules:
 type CondenseSourceOutcome = { note: string; usedFallback: boolean };
 
 export type CondenseOpts = {
-  model: LanguageModel;
+  /** Leases the summary model for the batched call (see lib/agent/stage.ts). */
+  stage: StageRunner;
   query: string;
   signal?: AbortSignal;
   requestId?: string;
-  modelId?: string;
   cache?: RequestCache;
   disableCache?: boolean;
 };
@@ -147,15 +149,24 @@ export async function condenseSourcesDetailed(
         {
           sources: entries.map((e) => ({ url: e.doc.url, content: e.input })),
           q: normalizeCacheText(opts.query),
-          model: opts.modelId ?? "summary",
+          model: opts.stage.primaryModelId,
         },
         serverConfig.cache.notesTtlSeconds,
         async () => {
+          const prompt = buildBatchPrompt(opts.query, entries);
+          // Lease inside the loader so cache hits reserve nothing. The wait
+          // (if any) happens here, before the model call, so it does not eat
+          // into the call's timeout; a denied lease throws and every pending
+          // source falls back to a raw excerpt below.
+          const leased = await opts.stage.lease({
+            estInputTokens: estimateTokens(SUMMARY_SYSTEM_PROMPT) + estimateTokens(prompt),
+            maxOutputTokens: serverConfig.summary.batchMaxOutputTokens,
+          });
           const { text } = await generateText({
-            model: opts.model,
+            model: leased.model,
             system: SUMMARY_SYSTEM_PROMPT,
             maxOutputTokens: serverConfig.summary.batchMaxOutputTokens,
-            providerOptions: groqReasoningOptions(opts.modelId, "auxiliary"),
+            providerOptions: groqReasoningOptions(leased.modelId, "auxiliary"),
             // Signal-free loader (shared/coalesced via the cache); the
             // caller's own signal is passed to `wrap` below and only
             // detaches this caller.
@@ -164,7 +175,7 @@ export async function condenseSourcesDetailed(
             // budget will not clear on an immediate retry, so don't burn
             // seconds retrying — fall back to raw excerpts instead.
             maxRetries: 0,
-            prompt: buildBatchPrompt(opts.query, entries),
+            prompt,
           });
           const notes = parseBatchNotes(text, entries.length);
           if (notes.every((n) => n === null)) {

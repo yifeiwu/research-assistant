@@ -3,6 +3,7 @@ import { isAbortError } from "./errors";
 import { logDebug, logError, logInfo } from "./logger";
 import { serverConfig } from "./config";
 import { normalizeCacheText, requestCache, type RequestCache } from "./cache";
+import { sharedBucketStore, type BucketStore } from "./agent/token-bucket";
 
 const EXA_API_BASE = "https://api.exa.ai";
 const DEFAULT_MAX_CHARS = serverConfig.exa.defaultMaxChars;
@@ -10,14 +11,6 @@ const REQUEST_TIMEOUT_MS = serverConfig.exa.timeoutMs;
 const MAX_RETRIES = serverConfig.exa.maxRetries;
 const BASE_BACKOFF_MS = serverConfig.exa.baseBackoffMs;
 const MAX_BACKOFF_MS = serverConfig.exa.maxBackoffMs;
-
-/**
- * Per-request Exa concurrency cap. Research rounds run at most 2 queries, so
- * 2 concurrent calls per request keeps a single request's burst low against
- * Exa's 10 req/s global limit even with several concurrent users.
- */
-const EXA_CONCURRENCY_PER_REQUEST =
-  serverConfig.exa.concurrencyPerRequest;
 
 export type ExaDocument = {
   url: string;
@@ -35,9 +28,11 @@ type RawExaResult = {
 };
 
 /** Bound async work to at most `limit` in-flight promises at once. */
-function createConcurrencyLimiter(
-  limit: number,
-): <T>(fn: () => Promise<T>) => Promise<T> {
+function createConcurrencyLimiter(limit: number): {
+  run: <T>(fn: () => Promise<T>) => Promise<T>;
+  /** True when nothing is running or waiting. */
+  idle: () => boolean;
+} {
   const cap = Math.max(1, Math.floor(limit));
   let active = 0;
   const queue: Array<() => void> = [];
@@ -48,29 +43,64 @@ function createConcurrencyLimiter(
     if (wake) wake();
   };
 
-  return <T>(fn: () => Promise<T>): Promise<T> =>
-    new Promise<T>((resolve, reject) => {
-      const run = () => {
-        active += 1;
-        fn().then(
-          (val) => {
-            next();
-            resolve(val);
-          },
-          (err) => {
-            next();
-            reject(err);
-          },
-        );
-      };
+  return {
+    idle: () => active === 0 && queue.length === 0,
+    run: <T>(fn: () => Promise<T>): Promise<T> =>
+      new Promise<T>((resolve, reject) => {
+        const run = () => {
+          active += 1;
+          fn().then(
+            (val) => {
+              next();
+              resolve(val);
+            },
+            (err) => {
+              next();
+              reject(err);
+            },
+          );
+        };
 
-      if (active < cap) {
-        run();
-      } else {
-        queue.push(run);
-      }
-    });
+        if (active < cap) {
+          run();
+        } else {
+          queue.push(run);
+        }
+      }),
+  };
 }
+
+/**
+ * One concurrency limit per key, shared by everything in this process that
+ * uses the same key. Limiters are dropped again once they are idle.
+ */
+function createKeyedLimiter(
+  limit: number,
+): <T>(key: string, fn: () => Promise<T>) => Promise<T> {
+  const limiters = new Map<string, ReturnType<typeof createConcurrencyLimiter>>();
+  return async (key, fn) => {
+    let limiter = limiters.get(key);
+    if (!limiter) {
+      limiter = createConcurrencyLimiter(limit);
+      limiters.set(key, limiter);
+    }
+    try {
+      return await limiter.run(fn);
+    } finally {
+      if (limiter.idle() && limiters.get(key) === limiter) limiters.delete(key);
+    }
+  };
+}
+
+/**
+ * At most 2 Exa calls are in flight at once for a conversation thread, however
+ * many its research round asks for; the rest wait their turn. A thread has
+ * one live run at a time (a new turn supersedes the old one, and detached
+ * attempts take a lease), so this bounds the thread as a whole. It is kept
+ * per process: a superseded run finishing on another instance is not counted.
+ * The total across all threads is paced by `awaitExaRateSlot`.
+ */
+const runOnThread = createKeyedLimiter(serverConfig.exa.concurrencyPerThread);
 
 function getExaApiKey(): string {
   const apiKey = process.env.EXA_API_KEY?.trim();
@@ -142,6 +172,56 @@ async function fetchWithTimeout(
   }
 }
 
+const EXA_RATE_KEY = "ratelimit:exa:rps";
+
+/**
+ * Take one slot from the Exa request budget shared by every request and
+ * isolate, waiting for it if needed. Returns how long it waited.
+ *
+ * The per-thread concurrency cap bounds one conversation's burst; this bounds
+ * all of them together. It only paces: after `maxWaitMs` the call goes ahead
+ * anyway, and Exa's own 429 handling (retry with backoff) takes over.
+ */
+export async function awaitExaRateSlot(opts?: {
+  signal?: AbortSignal;
+  requestId?: string;
+  store?: BucketStore;
+  requestsPerSecond?: number;
+  burst?: number;
+  maxWaitMs?: number;
+  now?: () => number;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+}): Promise<number> {
+  const perSecond = opts?.requestsPerSecond ?? serverConfig.exa.globalRequestsPerSecond;
+  if (perSecond <= 0) return 0;
+  const maxWaitMs = opts?.maxWaitMs ?? serverConfig.exa.globalMaxWaitMs;
+  const store = opts?.store ?? sharedBucketStore();
+  const now = opts?.now ?? Date.now;
+  const pause = opts?.sleep ?? sleep;
+  const bucket = {
+    key: EXA_RATE_KEY,
+    cost: 1,
+    capacity: Math.max(1, opts?.burst ?? serverConfig.exa.globalBurst),
+    refillPerMs: perSecond / 1_000,
+  };
+
+  const startedAt = now();
+  for (;;) {
+    if (opts?.signal?.aborted) {
+      throw new DOMException("The operation was aborted.", "AbortError");
+    }
+    const result = await store.reserve([bucket], now());
+    const waitedMs = now() - startedAt;
+    if (result.granted) return waitedMs;
+    if (waitedMs + result.waitMs > maxWaitMs) {
+      logInfo("exa-pace-skipped", { requestId: opts?.requestId, waitedMs });
+      return waitedMs;
+    }
+    // Jitter so calls queued together do not all retry on the same tick.
+    await pause(result.waitMs + Math.floor(Math.random() * 50), opts?.signal);
+  }
+}
+
 async function postExa(
   endpoint: "/search" | "/contents",
   payload: Record<string, unknown>,
@@ -156,6 +236,9 @@ async function postExa(
     if (opts.signal?.aborted) {
       throw new DOMException("The operation was aborted.", "AbortError");
     }
+
+    // Every HTTP attempt, retries included, counts against the shared rate.
+    await awaitExaRateSlot({ signal: opts.signal, requestId: opts.requestId });
 
     try {
       const response = await fetchWithTimeout(
@@ -310,27 +393,26 @@ async function fetchExaContents(
   return docs;
 }
 
-/**
- * Scoped Exa client enforcing a per-request concurrency cap (`maxConcurrent`)
- * and resilient error handling so individual query failures don't kill a round.
- */
 export type ExaSearchOutcome = { docs: ExaDocument[]; error?: string };
 
 /**
- * Scoped Exa client (the SearchProvider adapter) enforcing a per-request
- * concurrency cap, Redis request caching, and resilient error reporting so
- * individual query failures don't kill a round — but are no longer silent.
+ * Scoped Exa client (the SearchProvider adapter): at most 2 calls in flight
+ * per conversation thread, Redis request caching, and resilient error
+ * reporting so individual query failures don't kill a round but are not
+ * silent either.
  */
 export function createExaClient(opts: {
-  maxConcurrent?: number;
+  /**
+   * Conversation the searches belong to; clients with the same thread share
+   * its 2 parallel slots. Without one, the client gets slots of its own.
+   */
+  threadId?: string;
   signal?: AbortSignal;
   requestId?: string;
   cache?: RequestCache;
   disableCache?: boolean;
 }) {
-  const limit = createConcurrencyLimiter(
-    opts.maxConcurrent ?? EXA_CONCURRENCY_PER_REQUEST,
-  );
+  const threadKey = opts.threadId ?? `client:${crypto.randomUUID()}`;
   const cache = opts.cache ?? requestCache;
 
   const searchDetailed = async (
@@ -348,12 +430,13 @@ export function createExaClient(opts: {
         serverConfig.cache.searchTtlSeconds,
         // Signal-free loader: this task may be coalesced across callers, so
         // one caller's abort must not fail the rest. Our own signal is passed
-        // to `wrap`, which detaches only this caller.
+        // to `wrap`, which detaches only this caller. The thread's slot is
+        // taken here, around the real Exa call, so cache hits use no slot and
+        // a call left running after an abort keeps its slot until it ends.
         () =>
-          searchExa(query, {
-            numResults,
-            requestId: opts.requestId,
-          }),
+          runOnThread(threadKey, () =>
+            searchExa(query, { numResults, requestId: opts.requestId }),
+          ),
         { bypass: opts.disableCache, requestId: opts.requestId, signal: opts.signal },
       );
       return { docs };
@@ -373,9 +456,9 @@ export function createExaClient(opts: {
         { urls: [...urls].sort(), maxChars: DEFAULT_MAX_CHARS },
         serverConfig.cache.contentsTtlSeconds,
         () =>
-          fetchExaContents(urls, {
-            requestId: opts.requestId,
-          }),
+          runOnThread(threadKey, () =>
+            fetchExaContents(urls, { requestId: opts.requestId }),
+          ),
         { bypass: opts.disableCache, requestId: opts.requestId, signal: opts.signal },
       );
       return { docs };
@@ -386,9 +469,5 @@ export function createExaClient(opts: {
     }
   };
 
-  return {
-    searchDetailed: (query: string, numResults: number) =>
-      limit(() => searchDetailed(query, numResults)),
-    fetchDetailed: (urls: string[]) => limit(() => fetchDetailed(urls)),
-  };
+  return { searchDetailed, fetchDetailed };
 }

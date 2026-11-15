@@ -1,6 +1,12 @@
 /** Label for the in-flight status indicator, based on stream status + idle time. */
-export function busyLabel(status: string, idleSeconds: number): string {
+export function busyLabel(
+  status: string,
+  idleSeconds: number,
+  /** The turn is queued or waiting on a rate limit (the message says why). */
+  paused = false,
+): string {
   if (status === "submitted") return "Thinking…";
+  if (paused) return "Waiting…";
   // Streaming: if no new output has arrived for a few seconds, the model is
   // likely searching/reading/summarizing. Reassure the user it's still alive.
   if (idleSeconds >= 4) return "Still working — searching and reading sources…";

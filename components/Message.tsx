@@ -13,6 +13,8 @@ import { CopyButton } from "./message/CopyButton";
 import { EditUserMessage } from "./message/EditUserMessage";
 import { Reasoning } from "./message/Reasoning";
 import { SourcesBar } from "./message/SourcesBar";
+import { TurnStatus } from "./message/TurnStatus";
+import { activeTurnStatus } from "@/lib/turn-status";
 
 export const Message = memo(function Message({
   message,
@@ -33,6 +35,13 @@ export const Message = memo(function Message({
   const sources = useMemo(
     () => (isUser ? [] : collectSources(message)),
     [isUser, message],
+  );
+
+  // Only a live turn can be queued or waiting; a stale status left in a
+  // stopped or saved message is ignored.
+  const turnStatus = useMemo(
+    () => (!isUser && streaming ? activeTurnStatus(message) : null),
+    [isUser, streaming, message],
   );
 
   if (isUser && editing) {
@@ -134,6 +143,12 @@ export const Message = memo(function Message({
 
             return null;
           })}
+
+          {turnStatus && (
+            <div>
+              <TurnStatus status={turnStatus} />
+            </div>
+          )}
 
           {!isUser && streaming && (
             <span

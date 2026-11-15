@@ -1,38 +1,34 @@
-import {
-  convertToModelMessages,
-  streamText,
-  type UIMessage,
-  type UIMessageStreamWriter,
-} from "ai";
+import { convertToModelMessages, UI_MESSAGE_STREAM_HEADERS, type UIMessage } from "ai";
 import { after } from "next/server";
 import { effortConfig } from "@/lib/effort";
-import { chatRequestSchema, type ChatUIMessage } from "@/lib/types/chat";
+import { chatRequestSchema } from "@/lib/types/chat";
 import { latestUserText, pruneAssistantHistory } from "@/lib/messages";
-import { buildDirectAnswerPrompt, buildSynthesisPrompt } from "@/lib/prompts";
 import { logInfo, logError } from "@/lib/logger";
-import { resolveModels, isResolutionError } from "@/lib/agent/models";
-import {
-  groqModelLabel,
-  groqReasoningOptions,
-  maxSynthesisOutputTokens,
-} from "@/lib/models";
-import { serverConfig } from "@/lib/config";
-import type { Synthesizer } from "@/lib/ports";
-import { createPipelineStreamResponse } from "@/lib/agent/stream";
+import { isResolutionError, planModels } from "@/lib/agent/models";
 import { checkChatRateLimit, getClientIp } from "@/lib/rate-limit";
-import { runResearchPipeline } from "@/lib/research";
+import {
+  sharedAdmissionQueue,
+  type AdmissionTicket,
+} from "@/lib/agent/admission";
 import {
   startChatStream,
   abortChatStream,
-  ingestSseStream,
   isChatId,
-  type ChatStreamHandle,
 } from "@/lib/agent/chat-stream";
+import {
+  discardDetachedTurn,
+  saveDetachedTurn,
+  tailDetachedTurn,
+} from "@/lib/agent/detached";
 
-// Allow the multi-stage research + synthesis pipeline plenty of headroom.
-// Vercel Functions on Fluid compute allow up to 300s on all plans, and
-// active-CPU billing pauses while waiting on Exa / model I/O.
+// The response relays the turn's output from Redis, and the turn itself runs
+// in this invocation after (and regardless of) the response, both for at
+// most this long. A turn that needs longer is continued by a later request;
+// see lib/agent/detached.ts, where `handoffAfterMs` depends on this limit.
 export const maxDuration = 300;
+
+/** How soon a client should retry after the research queue was full. */
+const QUEUE_FULL_RETRY_AFTER_SECONDS = 15;
 
 function latestUserMessageId(messages: UIMessage[]): string | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -43,7 +39,17 @@ function latestUserMessageId(messages: UIMessage[]): string | undefined {
   return undefined;
 }
 
+/** What a turn that was stopped before it produced anything streams back. */
+function stoppedResponse(): Response {
+  return new Response(
+    'data: {"type":"start"}\n\ndata: {"type":"abort"}\n\ndata: [DONE]\n\n',
+    { headers: UI_MESSAGE_STREAM_HEADERS },
+  );
+}
+
 export async function POST(req: Request) {
+  const startedAt = Date.now();
+
   // Per-IP Redis rate limit before any expensive work (model/Exa calls).
   const rateLimit = await checkChatRateLimit(getClientIp(req.headers));
   if (!rateLimit.allowed) {
@@ -76,7 +82,9 @@ export async function POST(req: Request) {
 
   const { model, effort: rawEffort, id: rawChatId } = parsed.data;
   const messages = parsed.data.messages as unknown as UIMessage[];
-  const chatId = rawChatId && isChatId(rawChatId) ? rawChatId : undefined;
+  // The run buffer is keyed by chat, so a request without a usable chat id
+  // gets one of its own.
+  const chatId = rawChatId && isChatId(rawChatId) ? rawChatId : crypto.randomUUID();
 
   const effort = effortConfig(rawEffort);
   if (effort.rounds > 0 && !process.env.EXA_API_KEY?.trim()) {
@@ -87,50 +95,22 @@ export async function POST(req: Request) {
   }
 
   const requestId = crypto.randomUUID().slice(0, 8);
-  let activeWriter: UIMessageStreamWriter<ChatUIMessage> | undefined;
-  let activeModelInfo = "";
 
-  const resolved = resolveModels({
-    model,
-    onSynthesisFallback: (event) => {
-      activeModelInfo = `groq ${event.to}`;
-      activeWriter?.write({
-        type: "data-model-fallback",
-        id: `model-fallback-${requestId}`,
-        data: {
-          fromModel: event.from,
-          toModel: event.to,
-          fromLabel: groqModelLabel(event.from),
-          toLabel: groqModelLabel(event.to),
-        },
-      });
-    },
-  });
-  if (isResolutionError(resolved)) {
-    return Response.json(
-      { error: resolved.error },
-      { status: resolved.status },
-    );
+  // Only to reject a misconfigured server up front and to log the choice;
+  // each attempt builds the models it actually uses.
+  const plan = planModels({ model });
+  if (isResolutionError(plan)) {
+    return Response.json({ error: plan.error }, { status: plan.status });
   }
-  const {
-    selectedModel,
-    mainModel,
-    plannerModel,
-    plannerModelId,
-    summaryModel,
-    summaryModelId,
-    modelInfo,
-  } = resolved;
-  activeModelInfo = modelInfo;
 
   const query = latestUserText(messages);
   const turnId = latestUserMessageId(messages);
+  const history = pruneAssistantHistory(messages);
 
-  // Convert messages BEFORE registering the Redis stream so malformed message
-  // payloads fail cleanly with 400 rather than leaving an empty active run.
-  let modelMessages: Awaited<ReturnType<typeof convertToModelMessages>>;
+  // Check the messages convert BEFORE registering the Redis stream, so a
+  // malformed payload fails cleanly with 400 instead of in an attempt.
   try {
-    modelMessages = await convertToModelMessages(pruneAssistantHistory(messages));
+    await convertToModelMessages(history);
   } catch (error) {
     logError("convert-messages", error, { requestId, chatId });
     return Response.json(
@@ -141,122 +121,98 @@ export async function POST(req: Request) {
 
   logInfo("request", {
     requestId,
-    model: modelInfo,
-    plannerModel: plannerModelId,
-    summaryModel: summaryModelId,
+    model: `groq ${plan.selectedModel}`,
+    plannerModel: plan.candidates.planner[0],
+    summaryModel: plan.candidates.summary[0],
     messageCount: messages.length,
     query: query.slice(0, 200),
     rounds: effort.rounds,
-    maxSources: effort.maxSources,
+    followUpQueries: effort.followUpQueries,
   });
 
-  let streamHandle: ChatStreamHandle | undefined;
-  if (chatId) {
-    try {
-      streamHandle = await startChatStream(chatId, turnId);
-    } catch (error) {
-      logError("stream-start", error, { requestId, chatId });
+  // Research turns take a place in the shared FIFO queue. Join it before any
+  // stream exists so a full queue is a plain 429 the client can retry.
+  const queue = sharedAdmissionQueue();
+  let ticket: AdmissionTicket | undefined;
+  if (queue.enabled && effort.rounds > 0 && query.trim()) {
+    ticket = {
+      id: `${requestId}-${crypto.randomUUID().slice(0, 8)}`,
+      enqueuedAt: startedAt,
+    };
+    const initial = await queue.poll(ticket);
+    if (initial.state === "full") {
+      logInfo("admission-full", { requestId, queueLength: initial.queueLength });
       return Response.json(
         {
           error:
-            "Couldn't initialize the chat stream store. Check that Upstash Redis environment variables are set.",
+            "The server is busy with other research requests right now. Please try again in a moment.",
         },
-        { status: 500 },
+        {
+          status: 429,
+          headers: { "Retry-After": String(QUEUE_FULL_RETRY_AFTER_SECONDS) },
+        },
       );
     }
   }
+  const leaveQueue = async () => {
+    if (ticket) await queue.cancel(ticket);
+  };
 
-  const signal = streamHandle?.abortSignal;
-  let allowedSources: import("@/lib/types/chat").ResearchSource[] = [];
-
+  let run: Awaited<ReturnType<typeof startChatStream>>;
   try {
-    return createPipelineStreamResponse(
-      async (writer) => {
-        activeWriter = writer;
-        if (signal?.aborted) {
-          throw new DOMException("The operation was aborted.", "AbortError");
-        }
-
-        const outcome = await runResearchPipeline({
-          messages: modelMessages,
-          query,
-          effort,
-          plannerModel,
-          plannerModelId,
-          summaryModel,
-          summaryModelId,
-          writer,
-          signal,
-          requestId,
-        });
-
-        allowedSources = outcome.sources;
-        const synthesizer: Synthesizer = {
-          synthesize: (input) =>
-            streamText({
-              model: mainModel,
-              system: input.searched
-                ? buildSynthesisPrompt(input.evidenceBlock, input.degraded)
-                : buildDirectAnswerPrompt(input.degraded, input.searchFailed),
-              messages: modelMessages,
-              providerOptions: groqReasoningOptions(selectedModel, "synthesis"),
-              // Bounded per-model output reservation (e.g. 900 on Qwen's 1k OTPM
-              // bucket, 3,500 on GPT-OSS); retries/fallbacks are owned by
-              // `createResilientGroqFetch` so AI SDK blind retries are disabled.
-              maxOutputTokens: maxSynthesisOutputTokens(
-                selectedModel,
-                serverConfig.synthesis.maxOutputTokens,
-              ),
-              maxRetries: 0,
-              timeout: {
-                totalMs: serverConfig.synthesis.totalTimeoutMs,
-                stepMs: serverConfig.synthesis.stepTimeoutMs,
-              },
-              abortSignal: signal,
-              onAbort: () => {
-                logInfo("abort", { requestId, model: activeModelInfo });
-              },
-              onError: ({ error }) => {
-                logError("streamText", error, { requestId, model: activeModelInfo });
-              },
-              onFinish: ({ finishReason, usage }) => {
-                logInfo("finish", {
-                  requestId,
-                  model: activeModelInfo,
-                  finishReason,
-                  searched: outcome.searched,
-                  sources: outcome.totalSources,
-                  usage,
-                });
-              },
-            }),
-        };
-        return synthesizer.synthesize({
-          evidenceBlock: outcome.evidenceBlock,
-          degraded: outcome.degraded,
-          searched: outcome.searched,
-          searchFailed: outcome.searchFailed,
-        }) as ReturnType<typeof streamText>;
-      },
-      {
-        requestId,
-        modelInfo: () => activeModelInfo,
-        signal,
-        getAllowedSources: () => allowedSources,
-      },
-      streamHandle
-        ? {
-            consumeSseStream: ({ stream }) => {
-              const done = ingestSseStream(streamHandle, stream);
-              after(() => done);
-            },
-          }
-        : undefined,
-    );
+    run = await startChatStream(chatId, turnId);
   } catch (error) {
-    if (streamHandle) {
-      await abortChatStream(streamHandle);
-    }
-    throw error;
+    logError("stream-start", error, { requestId, chatId });
+    await leaveQueue();
+    return Response.json(
+      {
+        error:
+          "Couldn't initialize the chat stream store. Check that Upstash Redis environment variables are set.",
+      },
+      { status: 500 },
+    );
+  }
+  const { runId } = run;
+
+  // Stop was pressed before this request got here: the run is already over.
+  if (run.preStopped) {
+    await leaveQueue();
+    return stoppedResponse();
+  }
+
+  // Save the turn, then serve this request from the run's stream buffer
+  // while the turn runs behind it.
+  try {
+    await saveDetachedTurn({
+      runId,
+      chatId,
+      requestId,
+      model,
+      effort: rawEffort,
+      messages: history,
+      query,
+      ticket,
+      createdAt: startedAt,
+    });
+    const tail = await tailDetachedTurn({
+      chatId,
+      runId,
+      origin: "start",
+      startedAt,
+      signal: req.signal,
+      keepAlive: after,
+    });
+    // Nothing to tail means the run ended (stopped) before producing output.
+    return tail ?? stoppedResponse();
+  } catch (error) {
+    logError("turn-start", error, { requestId, chatId, runId });
+    // Make sure no later request runs it after this one has reported failure.
+    await discardDetachedTurn(runId);
+    await abortChatStream(chatId, runId);
+    await leaveQueue();
+    return Response.json(
+      { error: "Couldn't start your request. Please try again in a moment." },
+      { status: 503 },
+    );
   }
 }

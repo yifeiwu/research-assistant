@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
-  ingestSseStream,
+  ingestChunkStream,
   resumeChatStream,
-  resumePollDelayMs,
+  runLeaseKey,
   startChatStream,
   stopChatStream,
+  type ChatRun,
 } from "@/lib/agent/chat-stream";
 import { FakeRedis, streamOf } from "./fake-redis";
 
@@ -12,11 +13,27 @@ type Db = Parameters<typeof startChatStream>[2];
 const asDb = (fake: FakeRedis) => fake as unknown as Db;
 const CHAT = "chat-test-1234";
 
+/** Register a run on the chat, as `POST /api/chat` does, for an attempt to stream. */
+async function startRun(fake: FakeRedis, turnId?: string): Promise<ChatRun> {
+  const { runId } = await startChatStream(CHAT, turnId, asDb(fake));
+  return { chatId: CHAT, runId, abortController: new AbortController() };
+}
+
+/** An attempt that streams the run to its end. */
+const attemptFor = (run: ChatRun) => ({
+  lease: { key: runLeaseKey(run.runId), token: "attempt-1", ttlSeconds: 12 },
+  wakeAt: Promise.resolve(undefined),
+});
+
+const note = (text: string) => ({ type: "data-note", data: text });
+/** Large enough to be flushed at once, which is when stop flags are read. */
+const BIG = note("x".repeat(17_000));
+
 describe("chat-stream cross-instance protocol", () => {
   it("start -> ingest -> resume replays buffered SSE", async () => {
     const fake = new FakeRedis();
-    const handle = await startChatStream(CHAT, undefined, asDb(fake));
-    await ingestSseStream(handle, streamOf("data: hello\n\n"), asDb(fake));
+    const handle = await startRun(fake);
+    await ingestChunkStream(handle, streamOf(note("hello")), attemptFor(handle), asDb(fake));
     const res = await resumeChatStream(CHAT, undefined, undefined, asDb(fake));
     expect(res).not.toBeNull();
     expect(await res!.text()).toContain("hello");
@@ -24,41 +41,41 @@ describe("chat-stream cross-instance protocol", () => {
 
   it("onlyDone returns 202 while streaming and the payload once done", async () => {
     const fake = new FakeRedis();
-    const handle = await startChatStream(CHAT, undefined, asDb(fake));
+    const handle = await startRun(fake);
     const early = await resumeChatStream(CHAT, undefined, { onlyDone: true }, asDb(fake));
     expect(early?.status).toBe(202);
-    await ingestSseStream(handle, streamOf("data: done-chunk\n\n"), asDb(fake));
+    await ingestChunkStream(handle, streamOf(note("done-chunk")), attemptFor(handle), asDb(fake));
     const late = await resumeChatStream(CHAT, undefined, { onlyDone: true }, asDb(fake));
     expect(late?.status).toBe(200);
     expect(await late!.text()).toContain("done-chunk");
   });
 
-  it("remote stop aborts the generating isolate on flush", async () => {
+  it("remote stop aborts the attempt streaming the run on flush", async () => {
     const fake = new FakeRedis();
-    const handle = await startChatStream(CHAT, undefined, asDb(fake));
+    const handle = await startRun(fake);
     await stopChatStream(CHAT, undefined, asDb(fake));
-    await ingestSseStream(handle, streamOf("x".repeat(17_000)), asDb(fake));
-    expect(handle.abortSignal.aborted).toBe(true);
+    await ingestChunkStream(handle, streamOf(BIG), attemptFor(handle), asDb(fake));
+    expect(handle.abortController.signal.aborted).toBe(true);
   });
 
-  it("a superseding run aborts the previous isolate", async () => {
+  it("a superseding run aborts the attempt streaming the previous one", async () => {
     const fake = new FakeRedis();
-    const first = await startChatStream(CHAT, undefined, asDb(fake));
+    const first = await startRun(fake);
     await startChatStream(CHAT, undefined, asDb(fake));
-    await ingestSseStream(first, streamOf("x".repeat(17_000)), asDb(fake));
-    expect(first.abortSignal.aborted).toBe(true);
+    await ingestChunkStream(first, streamOf(BIG), attemptFor(first), asDb(fake));
+    expect(first.abortController.signal.aborted).toBe(true);
   });
 
-  it("pre-start stop tombstone aborts a late-starting run", async () => {
+  it("a stop that arrives before its turn registers the run as already stopped", async () => {
     const fake = new FakeRedis();
     await stopChatStream(CHAT, "turn-1", asDb(fake));
-    const handle = await startChatStream(CHAT, "turn-1", asDb(fake));
-    expect(handle.abortSignal.aborted).toBe(true);
+    const started = await startChatStream(CHAT, "turn-1", asDb(fake));
+    expect(started.preStopped).toBe(true);
   });
 
   it("stale runs with chunks still replay", async () => {
     const fake = new FakeRedis();
-    const handle = await startChatStream(CHAT, undefined, asDb(fake));
+    const handle = await startRun(fake);
     fake.lists.set(`chat:run:${handle.runId}:chunks`, ["data: stale\n\n"]);
     const meta = fake.hashes.get(`chat:run:${handle.runId}:meta`)!;
     meta.updatedAt = String(Date.now() - 120_000);
@@ -69,23 +86,23 @@ describe("chat-stream cross-instance protocol", () => {
   it("a delayed stop for an old turn does not kill the new turn", async () => {
     const fake = new FakeRedis();
     await startChatStream(CHAT, "turn-1", asDb(fake));
-    const second = await startChatStream(CHAT, "turn-2", asDb(fake));
+    const second = await startRun(fake, "turn-2");
     await stopChatStream(CHAT, "turn-1", asDb(fake));
-    await ingestSseStream(second, streamOf("x".repeat(17_000)), asDb(fake));
-    expect(second.abortSignal.aborted).toBe(false);
+    await ingestChunkStream(second, streamOf(BIG), attemptFor(second), asDb(fake));
+    expect(second.abortController.signal.aborted).toBe(false);
   });
 
   it("a stop for the current turn still aborts it", async () => {
     const fake = new FakeRedis();
-    const handle = await startChatStream(CHAT, "turn-9", asDb(fake));
+    const handle = await startRun(fake, "turn-9");
     await stopChatStream(CHAT, "turn-9", asDb(fake));
-    await ingestSseStream(handle, streamOf("x".repeat(17_000)), asDb(fake));
-    expect(handle.abortSignal.aborted).toBe(true);
+    await ingestChunkStream(handle, streamOf(BIG), attemptFor(handle), asDb(fake));
+    expect(handle.abortController.signal.aborted).toBe(true);
   });
 
   it("a failed Redis flush restores the batch for the finalize retry", async () => {
     const fake = new FakeRedis();
-    const handle = await startChatStream(CHAT, undefined, asDb(fake));
+    const handle = await startRun(fake);
     const originalPipeline = fake.pipeline.bind(fake);
     let failures = 1;
     fake.pipeline = (() => {
@@ -97,25 +114,21 @@ describe("chat-stream cross-instance protocol", () => {
       };
       return pipe;
     }) as typeof fake.pipeline;
-    await ingestSseStream(handle, streamOf("data: preserved\n\n"), asDb(fake));
+    await ingestChunkStream(handle, streamOf(note("preserved")), attemptFor(handle), asDb(fake));
     const res = await resumeChatStream(CHAT, undefined, undefined, asDb(fake));
-    expect(await res!.text()).toContain("preserved");
+    const replay = await res!.text();
+    expect(replay).toContain("preserved");
+    // The retry must not close the stream a second time.
+    expect(replay.split("[DONE]")).toHaveLength(2);
   });
 
   it("onlyDone marks stale partial payloads with the stale header", async () => {
     const fake = new FakeRedis();
-    const handle = await startChatStream(CHAT, undefined, asDb(fake));
+    const handle = await startRun(fake);
     fake.lists.set(`chat:run:${handle.runId}:chunks`, ["data: partial\n\n"]);
     const meta = fake.hashes.get(`chat:run:${handle.runId}:meta`)!;
     meta.updatedAt = String(Date.now() - 120_000);
     const res = await resumeChatStream(CHAT, undefined, { onlyDone: true }, asDb(fake));
     expect(res?.headers.get("x-chat-stream-stale")).toBe("1");
-  });
-
-  it("resume poll delay is bounded with backoff", () => {
-    for (let i = 0; i < 20; i++) {
-      expect(resumePollDelayMs(0)).toBeGreaterThanOrEqual(160);
-      expect(resumePollDelayMs(10)).toBeLessThanOrEqual(1_400);
-    }
   });
 });

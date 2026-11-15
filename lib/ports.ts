@@ -1,7 +1,6 @@
 import "server-only";
 import type { ModelMessage } from "ai";
 import type { ExaDocument } from "./exa";
-import type { DegradedResearch } from "./types/chat";
 
 export type PortContext = { signal?: AbortSignal; requestId?: string };
 
@@ -35,16 +34,6 @@ export interface Condenser {
     docs: ExaDocument[],
     input: { query: string } & PortContext,
   ): Promise<CondenseOutcome>;
-}
-
-/** Streams the final synthesised answer. Implemented by the chat route. */
-export interface Synthesizer {
-  synthesize(input: {
-    evidenceBlock: string;
-    degraded?: DegradedResearch;
-    searched: boolean;
-    searchFailed?: boolean;
-  }): unknown;
 }
 
 export type ResearchDeps = {

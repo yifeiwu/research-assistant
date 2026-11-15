@@ -47,10 +47,28 @@ export type ModelFallbackData = {
   toLabel: string;
 };
 
+/**
+ * Payload carried by the `data-turn-status` UI message part: why a turn is
+ * not making visible progress right now. One part per turn, replaced in
+ * place; `clear` means the turn is running again.
+ */
+export type TurnStatusData =
+  /** Waiting for a free research slot; `position` is 1-based. */
+  | { state: "queued"; position: number }
+  /** Waiting for a model's per-minute rate-limit window. `resumeAt` is epoch ms. */
+  | {
+      state: "waiting";
+      stage: "planning" | "reading" | "answering";
+      modelLabel: string;
+      resumeAt: number;
+    }
+  | { state: "clear" };
+
 /** Custom AI SDK v6 data parts emitted by `/api/chat`. */
 export type ChatDataParts = {
   "research-step": ResearchStepData;
   "model-fallback": ModelFallbackData;
+  "turn-status": TurnStatusData;
 };
 
 /** Application UIMessage type with typed research-step data parts. */

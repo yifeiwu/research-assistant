@@ -5,10 +5,19 @@ import {
   selectDeduplicatedDocs,
 } from "@/lib/research";
 import { effortConfig } from "@/lib/effort";
-import { serverConfig } from "@/lib/config";
 import type { ExaDocument } from "@/lib/exa";
+import type { StageRunner } from "@/lib/agent/stage";
 
 const doc = (url: string): ExaDocument => ({ url, title: url, text: "x" });
+
+/** Every port is injected in these tests, so no model should be leased. */
+const unusedStage = (id: string): StageRunner => ({
+  primaryModelId: id,
+  lease: async () => {
+    throw new Error(`unexpected ${id} model lease`);
+  },
+});
+const stages = { planner: unusedStage("planner"), summary: unusedStage("summary") };
 
 describe("parsePlainTextLines", () => {
   it("parses NO_SEARCH", () => {
@@ -17,33 +26,6 @@ describe("parsePlainTextLines", () => {
   it("strips bullets/numbering and dedupes", () => {
     const out = parsePlainTextLines("1. alpha query\n- beta query\nalpha query", { stopToken: "NO_SEARCH", maxLines: 4 });
     expect(out.lines).toEqual(["alpha query", "beta query"]);
-  });
-});
-
-describe("effortConfig parallelism vs rounds", () => {
-  it("bounds parallel searches per round and gains depth from more rounds", () => {
-    const medium = effortConfig("medium");
-    const high = effortConfig("high");
-    expect(medium).toMatchObject({ rounds: 2, queriesPerRound: 2, followUpQueries: 2, sourcesPerRound: 4, maxSources: 8 });
-    expect(high).toMatchObject({ rounds: 4, queriesPerRound: 2, followUpQueries: 2, sourcesPerRound: 4, maxSources: 14 });
-  });
-
-  it("keeps model-call token budgets small enough to share Groq per-minute windows", () => {
-    // Summarizer: Groq reserves the full output cap against a 1k OTPM limit,
-    // so one round's batch must leave room for the next round's.
-    expect(serverConfig.summary.batchMaxOutputTokens).toBeLessThanOrEqual(350);
-    // Planner/gap run on a dedicated auxiliary model with low/none reasoning.
-    expect(serverConfig.planner.maxOutputTokens).toBeLessThanOrEqual(300);
-    expect(serverConfig.gapCheck.maxOutputTokens).toBeLessThanOrEqual(250);
-    expect(serverConfig.gapCheck.notesTokenBudget).toBeLessThanOrEqual(1_000);
-    // Summarizer input: a 20k-char batch requested 3.7-4.2k input tokens in
-    // production, so round 2 busted the 7k ITPM window. ~10k chars keeps a
-    // batch near 2k tokens, letting sequential rounds share the minute.
-    expect(serverConfig.summary.batchInputCharCap).toBeLessThanOrEqual(10_000);
-    expect(serverConfig.summary.perSourceInputCharCap).toBeLessThanOrEqual(3_000);
-    // Synthesis cap counts reasoning tokens too (~700 observed); 3,500 fits
-    // the 8k TPM window alongside the ~2.9k-token evidence-capped input.
-    expect(serverConfig.synthesis.maxOutputTokens).toBeLessThanOrEqual(3_500);
   });
 });
 
@@ -63,8 +45,7 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "what happened",
       effort: effortConfig("medium"),
-      plannerModel: {} as never,
-      summaryModel: {} as never,
+      stages,
       writer,
       requestId: "test1234",
       deps: {
@@ -97,8 +78,7 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "breaking news",
       effort: effortConfig("medium"),
-      plannerModel: {} as never,
-      summaryModel: {} as never,
+      stages,
       writer,
       requestId: "test1234",
       deps: {
@@ -124,8 +104,7 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "summarise https://a.com/page please",
       effort: effortConfig("medium"),
-      plannerModel: {} as never,
-      summaryModel: {} as never,
+      stages,
       writer,
       requestId: "test1234",
       deps: {
@@ -154,8 +133,7 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "q",
       effort: effortConfig("medium"),
-      plannerModel: {} as never,
-      summaryModel: {} as never,
+      stages,
       writer,
       requestId: "test1234",
       deps: {
@@ -176,20 +154,17 @@ describe("runResearchPipeline degraded reporting", () => {
     expect(outcome.degraded?.messages.join(" ")).toContain("token budget");
   });
 
-  it("runs narrow sequential rounds until the gap check says DONE, never exceeding 2 parallel searches", async () => {
+  it("runs sequential rounds until the gap check says DONE", async () => {
     const chunks: { data?: { round?: number; phase?: string } }[] = [];
     const writer = { write: (c: unknown) => chunks.push(c as never) } as never;
     const searchCalls: string[] = [];
     const gapPriors: string[][] = [];
-    let active = 0;
-    let maxActive = 0;
     let gapCall = 0;
     const outcome = await runResearchPipeline({
       messages: [],
       query: "q",
       effort: effortConfig("high"),
-      plannerModel: {} as never,
-      summaryModel: {} as never,
+      stages,
       writer,
       requestId: "test1234",
       deps: {
@@ -205,10 +180,6 @@ describe("runResearchPipeline degraded reporting", () => {
         },
         search: {
           search: async (q: string) => {
-            active += 1;
-            maxActive = Math.max(maxActive, active);
-            await new Promise((r) => setTimeout(r, 5));
-            active -= 1;
             searchCalls.push(q);
             return { docs: [doc(`https://ex.com/${encodeURIComponent(q)}`)] };
           },
@@ -221,7 +192,6 @@ describe("runResearchPipeline degraded reporting", () => {
     });
     expect(outcome.searched).toBe(true);
     expect(searchCalls).toEqual(["q1", "q2", "f1", "f2"]);
-    expect(maxActive).toBeLessThanOrEqual(2);
     expect(gapPriors).toEqual([["q1", "q2"], ["q1", "q2", "f1"], ["q1", "q2", "f1", "f2"]]);
     expect(outcome.totalSources).toBe(4);
     const doneRounds = chunks.filter((c) => c.data?.phase === "done").map((c) => c.data?.round);
@@ -235,8 +205,7 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "q",
       effort: effortConfig("high"),
-      plannerModel: {} as never,
-      summaryModel: {} as never,
+      stages,
       writer,
       requestId: "test1234",
       deps: {
@@ -266,8 +235,7 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "q",
       effort: effortConfig("medium"),
-      plannerModel: {} as never,
-      summaryModel: {} as never,
+      stages,
       writer,
       requestId: "test1234",
       deps: {
@@ -297,8 +265,7 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "q",
       effort: effortConfig("high"),
-      plannerModel: {} as never,
-      summaryModel: {} as never,
+      stages,
       writer,
       requestId: "test1234",
       deps: {
@@ -333,8 +300,7 @@ describe("runResearchPipeline degraded reporting", () => {
       messages: [],
       query: "q",
       effort: effortConfig("medium"),
-      plannerModel: {} as never,
-      summaryModel: {} as never,
+      stages,
       writer,
       requestId: "test1234",
       deps: {

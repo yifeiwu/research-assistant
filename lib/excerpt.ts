@@ -61,7 +61,7 @@ function stripBoilerplateLines(raw: string): string {
   return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-function tokenizeQuery(query: string): string[] {
+export function tokenizeQuery(query: string): string[] {
   const rawTokens = query.toLowerCase().match(/[a-z0-9]{2,}/g) ?? [];
   const seen = new Set<string>();
   const out: string[] = [];
@@ -248,12 +248,24 @@ function scoreWindow(
   return score;
 }
 
-/**
- * Extract the most query-relevant, evidence-dense passages from a full-page
- * document within `maxChars`, preserving original document order and opening
- * framing context at zero LLM/API cost.
- */
-export function selectRelevantExcerpt(
+function normalizeComparable(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function isHighlightAlreadyCovered(highlight: string, excerptNorm: string): boolean {
+  const norm = normalizeComparable(highlight);
+  if (!norm) return true;
+  if (excerptNorm.includes(norm)) return true;
+  // Check an interior 48-char anchor so minor boundary truncation still counts as covered.
+  if (norm.length >= 60) {
+    const midStart = Math.floor((norm.length - 48) / 2);
+    const anchor = norm.slice(midStart, midStart + 48);
+    if (excerptNorm.includes(anchor)) return true;
+  }
+  return false;
+}
+
+function selectBodyExcerpt(
   rawBody: string,
   query: string,
   maxChars: number,
@@ -382,4 +394,64 @@ export function selectRelevantExcerpt(
   }
 
   return renderChosen(chosen).slice(0, maxChars);
+}
+
+/**
+ * Extract the most query-relevant, evidence-dense passages from a full-page
+ * document within `maxChars`, merging any non-redundant full-document neural
+ * `highlights` (e.g. facts buried beyond Exa's raw text truncation limit).
+ */
+export function selectRelevantExcerpt(
+  rawBody: string,
+  query: string,
+  maxChars: number,
+  highlights?: string[],
+): string {
+  if (maxChars <= 0) return "";
+
+  const cleanHighlights = (highlights ?? [])
+    .map((h) => h.replace(/\s+/g, " ").trim())
+    .filter((h) => h.length >= 25);
+
+  const initial = selectBodyExcerpt(rawBody, query, maxChars);
+  if (cleanHighlights.length === 0) return initial;
+
+  const initialNorm = normalizeComparable(initial);
+  const missing = cleanHighlights.filter(
+    (h) => !isHighlightAlreadyCovered(h, initialNorm),
+  );
+  if (missing.length === 0) return initial;
+
+  const highlightBudget = Math.min(1_200, Math.max(240, Math.floor(maxChars * 0.3)));
+  const header = "### Full-Document Highlights\n";
+  const picked: string[] = [];
+  let used = header.length;
+  for (const snippet of missing) {
+    const line = `- ${snippet}`;
+    const sepLen = picked.length > 0 ? 1 : 0;
+    if (used + sepLen + line.length <= highlightBudget) {
+      picked.push(line);
+      used += sepLen + line.length;
+    } else if (picked.length === 0) {
+      const available = highlightBudget - header.length - 2;
+      if (available >= 80) {
+        picked.push(`- ${clipAtBoundary(snippet, available)}`);
+      }
+      break;
+    }
+  }
+
+  if (picked.length === 0) return initial;
+
+  const highlightBlock = `${header}${picked.join("\n")}`;
+  if (initial.length + 2 + highlightBlock.length <= maxChars) {
+    return `${initial}\n\n${highlightBlock}`;
+  }
+
+  const bodyBudget = Math.max(0, maxChars - highlightBlock.length - 2);
+  if (bodyBudget < 200) {
+    return highlightBlock.slice(0, maxChars);
+  }
+  const tightenedBody = selectBodyExcerpt(rawBody, query, bodyBudget);
+  return `${tightenedBody}\n\n${highlightBlock}`.slice(0, maxChars);
 }

@@ -1,9 +1,8 @@
 "use client";
 
 import { useEffect } from "react";
-import { MessageSquarePlus, Settings2, Trash2, Undo2, X } from "lucide-react";
+import { MessageSquarePlus, Trash2, Undo2, X } from "lucide-react";
 import type { Conversation } from "@/lib/conversations";
-import { currentModelLabel, type AppSettings } from "@/lib/settings";
 
 /** Below this width the sidebar is a drawer over the conversation. */
 const DRAWER_QUERY = "(max-width: 767px)";
@@ -12,34 +11,27 @@ export function ConversationSidebar({
   conversations,
   activeId,
   open,
-  settings,
   deleted,
-  closeOnEscape = true,
   onSelect,
   onNewChat,
   onDelete,
   onUndoDelete,
   onClose,
-  onOpenSettings,
 }: {
   conversations: Conversation[];
   activeId: string | null;
   open: boolean;
-  settings: AppSettings;
   /** The conversation just deleted, while that can still be undone. */
   deleted: { id: string; title: string } | null;
-  /** False while something on top of the drawer handles Escape itself. */
-  closeOnEscape?: boolean;
   onSelect: (id: string) => void;
   onNewChat: () => void;
   onDelete: (id: string) => void;
   onUndoDelete: () => void;
   onClose: () => void;
-  onOpenSettings: () => void;
 }) {
   // As a drawer, Escape closes it. On wider screens it is part of the page.
   useEffect(() => {
-    if (!open || !closeOnEscape) return;
+    if (!open) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape" && window.matchMedia(DRAWER_QUERY).matches) {
         onClose();
@@ -47,7 +39,7 @@ export function ConversationSidebar({
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [open, closeOnEscape, onClose]);
+  }, [open, onClose]);
 
   return (
     <>
@@ -69,8 +61,6 @@ export function ConversationSidebar({
             : "max-md:-translate-x-full md:hidden")
         }
         aria-label="Conversation history"
-        // A closed drawer is only moved off screen, so without this its
-        // buttons could still be tabbed to and read out.
         inert={!open}
       >
         <div className="flex items-center justify-between gap-2 px-3 py-3">
@@ -154,7 +144,6 @@ export function ConversationSidebar({
           )}
         </nav>
 
-        {/* Always present, so that the notice appearing in it is announced. */}
         <div role="status" aria-live="polite" className="px-2">
           {deleted && (
             <div className="mb-2 flex items-center gap-2 rounded-lg border border-border bg-surface-2 py-1.5 pr-1.5 pl-3 text-xs text-muted">
@@ -173,23 +162,8 @@ export function ConversationSidebar({
           )}
         </div>
 
-        <div className="border-t border-border p-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))]">
-          <button
-            type="button"
-            onClick={onOpenSettings}
-            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-muted transition hover:bg-surface-2 hover:text-foreground"
-          >
-            <Settings2 className="h-4 w-4 shrink-0" aria-hidden />
-            <span className="flex min-w-0 flex-col">
-              <span className="text-xs text-muted">Model</span>
-              <span className="truncate text-foreground">
-                {currentModelLabel(settings)}
-              </span>
-            </span>
-          </button>
-          <p className="px-3 pt-1 text-[11px] text-muted/70">
-            powered by Groq + Exa
-          </p>
+        <div className="border-t border-border px-3 py-2.5 pb-[calc(0.625rem+env(safe-area-inset-bottom))]">
+          <p className="text-[11px] text-muted/70">powered by Groq + Exa</p>
         </div>
       </aside>
     </>

@@ -6,7 +6,11 @@ vi.mock("ai", async (importOriginal) => {
 });
 
 import { generateText } from "ai";
-import { condenseSourcesDetailed, parseBatchNotes } from "@/lib/pipeline";
+import {
+  condenseSourcesDetailed,
+  parseBatchNotes,
+  reduceNotesDetailed,
+} from "@/lib/pipeline";
 import type { ExaDocument } from "@/lib/exa";
 import type { StageRunner } from "@/lib/agent/stage";
 
@@ -170,5 +174,120 @@ describe("condenseSourcesDetailed (batched)", () => {
     });
     expect(out.fallbackCount).toBe(1);
     expect(out.notes[0]).toContain("4.8 TB/s");
+  });
+
+  it("splits high-effort rounds into 2-source micro-batches, retries transient 429s when patientWait is set, and extracts/strips Primary-Refs", async () => {
+    let call = 0;
+    mockGenerate.mockImplementation((async () => {
+      call += 1;
+      if (call === 1) {
+        throw new Error("Rate limit reached (429): try again in 3s");
+      }
+      if (call === 2) {
+        return {
+          text: [
+            "### Source 1",
+            "- Profile: news | Caveat: secondary press summary",
+            "- [Fact] Reported 31% latency drop.",
+            "- Primary-Ref: https://arxiv.org/abs/2604.09999",
+            "### Source 2",
+            "- Profile: blog/forum | Caveat: commentary",
+            "- [Claim] Argues memory bandwidth is the bottleneck.",
+            "- Primary-Ref: Stanford HELM 2026 Systems Benchmark",
+          ].join("\n"),
+        } as never;
+      }
+      return {
+        text: [
+          "### Source 1",
+          "- Profile: official-docs | Caveat: none",
+          "- [Fact] TDP is 600W.",
+          "### Source 2",
+          "- Irrelevant to research question.",
+        ].join("\n"),
+      } as never;
+    }) as never);
+
+    const leaseWaits: Array<number | undefined> = [];
+    const patientStage: StageRunner = {
+      primaryModelId: "qwen/qwen3.8-27b",
+      lease: async (req) => {
+        leaseWaits.push(req.maxWaitMs);
+        return { model: {} as never, modelId: "qwen/qwen3.8-27b", waitedMs: 0 };
+      },
+    };
+
+    const docs: ExaDocument[] = [
+      {
+        url: "https://technews.com/story",
+        title: "News",
+        text: `Secondary coverage referencing https://www.sec.gov/Archives/edgar/data/1045810/filing.htm and ${"analysis ".repeat(400)}`,
+      },
+      longDoc("https://blog.dev/post", "b", 5_000),
+      longDoc("https://docs.vendor.com/spec", "c", 5_000),
+      longDoc("https://noise.com/off", "d", 5_000),
+    ];
+
+    const out = await condenseSourcesDetailed(docs, {
+      stage: patientStage,
+      query: "accelerator latency and TDP",
+      batchSize: 2,
+      perSourceCharCap: 4_500,
+      patientWait: true,
+      extractPrimaryRefs: true,
+      disableCache: true,
+    });
+
+    // 2 micro-batches total, with micro-batch 1 retried once after the 429 -> 3 generateText calls.
+    expect(mockGenerate).toHaveBeenCalledTimes(3);
+    expect(leaseWaits.every((w) => w && w >= 40_000)).toBe(true);
+    expect(out.fallbackCount).toBe(0);
+    expect(out.notes).toHaveLength(4);
+
+    // Unretrieved Primary-Ref URLs must be stripped from the note text so synthesis cannot cite unverified URLs!
+    expect(out.notes[0]).not.toContain("2604.09999");
+    expect(out.notes[1]).not.toContain("Primary-Ref:");
+
+    // Both raw-text authority links (sec.gov) and model-emitted Primary-Ref URLs/titles are captured for hopping.
+    expect(out.primaryRefs?.urls).toEqual([
+      "https://www.sec.gov/Archives/edgar/data/1045810/filing.htm",
+      "https://arxiv.org/abs/2604.09999",
+    ]);
+    expect(out.primaryRefs?.queries).toEqual([
+      "Stanford HELM 2026 Systems Benchmark",
+    ]);
+  });
+});
+
+describe("reduceNotesDetailed (Thematic Reduce)", () => {
+  it("clusters oversized multi-round notes, sheds irrelevant sources, and preserves citation links", async () => {
+    mockGenerate
+      .mockResolvedValueOnce({
+        text: "### Sub-brief 1\n- [Fact] Margin hit 74.2% ([Q4 Filing](https://sec.gov/q4)).",
+      } as never)
+      .mockResolvedValueOnce({
+        text: "### Sub-brief 2\n- [Fact] Independent latency measured at 11ms ([Bench](https://bench.org/r)).",
+      } as never);
+
+    const notes = [
+      `### Q4 Filing\nURL: https://sec.gov/q4\n- [Fact] ${"Margin details ".repeat(450)}`,
+      "### Noise\nURL: https://spam.example/1\n- Irrelevant to research question.",
+      `### Bench\nURL: https://bench.org/r\n- [Fact] ${"Latency benchmark ".repeat(450)}`,
+    ];
+
+    const out = await reduceNotesDetailed(notes, {
+      stage: stageFor("openai/gpt-oss-20b"),
+      query: "margin and latency",
+      targetTokenBudget: 1_200,
+      patientWait: true,
+    });
+
+    expect(out.reduced).toBe(true);
+    expect(mockGenerate).toHaveBeenCalledTimes(2);
+    // Irrelevant note was dropped before clustering.
+    const allPrompts = mockGenerate.mock.calls.map((c) => String(c[0].prompt)).join("\n");
+    expect(allPrompts).not.toContain("spam.example");
+    expect(out.evidenceBlock).toContain("[Q4 Filing](https://sec.gov/q4)");
+    expect(out.evidenceBlock).toContain("[Bench](https://bench.org/r)");
   });
 });

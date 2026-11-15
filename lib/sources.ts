@@ -1,18 +1,29 @@
-import { safeStringify } from "./json";
-
 export type CollectedSource = {
   url: string;
   title?: string;
 };
 
 const URL_REGEX = /https?:\/\/[^\s)\]}"'<>]+/g;
-const MARKDOWN_LINK_REGEX = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
-/** A markdown link's destination, allowing one level of brackets in the URL. */
-const MARKDOWN_LINK_BALANCED_REGEX =
-  /\]\((https?:\/\/[^\s)]+(?:\([^\s)]*\)[^\s)]*)*)\)/g;
+
+/**
+ * Markdown link `[label](url)` allowing one level of balanced parentheses in
+ * the destination (e.g. `https://en.wikipedia.org/wiki/Foo_(bar)`).
+ */
+export const MARKDOWN_LINK_REGEX =
+  /\[([^\]]+)\]\((https?:\/\/[^\s)]+(?:\([^\s)]*\)[^\s)]*)*)\)/g;
+
+/** Split a candidate URL into the URL itself and trailing sentence punctuation. */
+export function splitTrailingPunctuation(rawUrl: string): {
+  url: string;
+  suffix: string;
+} {
+  const match = rawUrl.match(/[.,;:!?)\]}'"]+$/);
+  if (!match) return { url: rawUrl, suffix: "" };
+  return { url: rawUrl.slice(0, -match[0].length), suffix: match[0] };
+}
 
 function stripTrailingPunctuation(url: string): string {
-  return url.replace(/[.,;:!?)\]}'"]+$/, "");
+  return splitTrailingPunctuation(url).url;
 }
 
 const TRACKING_PARAM_NAMES = new Set([
@@ -66,7 +77,6 @@ export function extractUrls(text: string): string[] {
   return matches.map(stripTrailingPunctuation).filter(Boolean);
 }
 
-
 export function domainOf(url: string): string {
   try {
     return new URL(url).hostname.replace(/^www\./, "");
@@ -81,8 +91,7 @@ type MessagePart = Record<string, unknown>;
  * Collect deduplicated `{ url, title }` sources from an assistant message.
  *
  * Prefers structured `source-url` and `data-research-step` parts emitted by the
- * deterministic research pipeline, and falls back to markdown links / bare URLs
- * (plus legacy `dynamic-tool` parts) so saved conversations still render sources.
+ * deterministic research pipeline, and falls back to markdown links / bare URLs.
  */
 export function collectSources(message: {
   parts: MessagePart[];
@@ -137,25 +146,6 @@ export function collectSources(message: {
       for (const url of extractUrls(part.text)) {
         add(url);
       }
-      continue;
-    }
-
-    // Backwards compatibility for legacy saved conversations in localStorage.
-    if (part.type === "dynamic-tool") {
-      if (part.input != null) {
-        for (const url of extractUrls(safeStringify(part.input))) {
-          add(url);
-        }
-      }
-      if (part.output != null) {
-        const raw =
-          typeof part.output === "string"
-            ? part.output
-            : safeStringify(part.output);
-        for (const url of extractUrls(raw)) {
-          add(url);
-        }
-      }
     }
   }
 
@@ -174,8 +164,8 @@ export function splitSourcesByCitation(
   for (const part of message.parts) {
     if (part.type !== "text" || typeof part.text !== "string") continue;
     // Link destinations first: unlike a bare URL, one may contain brackets.
-    for (const match of part.text.matchAll(MARKDOWN_LINK_BALANCED_REGEX)) {
-      citedKeys.add(normalizeUrlKey(match[1]));
+    for (const match of part.text.matchAll(MARKDOWN_LINK_REGEX)) {
+      citedKeys.add(normalizeUrlKey(match[2]));
     }
     for (const url of extractUrls(part.text)) citedKeys.add(normalizeUrlKey(url));
   }

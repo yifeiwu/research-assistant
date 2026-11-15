@@ -8,7 +8,6 @@ import { Header } from "@/components/Header";
 import { Composer } from "@/components/Composer";
 import { EmptyState } from "@/components/EmptyState";
 import { ConversationSidebar } from "@/components/ConversationSidebar";
-import { SettingsPanel } from "@/components/SettingsPanel";
 import { UnansweredNotice } from "@/components/UnansweredNotice";
 import { useChatState } from "@/lib/hooks/useChatState";
 import { useConversations } from "@/lib/hooks/useConversations";
@@ -71,7 +70,6 @@ export default function Home() {
 
   const [input, setInput] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   // The assistant message taken out of the chat while its turn's stream is
   // replayed, shown in its place until the replay catches up.
   const [held, setHeld] = useState<{ chatId: string; message: UIMessage } | null>(
@@ -282,7 +280,6 @@ export default function Home() {
         conversations={listedConversations}
         activeId={activeId}
         open={sidebarOpen}
-        settings={settings}
         onSelect={(id) => {
           selectConversation(id);
           if (window.matchMedia("(max-width: 767px)").matches) {
@@ -299,9 +296,7 @@ export default function Home() {
         onDelete={deleteConversation}
         deleted={deleted}
         onUndoDelete={undoDelete}
-        closeOnEscape={!settingsOpen}
         onClose={() => setSidebarOpen(false)}
-        onOpenSettings={() => setSettingsOpen(true)}
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
@@ -462,14 +457,6 @@ export default function Home() {
           </>
         )}
       </div>
-
-      {settingsOpen && (
-        <SettingsPanel
-          settings={settings}
-          onChange={updateSettings}
-          onClose={() => setSettingsOpen(false)}
-        />
-      )}
     </div>
   );
 }

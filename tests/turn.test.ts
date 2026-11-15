@@ -34,7 +34,6 @@ function harness(opts?: {
     const saved: TurnCheckpoint[] = [];
     const turn = startTurn({
       requestId: "req12345",
-      threadId: "chat-thread-1",
       query: "what is new?",
       effort: effortConfig("medium"),
       modelMessages: [{ role: "user", content: "what is new?" }],
@@ -90,7 +89,6 @@ describe("startTurn", () => {
     expect(statusData(events)).toEqual([]);
 
     expect(h.calls.research).toHaveLength(1);
-    expect(h.calls.research[0].threadId).toBe("chat-thread-1");
     expect(h.calls.research[0].stages.planner).toBe(h.resolved.stages.planner);
     expect(h.calls.research[0].stages.summary).toBe(h.resolved.stages.summary);
 
@@ -302,5 +300,74 @@ describe("startTurn", () => {
     expect(hQwenFallback.calls.synthesis[0].providerOptions).toEqual({
       groq: { reasoningFormat: "parsed" },
     });
+  });
+
+  it("runs the pre-synthesis Analytical Blueprint & Entailment Critic pass on multi-source high-effort turns and checkpoints it", async () => {
+    const multiOutcome = {
+      searched: true,
+      evidenceBlock: "[Source 1]\nURL: https://a.org\n- [Fact] 34.2%\n\n[Source 2]\nURL: https://b.org\n- [Fact] 31.0%",
+      totalSources: 2,
+      sources: [{ url: "https://a.org" }, { url: "https://b.org" }],
+    };
+    const fakes = fakeTurnDeps({ outcome: multiOutcome });
+    const saved: TurnCheckpoint[] = [];
+    const turn = startTurn({
+      requestId: "req-bp-1",
+      query: "compare margins across sources",
+      effort: effortConfig("high"),
+      modelMessages: [{ role: "user", content: "compare margins across sources" }],
+      signal: new AbortController().signal,
+      emitStart: true,
+      saveCheckpoint: async (cp) => {
+        saved.push(cp);
+      },
+      maxDeferMs: 90_000,
+      answerBy: Number.POSITIVE_INFINITY,
+      finishBy: Number.POSITIVE_INFINITY,
+      deps: fakes.deps,
+    });
+    if ("error" in turn) throw new Error("unexpected resolution error");
+    await readAll(turn.stream);
+
+    expect(fakes.calls.blueprint).toHaveLength(1);
+    expect(saved.at(-1)?.analyticalBlueprint).toContain("BASELINE AUDIT");
+    expect(fakes.calls.synthesis[0].system).toContain(
+      "=== VERIFIED ANALYTICAL BLUEPRINT & ENTAILMENT AUDIT ===",
+    );
+    expect(fakes.calls.synthesis[0].system).toContain("34.2% (https://example.com/a)");
+  });
+
+  it("gracefully skips the blueprint pass without failing the turn when the planner bucket is exhausted", async () => {
+    const multiOutcome = {
+      searched: true,
+      evidenceBlock: "multi-source notes",
+      totalSources: 3,
+      sources: [{ url: "https://a.org" }, { url: "https://b.org" }, { url: "https://c.org" }],
+    };
+    const fakes = fakeTurnDeps({
+      outcome: multiOutcome,
+      plannerLease: () => async () => {
+        throw new BudgetDeniedError("planner", 55_000);
+      },
+    });
+    const turn = startTurn({
+      requestId: "req-bp-skip",
+      query: "deep question",
+      effort: effortConfig("high"),
+      modelMessages: [{ role: "user", content: "deep question" }],
+      signal: new AbortController().signal,
+      emitStart: true,
+      saveCheckpoint: async () => {},
+      maxDeferMs: 90_000,
+      answerBy: Number.POSITIVE_INFINITY,
+      finishBy: Number.POSITIVE_INFINITY,
+      deps: fakes.deps,
+    });
+    if ("error" in turn) throw new Error("unexpected resolution error");
+    const events = (await readAll(turn.stream)) as Array<Record<string, unknown>>;
+
+    expect(fakes.calls.blueprint).toHaveLength(0);
+    expect(fakes.calls.synthesis).toHaveLength(1);
+    expect(events.map((e) => e.type).at(-1)).toBe("finish");
   });
 });

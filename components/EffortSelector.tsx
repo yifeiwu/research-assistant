@@ -1,13 +1,13 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { Check, ChevronDown, Zap } from "lucide-react";
 import { EFFORT_OPTIONS, type EffortLevel } from "@/lib/effort";
+import { useMenuDismiss } from "@/lib/hooks/useMenuDismiss";
 
 /**
- * Compact "advanced" control that sits next to the Send button and lets the
- * user pick the research effort (low / medium / high). Collapsed to a single
- * chip until clicked, so it stays out of the way for the common case.
+ * Compact control next to the Send button that lets the user pick the research
+ * effort (low / medium / high).
  */
 export function EffortSelector({
   effort,
@@ -18,22 +18,8 @@ export function EffortSelector({
 }) {
   const [open, setOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    function onDocMouseDown(e: MouseEvent) {
-      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
-    }
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") setOpen(false);
-    }
-    document.addEventListener("mousedown", onDocMouseDown);
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("mousedown", onDocMouseDown);
-      document.removeEventListener("keydown", onKeyDown);
-    };
-  }, [open]);
+  const close = useCallback(() => setOpen(false), []);
+  useMenuDismiss(open, wrapRef, close);
 
   const current = EFFORT_OPTIONS.find((o) => o.id === effort);
 

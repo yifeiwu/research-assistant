@@ -6,11 +6,10 @@ import {
   isValidGroqModel,
 } from "@/lib/models";
 import { serverConfig } from "@/lib/config";
-import { logError } from "@/lib/logger";
-import { redis } from "@/lib/redis";
 import { sharedGroqBudget, type GroqBudget } from "./groq-budget";
 import {
   createResilientGroqFetch,
+  resolveGroqCooldownDb,
   type GroqCooldownDb,
   type GroqFallbackEvent,
   type GroqStage,
@@ -127,17 +126,7 @@ export function resolveModels(input: {
   const { apiKey, selectedModel, candidates } = plan;
 
   const budget = input.budget ?? sharedGroqBudget();
-
-  const resolveCooldownDb = (): GroqCooldownDb | undefined => {
-    if (input.db === null) return undefined;
-    if (input.db) return input.db;
-    try {
-      return redis() as unknown as GroqCooldownDb;
-    } catch (error) {
-      logError("groq-cooldown-redis", error, { stage: "scheduler" });
-      return undefined;
-    }
-  };
+  const resolveCooldownDb = resolveGroqCooldownDb(input.db, "scheduler");
 
   const scheduler =
     input.scheduler ??
@@ -194,6 +183,7 @@ export function resolveModels(input: {
           candidates: candidates[stage],
           estInputTokens: req.estInputTokens,
           maxOutputTokens: req.maxOutputTokens,
+          maxWaitMs: req.maxWaitMs,
           signal: req.signal,
         });
         if (isDenied(result)) throw new BudgetDeniedError(stage, result.waitMs);

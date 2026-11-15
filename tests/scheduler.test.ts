@@ -161,6 +161,24 @@ describe("createModelScheduler", () => {
     }
   });
 
+  it("honours per-request maxWaitMs overrides for patient high-effort stages", async () => {
+    const { scheduler, sleeps } = setup({ waitMs: 5_000 });
+    await scheduler.acquire(request({ candidates: [PRIMARY] })); // 3,000 left
+    await scheduler.acquire(request({ candidates: [PRIMARY] })); // 0 left (needs 30s)
+
+    // Default 5s cap denies when only PRIMARY is eligible (and switches to FALLBACK when available):
+    expect(await scheduler.acquire(request({ candidates: [PRIMARY] }))).toEqual({
+      denied: true,
+      waitMs: 30_000,
+    });
+    expect(sleeps).toEqual([]);
+
+    // Patient 45s override waits for PRIMARY's bucket to refill instead of switching to FALLBACK:
+    const granted = await scheduler.acquire(request({ maxWaitMs: 45_000 }));
+    expect(granted).toEqual({ model: PRIMARY, waitedMs: 30_050 });
+    expect(sleeps).toEqual([30_050]);
+  });
+
   it("rejects with AbortError when the turn is stopped mid-wait", async () => {
     const controller = new AbortController();
     const budget = createGroqBudget({

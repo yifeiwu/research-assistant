@@ -127,7 +127,6 @@ export function useChatState<UI_MESSAGE extends UIMessage = UIMessage>(
     messages: current.messages,
     setMessages,
     sendMessage: chat.sendMessage,
-    regenerate: chat.regenerate,
     clearError: chat.clearError,
     stop: chat.stop,
     error: current.error,

@@ -1,5 +1,7 @@
 import "server-only";
 import { createHash } from "node:crypto";
+import { createAbortError } from "./errors";
+import { decodeStoredJson } from "./json";
 import { redis } from "./redis";
 import { logDebug, logError } from "./logger";
 
@@ -12,15 +14,12 @@ export type CacheStore = {
 function defaultStore(): CacheStore {
   const db = redis();
   return {
-    // Upstash's client auto-deserializes JSON on read: a stored JSON object
-    // or array comes back as an object/array, and a stored JSON string comes
-    // back as the plain string — not as raw JSON text.
     get: (key) => db.get(key),
     set: (key, value, ttlSeconds) => db.set(key, value, { ex: ttlSeconds }),
   };
 }
 
-export function cacheKey(namespace: string, parts: unknown): string {
+function cacheKey(namespace: string, parts: unknown): string {
   const hash = createHash("sha256")
     .update(JSON.stringify(parts))
     .digest("hex")
@@ -49,11 +48,10 @@ export type RequestCache = {
 function withCallerAbort<T>(task: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return task;
   if (signal.aborted) {
-    return Promise.reject(new DOMException("The operation was aborted.", "AbortError"));
+    return Promise.reject(createAbortError());
   }
   return new Promise<T>((resolve, reject) => {
-    const onAbort = () =>
-      reject(new DOMException("The operation was aborted.", "AbortError"));
+    const onAbort = () => reject(createAbortError());
     signal.addEventListener("abort", onAbort, { once: true });
     task.then(
       (value) => {
@@ -97,15 +95,8 @@ export function createRequestCache(store?: CacheStore): RequestCache {
           const hit = await cache.get(key);
           if (hit != null) {
             logDebug("cache-hit", { requestId: opts?.requestId, namespace });
-            // Already-deserialized values (objects/arrays/plain strings from
-            // Upstash) are used as-is; only a raw JSON string needs parsing,
-            // and a plain non-JSON string is the value itself.
-            if (typeof hit !== "string") return hit as Awaited<ReturnType<typeof loader>>;
-            try {
-              return JSON.parse(hit) as Awaited<ReturnType<typeof loader>>;
-            } catch {
-              return hit as Awaited<ReturnType<typeof loader>>;
-            }
+            const decoded = decodeStoredJson<Awaited<ReturnType<typeof loader>>>(hit);
+            return decoded ?? (hit as Awaited<ReturnType<typeof loader>>);
           }
         } catch (error) {
           logError("cache-get", error, { requestId: opts?.requestId, namespace });

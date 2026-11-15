@@ -2,7 +2,11 @@ import { convertToModelMessages, UI_MESSAGE_STREAM_HEADERS, type UIMessage } fro
 import { after } from "next/server";
 import { effortConfig } from "@/lib/effort";
 import { chatRequestSchema } from "@/lib/types/chat";
-import { latestUserText, pruneAssistantHistory } from "@/lib/messages";
+import {
+  findLastUserMessageId,
+  latestUserText,
+  pruneAssistantHistory,
+} from "@/lib/messages";
 import { logInfo, logError } from "@/lib/logger";
 import { isResolutionError, planModels } from "@/lib/agent/models";
 import { checkChatRateLimit, getClientIp } from "@/lib/rate-limit";
@@ -30,15 +34,6 @@ export const maxDuration = 300;
 
 /** How soon a client should retry after the research queue was full. */
 const QUEUE_FULL_RETRY_AFTER_SECONDS = 15;
-
-function latestUserMessageId(messages: UIMessage[]): string | undefined {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user" && typeof messages[i].id === "string") {
-      return messages[i].id;
-    }
-  }
-  return undefined;
-}
 
 /** What a turn that was stopped before it produced anything streams back. */
 function stoppedResponse(): Response {
@@ -105,7 +100,7 @@ export async function POST(req: Request) {
   }
 
   const query = latestUserText(messages);
-  const turnId = latestUserMessageId(messages);
+  const turnId = findLastUserMessageId(messages);
   const history = pruneAssistantHistory(messages);
 
   // Check the messages convert BEFORE registering the Redis stream, so a
@@ -127,8 +122,8 @@ export async function POST(req: Request) {
     summaryModel: plan.candidates.summary[0],
     messageCount: messages.length,
     query: query.slice(0, 200),
+    effort: effort.level,
     rounds: effort.rounds,
-    followUpQueries: effort.followUpQueries,
   });
 
   // Research turns take a place in the shared FIFO queue. Join it before any

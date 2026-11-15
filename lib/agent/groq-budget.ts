@@ -23,7 +23,7 @@ export type BudgetDimension = "tpm" | "itpm" | "otpm";
 
 const BUCKET_KEY_PREFIX = "ratelimit:groq:bucket:";
 
-export function budgetBucketKey(model: string, dimension: BudgetDimension): string {
+function budgetBucketKey(model: string, dimension: BudgetDimension): string {
   return `${BUCKET_KEY_PREFIX}${model}:${dimension}`;
 }
 

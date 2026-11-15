@@ -27,27 +27,29 @@ export const serverConfig = {
   // `llama-3.1-8b-instant` was shut down 2026-08-16, so a stale env default
   // silently degraded every research turn to raw-text fallbacks.
   summaryModel: "qwen/qwen3.8-27b",
-  // The fixed shape of a research round. Effort (lib/effort.ts) only changes
-  // how many rounds run and how many follow-up queries a gap check may add.
+  // Baseline shape of a single-query research round (overridden on `high` effort
+  // where wider candidate pools and deeper excerpts are enabled).
   research: {
-    // Searches planned for the first round.
-    initialQueries: 2,
-    resultsPerQuery: 4,
+    resultsPerQuery: 6,
+    deepResultsPerQuery: 8,
     // Unique sources condensed per round, and in total across all rounds.
     sourcesPerRound: 4,
-    maxSources: 14,
+    maxSources: 20,
+    deepGatherTokenBudget: 8_500,
   },
   exa: {
     timeoutMs: intFromEnv("EXA_TIMEOUT_MS", 25_000),
     maxRetries: 2,
     baseBackoffMs: 500,
     maxBackoffMs: 3_000,
-    // Exa calls in flight at once for one conversation thread.
-    concurrencyPerThread: 2,
     defaultMaxChars: 14_000,
+    deepMaxChars: 20_000,
+    highlightsPerUrl: 4,
+    highlightSentences: 4,
     // Shared (Redis) cap on the sustained rate of Exa HTTP calls across every
     // request and isolate. 0 disables it. A short burst of `globalBurst`
     // calls may go out on top, so the defaults peak at Exa's 10 req/s limit.
+    // Note: Exa calls inside a single turn are strictly sequential (never parallel).
     globalRequestsPerSecond: nonNegativeIntFromEnv("EXA_REQUESTS_PER_SECOND", 8),
     globalBurst: 2,
     // Longest a single Exa call queues for the shared cap before going anyway.
@@ -65,6 +67,8 @@ export const serverConfig = {
     // so one long page cannot starve the rest.
     batchInputCharCap: 10_000,
     perSourceInputCharCap: 3_000,
+    deepPerSourceInputCharCap: 4_500,
+    deepBatchSize: 2,
     fallbackCharCap: 4_000,
     // Groq reserves the full max-output budget against the summary model's
     // OTPM. `maxSummaryOutputTokens` caps Qwen 3.8 27B at 450 (so 2 rounds
@@ -72,6 +76,24 @@ export const serverConfig = {
     // 650 tokens to accommodate "low" reasoning + dense factual bullets.
     batchMaxOutputTokens: 650,
     timeoutMs: 25_000,
+  },
+  rerank: {
+    timeoutMs: 12_000,
+    maxOutputTokens: 160,
+  },
+  reduce: {
+    clusterTokenCap: 2_600,
+    maxOutputTokens: 700,
+    timeoutMs: 30_000,
+  },
+  blueprint: {
+    timeoutMs: 25_000,
+    maxOutputTokens: 600,
+    maxInjectedChars: 1_800,
+    // Reserve ~450 tokens for the injected analytical blueprint on high effort
+    // so (evidence + blueprint + prompt + history + 3.5k output) stays <= 8k TPM.
+    deepEvidenceTokenBudget: 2_600,
+    minRemainingWindowMs: 55_000,
   },
   // Planner/gap-check outputs are a handful of short query lines (or DONE /
   // NO_SEARCH); with auxiliary reasoning set to "low"/"none" and routed to a
@@ -114,6 +136,13 @@ export const serverConfig = {
       synthesisMs: 25_000,
       plannerMs: 10_000,
       summaryMs: 20_000,
+    },
+    // Extended per-stage rate-limit patience when `high` effort trades latency
+    // for lossless multi-batch condensation and non-fallback synthesis.
+    deepBudgetWait: {
+      synthesisMs: 40_000,
+      plannerMs: 20_000,
+      summaryMs: 45_000,
     },
     // TPM an auxiliary stage must leave free in a *fallback* model's bucket,
     // so one turn's planner/summariser cannot drain another turn's answer.

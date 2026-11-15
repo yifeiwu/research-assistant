@@ -16,8 +16,8 @@ import { Markdown } from "./Markdown";
 import { domainOf } from "@/lib/sources";
 import type { ResearchStepData } from "@/lib/types/chat";
 
-function pluralize(count: number, singular: string, plural?: string): string {
-  return `${count} ${count === 1 ? singular : (plural ?? `${singular}s`)}`;
+function pluralize(count: number, singular: string): string {
+  return `${count} ${count === 1 ? singular : `${singular}s`}`;
 }
 
 function stepPresentation(data: ResearchStepData): {
@@ -28,14 +28,13 @@ function stepPresentation(data: ResearchStepData): {
   failed: boolean;
 } {
   const isFollowUp = data.round > 1;
-  const qCount = data.queries.length;
   const sCount = data.sources.length;
 
   switch (data.phase) {
     case "planning":
       return {
         icon: Compass,
-        title: "Planning search queries",
+        title: "Planning search",
         status: "planning…",
         running: true,
         failed: false,
@@ -43,10 +42,16 @@ function stepPresentation(data: ResearchStepData): {
     case "searching":
       return {
         icon: Search,
-        title: isFollowUp
-          ? `Follow-up search (${pluralize(qCount, "query", "queries")})`
-          : `Searching ${pluralize(qCount, "query", "queries")}`,
+        title: isFollowUp ? "Follow-up search" : "Searching the web",
         status: "searching…",
+        running: true,
+        failed: false,
+      };
+    case "reranking":
+      return {
+        icon: Compass,
+        title: "Selecting highest-authority sources",
+        status: "reranking…",
         running: true,
         failed: false,
       };
@@ -68,6 +73,14 @@ function stepPresentation(data: ResearchStepData): {
         running: true,
         failed: false,
       };
+    case "synthesizing":
+      return {
+        icon: Sparkles,
+        title: "Distilling cross-round research brief",
+        status: "distilling…",
+        running: true,
+        failed: false,
+      };
     case "error":
       return {
         icon: AlertCircle,
@@ -80,8 +93,8 @@ function stepPresentation(data: ResearchStepData): {
       const prefix = isFollowUp ? "Follow-up research" : "Researched";
       const title =
         sCount > 0
-          ? `${prefix} ${pluralize(sCount, "source")} across ${pluralize(qCount, "query", "queries")}`
-          : `${prefix} (${pluralize(qCount, "query", "queries")}, 0 new sources)`;
+          ? `${prefix} · ${pluralize(sCount, "source")}`
+          : `${prefix} (0 new sources)`;
       return {
         icon: Search,
         title,
@@ -100,7 +113,7 @@ export function ResearchStep({ data }: { data: ResearchStepData }) {
   // collapse cleanly once complete so direct answers have no empty card.
   if (
     data.phase === "done" &&
-    data.queries.length === 0 &&
+    !data.query &&
     data.sources.length === 0 &&
     !data.notes
   ) {
@@ -109,13 +122,12 @@ export function ResearchStep({ data }: { data: ResearchStepData }) {
 
   const { icon: Icon, title, status, running, failed } = stepPresentation(data);
   const hasDetails =
-    data.queries.length > 0 ||
+    Boolean(data.query) ||
     data.sources.length > 0 ||
     Boolean(data.notes) ||
     Boolean(data.error);
 
-  const previewQuery =
-    running && data.queries.length > 0 ? data.queries[0] : null;
+  const previewQuery = running && data.query ? data.query : null;
 
   return (
     <div className="my-2 rounded-xl border border-border bg-surface-2/60 text-sm">
@@ -178,22 +190,15 @@ export function ResearchStep({ data }: { data: ResearchStepData }) {
             </div>
           )}
 
-          {data.queries.length > 0 && (
+          {data.query && (
             <div>
               <div className="mb-1.5 text-[11px] font-medium tracking-wide text-muted/80 uppercase">
-                Queries
+                Query
               </div>
-              <div className="flex flex-wrap gap-1.5">
-                {data.queries.map((q) => (
-                  <span
-                    key={q}
-                    className="inline-flex items-center gap-1 rounded-md border border-border bg-surface px-2 py-0.5 text-[11px] text-accent-2"
-                  >
-                    <Search className="h-3 w-3 shrink-0 text-muted" aria-hidden />
-                    <span>{q}</span>
-                  </span>
-                ))}
-              </div>
+              <span className="inline-flex items-center gap-1 rounded-md border border-border bg-surface px-2 py-0.5 text-[11px] text-accent-2">
+                <Search className="h-3 w-3 shrink-0 text-muted" aria-hidden />
+                <span>{data.query}</span>
+              </span>
             </div>
           )}
 

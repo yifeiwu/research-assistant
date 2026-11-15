@@ -8,9 +8,3 @@
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
-
-/** Truncate text to at most `maxTokens` estimated tokens. */
-export function truncateToTokenBudget(text: string, maxTokens: number): string {
-  const maxChars = Math.max(0, maxTokens) * 4;
-  return text.length <= maxChars ? text : text.slice(0, maxChars);
-}

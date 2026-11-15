@@ -183,8 +183,6 @@ describe("driveDetachedTurn", () => {
     expect(t.meta().status).toBe("done");
     // Recorded so that a crash after this point is not retried.
     expect(t.meta().answerStarted).toBe("1");
-    // Searches are limited per conversation thread.
-    expect(t.calls.research[0].threadId).toBe(CHAT);
     expect(types(t.buffered())).toEqual(expect.arrayContaining(["start", "text-delta", "finish"]));
     expect(t.buffered().endsWith("data: [DONE]\n\n")).toBe(true);
 
@@ -362,7 +360,7 @@ describe("driveDetachedTurn", () => {
     // its lease has lapsed and the run was never finished.
     await t.fake.rpush(
       `chat:run:${t.job.runId}:chunks`,
-      'data: {"type":"start"}\n\ndata: {"type":"data-research-step","id":"research-r1-req12345","data":{"round":1,"phase":"searching","queries":["q"],"sources":[]}}\n\n',
+      'data: {"type":"start"}\n\ndata: {"type":"data-research-step","id":"research-r1-req12345","data":{"round":1,"phase":"searching","query":"q","sources":[]}}\n\n',
     );
     await t.fake.hset(`chat:run:${t.job.runId}:meta`, { attempts: "1" });
 

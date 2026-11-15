@@ -1,3 +1,5 @@
+import { abortableSleep } from "./errors";
+
 /**
  * Longest `Retry-After` the client will sit out on its own. Longer waits
  * (e.g. the hourly per-visitor limit) are surfaced as an error instead.
@@ -9,26 +11,6 @@ function retryAfterSeconds(response: Response): number | null {
   const raw = response.headers.get("retry-after")?.trim();
   if (!raw || !/^\d+(\.\d+)?$/.test(raw)) return null;
   return Math.ceil(Number(raw));
-}
-
-function abortableDelay(ms: number, signal?: AbortSignal | null): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const abort = () =>
-      reject(signal?.reason ?? new DOMException("The operation was aborted.", "AbortError"));
-    if (signal?.aborted) {
-      abort();
-      return;
-    }
-    const onAbort = () => {
-      clearTimeout(timer);
-      abort();
-    };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
 }
 
 /**
@@ -59,6 +41,6 @@ export async function fetchWithRetryAfter(
   if (!replayable || seconds === null || seconds > maxWait) return response;
 
   void response.body?.cancel().catch(() => {});
-  await (opts?.delay ?? abortableDelay)(seconds * 1_000, init?.signal);
+  await (opts?.delay ?? abortableSleep)(seconds * 1_000, init?.signal);
   return fetchImpl(input, init);
 }

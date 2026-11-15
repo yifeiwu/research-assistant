@@ -24,18 +24,11 @@ export function useChatSettings(): ChatSettings {
     settingsRef.current = settings;
   }, [settings]);
 
-  // Restore settings, migrating legacy payloads by discarding any custom
-  // provider fields (including a stored API key) and rewriting the clean copy.
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
       if (saved) {
-        const cleaned = sanitizeSettings(JSON.parse(saved));
-        setSettings(cleaned);
-        window.localStorage.setItem(
-          SETTINGS_STORAGE_KEY,
-          JSON.stringify(cleaned),
-        );
+        setSettings(sanitizeSettings(JSON.parse(saved)));
       }
     } catch {
       // ignore malformed storage

@@ -1,4 +1,4 @@
-import type { LanguageModel, streamText } from "ai";
+import type { LanguageModel, generateText, streamText } from "ai";
 import type { ResolvedModels, resolveModels } from "@/lib/agent/models";
 import type { StageRunner } from "@/lib/agent/stage";
 import type { startTurn } from "@/lib/agent/turn";
@@ -24,6 +24,9 @@ type TurnDeps = NonNullable<Parameters<typeof startTurn>[0]["deps"]>;
  */
 export function fakeTurnDeps(opts?: {
   synthesisLease?: () => StageRunner["lease"] | undefined;
+  plannerLease?: () => StageRunner["lease"] | undefined;
+  outcome?: ResearchOutcome;
+  generateTextImpl?: (input: Parameters<typeof generateText>[0]) => Promise<{ text: string }>;
   /** Runs inside the fake research pipeline (e.g. to stop the turn mid-way). */
   onResearch?: (input: Parameters<typeof runResearchPipeline>[0]) => void | Promise<void>;
   /** Clock the turn reads; fixed unless given. */
@@ -31,6 +34,7 @@ export function fakeTurnDeps(opts?: {
 }) {
   const calls = {
     research: [] as Array<Parameters<typeof runResearchPipeline>[0]>,
+    blueprint: [] as Array<Parameters<typeof generateText>[0]>,
     synthesis: [] as Array<Parameters<typeof streamText>[0]>,
   };
   let handlers: Parameters<typeof resolveModels>[0] | undefined;
@@ -48,10 +52,15 @@ export function fakeTurnDeps(opts?: {
         primaryModelId: SELECTED,
         lease: (req) => (opts?.synthesisLease?.() ?? runner(SELECTED).lease)(req),
       },
-      planner: runner("planner"),
+      planner: {
+        primaryModelId: "planner",
+        lease: (req) => (opts?.plannerLease?.() ?? runner("planner").lease)(req),
+      },
       summary: runner("summary"),
     },
   };
+
+  const activeOutcome = opts?.outcome ?? OUTCOME;
 
   const deps: TurnDeps = {
     resolveModels: (input) => {
@@ -65,10 +74,19 @@ export function fakeTurnDeps(opts?: {
       input.writer.write({
         type: "data-research-step",
         id: `research-r1-${input.requestId}`,
-        data: { round: 1, phase: "done", queries: ["q"], sources: OUTCOME.sources },
+        data: { round: 1, phase: "done", query: "q", sources: activeOutcome.sources },
       });
-      return OUTCOME;
+      return activeOutcome;
     },
+    generateText: (async (input: Parameters<typeof generateText>[0]) => {
+      calls.blueprint.push(input);
+      if (opts?.generateTextImpl) {
+        return opts.generateTextImpl(input);
+      }
+      return {
+        text: "1. SUB-QUESTIONS: cover margin delta\n2. THESIS: 34.2% (https://example.com/a) [Fact]\n3. BASELINE AUDIT: FY2026 GAAP\n4. UNRESOLVED GAPS: Q1 2027 guidance",
+      };
+    }) as unknown as typeof generateText,
     streamText: ((input: Parameters<typeof streamText>[0]) => {
       calls.synthesis.push(input);
       return {

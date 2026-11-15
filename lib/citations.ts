@@ -1,14 +1,13 @@
-import { normalizeUrlKey } from "./sources";
+import {
+  MARKDOWN_LINK_REGEX,
+  normalizeUrlKey,
+  splitTrailingPunctuation,
+} from "./sources";
 import type { ResearchSource } from "./types/chat";
 
-// Markdown link destinations allow one level of balanced parentheses so
-// URLs like https://en.wikipedia.org/wiki/Foo_(bar) aren't truncated at ")".
-const MARKDOWN_LINK =
-  /\[([^\]]+)\]\((https?:\/\/[^\s)]+(?:\([^\s)]*\)[^\s)]*)*)\)/g;
 const BARE_URL = /https?:\/\/[^\s<>"')\]]+/g;
 
-/** Split a candidate URL into the URL itself and trailing sentence punctuation. */
-function splitTrailingPunctuation(rawUrl: string): { url: string; suffix: string } {
+function splitSentencePunctuation(rawUrl: string): { url: string; suffix: string } {
   const match = rawUrl.match(/[.,;:!?]+$/);
   if (!match) return { url: rawUrl, suffix: "" };
   return { url: rawUrl.slice(0, -match[0].length), suffix: match[0] };
@@ -26,16 +25,19 @@ function verifySegment(
   allowed: Set<string>,
   stats: { stripped: number; verified: number },
 ): string {
-  const withoutMarkdown = segment.replace(MARKDOWN_LINK, (match, label: string, url: string) => {
-    if (allowed.has(canonicalCitationKey(url))) {
-      stats.verified += 1;
-      return match;
-    }
-    stats.stripped += 1;
-    return label;
-  });
+  const withoutMarkdown = segment.replace(
+    MARKDOWN_LINK_REGEX,
+    (match, label: string, url: string) => {
+      if (allowed.has(canonicalCitationKey(url))) {
+        stats.verified += 1;
+        return match;
+      }
+      stats.stripped += 1;
+      return label;
+    },
+  );
   return withoutMarkdown.replace(BARE_URL, (url) => {
-    const { url: cleaned, suffix } = splitTrailingPunctuation(url);
+    const { url: cleaned, suffix } = splitSentencePunctuation(url);
     if (allowed.has(canonicalCitationKey(cleaned))) {
       stats.verified += 1;
       // Keep the sentence punctuation, but not glued to the URL.

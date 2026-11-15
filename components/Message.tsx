@@ -144,12 +144,6 @@ export const Message = memo(function Message({
               );
             }
 
-            if (part.type === "step-start") {
-              return index > 0 ? (
-                <hr key={index} className="my-3 border-border/60" />
-              ) : null;
-            }
-
             return null;
           })}
 

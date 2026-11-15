@@ -14,7 +14,6 @@ import {
   deriveTitle,
   loadActiveConversationId,
   loadConversations,
-  migrateLegacyMessages,
   saveActiveConversationId,
   saveConversations,
   withTurnPrompt,
@@ -178,20 +177,10 @@ export function useConversations({
     [setChatId],
   );
 
-  // Restore saved conversations (migrating any legacy single-thread state).
+  // Restore saved conversations.
   useEffect(() => {
-    let list = loadConversations();
-    let active = loadActiveConversationId();
-
-    if (list.length === 0) {
-      const migrated = migrateLegacyMessages();
-      if (migrated) {
-        list = [migrated];
-        active = migrated.id;
-        saveConversations(list);
-        saveActiveConversationId(active);
-      }
-    }
+    const list = loadConversations();
+    const active = loadActiveConversationId();
 
     conversationsRef.current = list;
     setConversations(list);

@@ -1,37 +1,28 @@
 /**
- * Research "effort" controls how long and how broadly the research pipeline
- * searches before the answer is written:
+ * Research "effort" controls how deeply the sequential research pipeline
+ * searches, reads, and verifies sources before the answer is written:
  *
- * - `level`: the named effort tier ("low" | "medium" | "high").
- * - `rounds`: how many sequential research rounds may run. A round after the
- *   first only runs if the gap check over the notes so far asks for more.
- * - `initialQueries`: how many diverse query angles Round 1 may plan.
- * - `followUpQueries`: how many follow-up searches each gap check may ask for.
- *
- * Per-round source caps and the limit of 2 parallel searches per conversation
- * thread live in `serverConfig` (lib/config.ts, lib/exa.ts).
- *
- * - low:    no web research (0 rounds); the model answers directly.
- * - medium: up to 2 rounds, 2 initial queries.
- * - high:   up to 4 rounds, 3 initial queries (adds counterpoint/primary angle).
+ * - `low`:    no web research (0 rounds); the model answers directly.
+ * - `medium`: up to 3 sequential research rounds (Round 1 + up to 2 gap-checked follow-ups).
+ * - `high`:   up to 5 sequential deep-research rounds (`deep: true`: full-doc
+ *             highlights, candidate reranking, citation hopping, 2-source
+ *             micro-batches, Thematic Reduce, and pre-synthesis audit).
  */
 export type EffortLevel = "low" | "medium" | "high";
 
 export type EffortConfig = {
   /** Selected effort tier. */
   level: EffortLevel;
-  /** Max sequential research rounds (0 = answer directly, no search). */
+  /** Max sequential single-query research rounds (0 = answer directly, no search). */
   rounds: number;
-  /** Max search queries planned in Round 1. */
-  initialQueries: number;
-  /** Max follow-up search queries per gap check. */
-  followUpQueries: number;
+  /** Enables deep-research upgrades configured in `serverConfig` (highlights, reranking, citation hopping, micro-batches, Thematic Reduce, and pre-synthesis blueprint). */
+  deep: boolean;
 };
 
 const EFFORT_CONFIG: Record<EffortLevel, EffortConfig> = {
-  low: { level: "low", rounds: 0, initialQueries: 0, followUpQueries: 0 },
-  medium: { level: "medium", rounds: 2, initialQueries: 2, followUpQueries: 2 },
-  high: { level: "high", rounds: 4, initialQueries: 3, followUpQueries: 2 },
+  low: { level: "low", rounds: 0, deep: false },
+  medium: { level: "medium", rounds: 3, deep: false },
+  high: { level: "high", rounds: 5, deep: true },
 };
 
 export const DEFAULT_EFFORT: EffortLevel = "medium";
@@ -42,11 +33,11 @@ export const EFFORT_OPTIONS: {
   hint: string;
 }[] = [
   { id: "low", label: "Low", hint: "No web search — answer directly" },
-  { id: "medium", label: "Medium", hint: "Up to 2 sequential research rounds (default)" },
-  { id: "high", label: "High", hint: "Up to 4 sequential deep-research rounds" },
+  { id: "medium", label: "Medium", hint: "Up to 3 sequential research rounds (default)" },
+  { id: "high", label: "High", hint: "Up to 5 deep-research rounds, primary-source hopping & audit (slower)" },
 ];
 
-function isValidEffort(value: unknown): value is EffortLevel {
+export function isValidEffort(value: unknown): value is EffortLevel {
   return value === "low" || value === "medium" || value === "high";
 }
 

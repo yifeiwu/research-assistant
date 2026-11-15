@@ -6,8 +6,9 @@ extraction.
 
 Type a question into the prompt box on the homepage. A deterministic,
 server-orchestrated research pipeline plans focused search queries, retrieves
-and condenses web sources in parallel, and streams a cited answer — with live
-research progress cards and zero reliance on LLM function/tool calling.
+and condenses web sources across sequential gap-checked rounds, and streams a
+cited answer — with live research progress cards and zero reliance on LLM
+function/tool calling.
 
 Groq is the only model provider: pick from a curated list of free-tier Groq
 models (`lib/models.ts`), validated server-side on every request, in the model
@@ -20,10 +21,10 @@ Browser (Chat) ─POST /api/chat─▶ Deterministic Research Pipeline (lib/rese
                                       │ 1. Plain-text query planning (or NO_SEARCH)
                                       ▼
                                Exa REST API (/search + /contents, Redis-cached)
-                                      │ 2. Retrieval (<= 2 parallel searches per thread, sequential rounds)
+                                      │ 2. Sequential single-search retrieval rounds
                                       ▼
                                Summarizer model (map, Redis-cached notes)
-                                      │ 3. One batched condensation call per round (+ optional Round 2 gap check)
+                                      │ 3. Batched condensation per round (+ sequential gap-check follow-ups)
                                       ▼
                                Main model (reduce) ──▶ streamed, citation-verified answer
 ```
@@ -49,24 +50,16 @@ rounds stop early once the 3k-token synthesis evidence budget is full, and
 synthesis itself is capped at 3,500 output tokens (including reasoning) —
 so research stages can't starve the final answer.
 
-Research depth is controlled by the **Effort** selector (`lib/effort.ts`),
-which changes two things only: how many sequential rounds may run, and how
-many follow-up queries each gap check between rounds may add.
+Research depth is controlled by the **Effort** selector (`lib/effort.ts`).
+Every round executes a single search query (never parallel bursts), so each
+follow-up search is informed by all notes gathered in earlier rounds:
 
 - **Low:** `0` rounds. Skips web search and answers directly in a single pass.
-- **Medium (default):** up to `2` rounds, with up to 2 follow-up queries.
-- **High:** up to `4` rounds, with up to 2 follow-up queries per gap check.
+- **Medium (default):** up to `3` sequential single-query rounds (Round 1 + up to 2 gap-checked follow-up rounds).
+- **High:** up to `5` sequential deep-research rounds (Round 1 + up to 4 gap-checked follow-up rounds, with full-document Exa highlights, candidate reranking, primary-source citation hopping, 2-source micro-batch condensation, Thematic Reduce, and a pre-synthesis audit).
 
-Every round has the same shape at every effort level (`research` in
-`lib/config.ts`): the first round plans 2 queries, each query returns 4
-results, and a round condenses up to 4 new sources (14 at most in a turn).
-Rounds stop early when the gap check finds the notes sufficient.
-
-Searches are limited to 2 in parallel per conversation thread (`lib/exa.ts`),
-however many a round asks for; the rest wait their turn. The limit counts real
-Exa calls, so cached results do not use a slot. It is kept per server
-instance. A thread has one live turn at a time, so that covers the thread,
-except for calls a replaced turn left in flight on another instance.
+Rounds stop early when the gap check finds the notes sufficient. All Exa HTTP
+requests across instances are paced globally via `awaitExaRateSlot` (`lib/exa.ts`).
 
 Streaming is resumable across serverless instances: SSE chunks are buffered in
 Upstash Redis (`lib/agent/chat-stream.ts`) so reloads, tab switches, and thread
@@ -99,8 +92,8 @@ unreachable, turns still run, with per-process limits only.
   `Retry-After`; a turn that waits longer than `MAX_RESEARCH_QUEUE_WAIT_MS`
   fails with a "server is busy" error. The queue rations research only: a
   turn whose research is done answers without lining up again.
-- **Exa pacing** (`lib/exa.ts`): on top of the 2 parallel searches allowed per
-  thread, all requests together are paced to `EXA_REQUESTS_PER_SECOND`.
+- **Exa pacing** (`lib/exa.ts`): Exa calls within a turn are strictly sequential,
+  and all requests across instances are paced together to `EXA_REQUESTS_PER_SECOND`.
 - **Client**: a `429` with a `Retry-After` of 20 seconds or less is retried
   once automatically (`lib/retry-fetch.ts`).
 - **Safety net**: the fetch wrapper in `lib/agent/groq-rate-limit.ts` still
@@ -215,9 +208,9 @@ Files:
   pipeline, then single-pass final answer synthesis.
 - `lib/research.ts` — pipeline orchestration through the ports in
   `lib/ports.ts`, with live `data-research-step` + `source-url` streaming.
-- `lib/exa.ts` — Exa REST adapter (`/search` and `/contents`) with per-thread
-  concurrency limiting, a shared requests-per-second cap, timeouts, retry
-  backoff, and Redis request caching (`lib/cache.ts`).
+- `lib/exa.ts` — Exa REST adapter (`/search` and `/contents`) with a shared
+  requests-per-second cap, timeouts, retry backoff, and Redis request caching
+  (`lib/cache.ts`).
 - `lib/pipeline.ts` — map-stage source condensation: all sources in a round
   are condensed in a single batched, fail-fast (`maxRetries: 0`) summarizer
   call, sized to fit the summary model's per-minute token budget, with raw

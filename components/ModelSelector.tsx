@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { Check, ChevronDown, Cpu } from "lucide-react";
 import { GROQ_MODELS } from "@/lib/models";
 import { currentModelLabel, type AppSettings } from "@/lib/settings";
+import { useMenuDismiss } from "@/lib/hooks/useMenuDismiss";
 
 /** Compact Groq model picker for the composer control bar. */
 export function ModelSelector({
@@ -15,22 +16,8 @@ export function ModelSelector({
 }) {
   const [open, setOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    function onDocMouseDown(e: MouseEvent) {
-      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
-    }
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") setOpen(false);
-    }
-    document.addEventListener("mousedown", onDocMouseDown);
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("mousedown", onDocMouseDown);
-      document.removeEventListener("keydown", onKeyDown);
-    };
-  }, [open]);
+  const close = useCallback(() => setOpen(false), []);
+  useMenuDismiss(open, wrapRef, close);
 
   return (
     <div className="relative" ref={wrapRef}>

@@ -6,3 +6,18 @@ export function safeStringify(value: unknown): string {
     return String(value);
   }
 }
+
+/**
+ * Decode a value read from Redis / Upstash: Upstash auto-deserializes JSON
+ * objects/arrays on read, while plain strings or test doubles may return raw
+ * JSON text.
+ */
+export function decodeStoredJson<T>(raw: unknown): T | null {
+  if (raw == null) return null;
+  if (typeof raw !== "string") return raw as T;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}

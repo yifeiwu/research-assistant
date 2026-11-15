@@ -1,5 +1,6 @@
 import "server-only";
 import { UI_MESSAGE_STREAM_HEADERS } from "ai";
+import { sleepUntilAborted } from "@/lib/errors";
 import { redis } from "@/lib/redis";
 import { logError, logInfo } from "@/lib/logger";
 
@@ -122,21 +123,6 @@ function resumePollDelayMs(emptyPolls: number): number {
   const exponent = Math.min(Math.max(emptyPolls, 0), 3);
   const base = Math.min(1_000, POLL_FAST_MS * 2 ** exponent);
   return Math.round(base * (0.8 + Math.random() * 0.4));
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.resolve();
-  return new Promise((resolve) => {
-    const onAbort = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
 }
 
 /**
@@ -795,7 +781,7 @@ export async function resumeChatStream(
 
         let emptyPolls = 0;
         while (!cancelled && !signal?.aborted) {
-          await sleep(resumePollDelayMs(emptyPolls), signal);
+          await sleepUntilAborted(resumePollDelayMs(emptyPolls), signal);
           if (cancelled || signal?.aborted) break;
 
           // Query HGETALL *before* LRANGE in the pipeline so observing

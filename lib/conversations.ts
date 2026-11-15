@@ -17,8 +17,6 @@ export type Conversation = {
 
 const CONVERSATIONS_STORAGE_KEY = "web-seek-conversations";
 const ACTIVE_CONVERSATION_STORAGE_KEY = "web-seek-active-conversation";
-/** Old single-thread key, migrated into a conversation on first load. */
-const LEGACY_MESSAGES_STORAGE_KEY = "web-seek-messages";
 
 const MAX_TITLE_LENGTH = 60;
 
@@ -43,9 +41,9 @@ function capConversations(conversations: Conversation[]): Conversation[] {
 }
 
 /**
- * Strip bulky research notes / legacy tool outputs from a conversation's
- * messages while keeping answer text, queries, and structured source pills
- * intact. Used only when `localStorage` hits its browser size quota.
+ * Strip bulky research notes from a conversation's messages while keeping
+ * answer text, search query, and structured source pills intact. Used only when
+ * `localStorage` hits its browser size quota.
  */
 function compactConversation(conv: Conversation): Conversation {
   let changed = false;
@@ -67,14 +65,6 @@ function compactConversation(conv: Conversation): Conversation {
           unknown
         >;
         return { ...part, data: restData } as typeof part;
-      }
-      if (
-        part.type === "dynamic-tool" &&
-        "output" in part &&
-        part.output != null
-      ) {
-        msgChanged = true;
-        return { ...part, output: undefined } as typeof part;
       }
       return part;
     });
@@ -239,30 +229,6 @@ export function saveActiveConversationId(id: string | null): void {
     }
   } catch {
     // ignore
-  }
-}
-
-/**
- * Migrate the pre-history single-thread storage into a conversation. Returns the
- * created conversation, or null if there was nothing to migrate.
- */
-export function migrateLegacyMessages(): Conversation | null {
-  try {
-    const raw = window.localStorage.getItem(LEGACY_MESSAGES_STORAGE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    window.localStorage.removeItem(LEGACY_MESSAGES_STORAGE_KEY);
-    if (!Array.isArray(parsed) || parsed.length === 0) return null;
-    const now = Date.now();
-    return {
-      id: createConversationId(),
-      title: deriveTitle(parsed as UIMessage[]),
-      messages: parsed as UIMessage[],
-      createdAt: now,
-      updatedAt: now,
-    };
-  } catch {
-    return null;
   }
 }
 

@@ -1,8 +1,15 @@
 {
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "entry": ["tests/**/*.test.ts"],
-  "project": ["app/**/*.{ts,tsx}", "components/**/*.{ts,tsx}", "lib/**/*.{ts,tsx}", "tests/**/*.ts"],
-  "ignoreExportsUsedInFile": { "interface": true, "type": true },
+  "project": [
+    "app/**/*.{ts,tsx,css}",
+    "components/**/*.{ts,tsx}",
+    "lib/**/*.{ts,tsx}",
+    "tests/**/*.ts"
+  ],
   "ignore": ["tests/stubs/**"],
-  "ignoreDependencies": ["tailwindcss"]
+  "ignoreExportsUsedInFile": {
+    "interface": true,
+    "type": true
+  }
 }

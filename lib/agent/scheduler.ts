@@ -1,9 +1,9 @@
 import "server-only";
 import { serverConfig } from "@/lib/config";
+import { abortableSleep, createAbortError } from "@/lib/errors";
 import { logInfo } from "@/lib/logger";
 import type { GroqBudget } from "./groq-budget";
 import {
-  abortableSleep,
   readCooldowns,
   type GroqCooldownDb,
   type GroqStage,
@@ -30,6 +30,8 @@ export type AcquireRequest = {
   estInputTokens: number;
   /** Output reservation, which may differ per model (e.g. Qwen's OTPM cap). */
   maxOutputTokens: number | ((model: string) => number);
+  /** Optional override for the stage's rate-limit wait cap (e.g. patient high-effort runs). */
+  maxWaitMs?: number;
   signal?: AbortSignal;
 };
 
@@ -93,7 +95,8 @@ export function createModelScheduler(opts: {
   return {
     async acquire(req) {
       const started = nowFn();
-      const latestStart = started + Math.max(0, stageWaitMs(req.stage));
+      const waitCap = req.maxWaitMs ?? stageWaitMs(req.stage);
+      const latestStart = started + Math.max(0, waitCap);
       const candidates = [...new Set(req.candidates.filter(Boolean))];
       const outputFor = (model: string) =>
         typeof req.maxOutputTokens === "function"
@@ -108,7 +111,7 @@ export function createModelScheduler(opts: {
 
       for (;;) {
         if (req.signal?.aborted) {
-          throw new DOMException("The operation was aborted.", "AbortError");
+          throw createAbortError();
         }
         const now = nowFn();
         const cooldowns = await readCooldowns(candidates, now, resolveCooldownDb);

@@ -13,26 +13,6 @@ function truncate(value: string | undefined, max = 4000): string | undefined {
   return value.length > max ? `${value.slice(0, max)}… [truncated]` : value;
 }
 
-/**
- * Pull Groq's `failed_generation` (the raw text the model produced that could
- * not be parsed into a valid tool call) out of an API error, if present.
- */
-function extractFailedGeneration(error: unknown): string | undefined {
-  if (!APICallError.isInstance(error)) return undefined;
-  try {
-    const parsed: unknown =
-      error.data ??
-      (error.responseBody ? JSON.parse(error.responseBody) : undefined);
-    const root = parsed as
-      | { failed_generation?: unknown; error?: { failed_generation?: unknown } }
-      | undefined;
-    const fg = root?.error?.failed_generation ?? root?.failed_generation;
-    return typeof fg === "string" ? truncate(fg) : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 /** Build a structured, log-friendly description of any error. */
 function describeError(error: unknown): Record<string, unknown> {
   if (APICallError.isInstance(error)) {
@@ -43,7 +23,6 @@ function describeError(error: unknown): Record<string, unknown> {
       statusCode: error.statusCode,
       url: error.url,
       isRetryable: error.isRetryable,
-      failedGeneration: extractFailedGeneration(error),
       responseBody: truncate(error.responseBody),
     };
   }

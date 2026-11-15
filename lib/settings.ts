@@ -1,5 +1,5 @@
 import { DEFAULT_GROQ_MODEL, groqModelLabel, isValidGroqModel } from "./models";
-import { DEFAULT_EFFORT, type EffortLevel } from "./effort";
+import { DEFAULT_EFFORT, isValidEffort, type EffortLevel } from "./effort";
 
 /** Client-side settings (persisted in the browser). Groq is the only provider. */
 export type AppSettings = {
@@ -12,23 +12,13 @@ export const DEFAULT_SETTINGS: AppSettings = {
   effort: DEFAULT_EFFORT,
 };
 
-function isEffort(value: unknown): value is EffortLevel {
-  return value === "low" || value === "medium" || value === "high";
-}
-
-/**
- * Whitelist-parse persisted settings. Legacy payloads may contain custom
- * provider fields (including an API key); only the Groq model and effort are
- * retained so callers can rewrite the cleaned value back to storage.
- */
+/** Whitelist-parse persisted settings, falling back to defaults for unknown values. */
 export function sanitizeSettings(value: unknown): AppSettings {
   if (!value || typeof value !== "object") return { ...DEFAULT_SETTINGS };
   const v = value as Record<string, unknown>;
-  const legacyModel = typeof v.groqModel === "string" ? v.groqModel : undefined;
-  const model = typeof v.model === "string" ? v.model : legacyModel;
   return {
-    model: isValidGroqModel(model) ? model : DEFAULT_GROQ_MODEL,
-    effort: isEffort(v.effort) ? v.effort : DEFAULT_EFFORT,
+    model: isValidGroqModel(v.model) ? v.model : DEFAULT_GROQ_MODEL,
+    effort: isValidEffort(v.effort) ? v.effort : DEFAULT_EFFORT,
   };
 }
 

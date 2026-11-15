@@ -1,18 +1,26 @@
 import "server-only";
 import {
+  generateText,
   streamText,
   type ModelMessage,
   type UIMessageStreamWriter,
 } from "ai";
+import { createAbortError, isAbortError } from "@/lib/errors";
 import { serverConfig } from "@/lib/config";
 import type { EffortConfig } from "@/lib/effort";
 import { logError, logInfo } from "@/lib/logger";
 import {
   groqModelLabel,
   groqReasoningOptions,
+  maxSummaryOutputTokens,
   maxSynthesisOutputTokens,
 } from "@/lib/models";
-import { buildDirectAnswerPrompt, buildSynthesisPrompt } from "@/lib/prompts";
+import { stripThinking } from "@/lib/pipeline";
+import {
+  buildAnalyticalBlueprintPrompt,
+  buildDirectAnswerPrompt,
+  buildSynthesisPrompt,
+} from "@/lib/prompts";
 import { runResearchPipeline, type ResearchOutcome } from "@/lib/research";
 import { estimateTokens } from "@/lib/tokens";
 import type {
@@ -32,7 +40,7 @@ import {
   resolveModels,
   type ModelResolutionError,
 } from "./models";
-import { isBudgetDenied, type StageLease } from "./stage";
+import { generateAuxiliaryText, isBudgetDenied, type StageLease } from "./stage";
 import {
   createPipelineStream,
   type PipelineStream,
@@ -42,6 +50,8 @@ import {
 /** Work a later attempt of the same turn can skip. */
 export type TurnCheckpoint = {
   outcome: ResearchOutcome;
+  /** Pre-verified analytical blueprint computed before synthesis on high effort. */
+  analyticalBlueprint?: string;
   /** How long the turn waited for its research slot (ms), for its summary. */
   queueWaitMs?: number;
 };
@@ -91,8 +101,6 @@ export type TurnAdmission = {
 export type TurnInput = {
   requestId: string;
   requestedModel?: string;
-  /** Conversation id; searches are limited to 2 in parallel per thread. */
-  threadId: string;
   query: string;
   effort: EffortConfig;
   modelMessages: ModelMessage[];
@@ -130,13 +138,14 @@ export type TurnInput = {
 type TurnDeps = {
   resolveModels: typeof resolveModels;
   runResearch: typeof runResearchPipeline;
+  generateText: typeof generateText;
   streamText: typeof streamText;
   now: () => number;
 };
 
 function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) {
-    throw new DOMException("The operation was aborted.", "AbortError");
+    throw createAbortError();
   }
 }
 
@@ -159,14 +168,11 @@ const STATUS_STAGE: Record<GroqStage, "planning" | "reading" | "answering"> = {
 export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError {
   const { requestId, signal } = input;
   const stats: TurnStats = { queueWaitMs: input.checkpoint?.queueWaitMs };
-  // The queue rations research. A turn that already has its research gave
-  // its slot back when the earlier attempt deferred, and must not line up
-  // (or be turned away by a full queue) a second time just to answer: the
-  // model budgets pace the answer on their own.
   const admission = input.checkpoint ? undefined : input.admission;
   const deps: TurnDeps = {
     resolveModels,
     runResearch: runResearchPipeline,
+    generateText,
     streamText,
     now: Date.now,
     ...input.deps,
@@ -174,7 +180,6 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
 
   let activeWriter: UIMessageStreamWriter<ChatUIMessage> | undefined;
   let activeModelInfo = "";
-  // A continued turn may still be showing an earlier attempt's status.
   let statusShown = !input.emitStart;
 
   const writeStatus = (data: TurnStatusData) => {
@@ -224,6 +229,7 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
 
   let allowedSources: ResearchSource[] = [];
   let releaseSlot: (() => Promise<void>) | undefined;
+  const isDeep = input.effort.deep;
 
   const execute = async (
     writer: UIMessageStreamWriter<ChatUIMessage>,
@@ -234,7 +240,6 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
     if (admission) {
       const state = await admission.queue.poll(admission.ticket);
       if (state.state === "queued" && admission.deferDelayMs != null) {
-        // Still in line. Show the position and look again in a later attempt.
         writeStatus({ state: "queued", position: state.position });
         throw new TurnDeferredError("queued", admission.deferDelayMs);
       }
@@ -256,12 +261,10 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
         writer,
         signal,
         requestId,
-        threadId: input.threadId,
       });
       try {
         await input.saveCheckpoint({ outcome, queueWaitMs: stats.queueWaitMs });
       } catch (error) {
-        // Only costs a repeat of (cached) research if this attempt dies.
         logError("turn-checkpoint", error, { requestId });
       }
     }
@@ -272,26 +275,77 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
       stages: outcome.stats,
     };
     allowedSources = outcome.sources;
-    // Stopped during research (or before a resumed attempt got this far).
     throwIfAborted(signal);
 
-    // Too late to start the answer here. Research is checkpointed, so a
-    // fresh invocation can go straight to it.
     if (deps.now() > input.answerBy) {
       throw new TurnDeferredError("handoff", 0);
     }
 
-    // Bounded per-model output reservation (e.g. 900 on Qwen's 1k OTPM
-    // bucket, 3,500 on GPT-OSS).
+    // On deep high-effort turns with multiple corroborated sources, run a compact
+    // Analytical Blueprint & Entailment Critic pass on the independent planner
+    // model bucket before streaming prose.
+    let analyticalBlueprint = input.checkpoint?.analyticalBlueprint;
+    if (
+      !analyticalBlueprint &&
+      isDeep &&
+      outcome.searched &&
+      outcome.totalSources >= 2 &&
+      input.finishBy - deps.now() >= serverConfig.blueprint.minRemainingWindowMs
+    ) {
+      try {
+        const blueprintText = await generateAuxiliaryText({
+          stage: resolved.stages.planner,
+          system: buildAnalyticalBlueprintPrompt(),
+          prompt: `User question:\n${input.query}\n\nGathered research notes:\n${outcome.evidenceBlock}\n\nProduce the 4-part verification blueprint:`,
+          maxOutputTokens: (modelId) =>
+            Math.min(
+              serverConfig.blueprint.maxOutputTokens,
+              maxSummaryOutputTokens(modelId, serverConfig.blueprint.maxOutputTokens),
+            ),
+          timeoutMs: serverConfig.blueprint.timeoutMs,
+          maxWaitMs: serverConfig.groqRateLimit.deepBudgetWait.plannerMs,
+          signal,
+          generateTextImpl: deps.generateText,
+        });
+        const cleanedBlueprint = stripThinking(blueprintText).slice(
+          0,
+          serverConfig.blueprint.maxInjectedChars,
+        );
+        if (cleanedBlueprint.length >= 40) {
+          analyticalBlueprint = cleanedBlueprint;
+          try {
+            await input.saveCheckpoint({
+              outcome,
+              analyticalBlueprint,
+              queueWaitMs: stats.queueWaitMs,
+            });
+          } catch (error) {
+            logError("turn-checkpoint", error, { requestId });
+          }
+        }
+      } catch (error) {
+        if (isAbortError(error) || signal.aborted) throw error;
+        logInfo("synthesis-blueprint-skipped", {
+          requestId,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+      throwIfAborted(signal);
+    }
+
     const outputTokensFor = (modelId: string) =>
       maxSynthesisOutputTokens(modelId, serverConfig.synthesis.maxOutputTokens);
-    const buildSystemFor = (modelId: string) =>
-      outcome.searched
-        ? buildSynthesisPrompt(outcome.evidenceBlock, outcome.degraded, {
-            effort: input.effort.level,
-            maxOutputTokens: outputTokensFor(modelId),
-          })
-        : buildDirectAnswerPrompt(outcome.degraded, outcome.searchFailed);
+    const buildSystemFor = (modelId: string) => {
+      if (!outcome.searched) {
+        return buildDirectAnswerPrompt(outcome.degraded, outcome.searchFailed);
+      }
+      const modelCap = outputTokensFor(modelId);
+      return buildSynthesisPrompt(outcome.evidenceBlock, outcome.degraded, {
+        effort: input.effort.level,
+        maxOutputTokens: modelCap,
+        analyticalBlueprint: modelCap >= 1_500 ? analyticalBlueprint : undefined,
+      });
+    };
     const initialSystem = buildSystemFor(resolved.selectedModel);
 
     let leased: StageLease;
@@ -300,13 +354,14 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
         estInputTokens:
           estimateTokens(initialSystem) + estimateTokens(JSON.stringify(input.modelMessages)),
         maxOutputTokens: outputTokensFor,
+        maxWaitMs: isDeep
+          ? serverConfig.groqRateLimit.deepBudgetWait.synthesisMs
+          : undefined,
         signal,
       });
     } catch (error) {
       if (!isBudgetDenied(error)) throw error;
       if (error.waitMs <= input.maxDeferMs) {
-        // Come back when the window has room. Research is checkpointed,
-        // so the next attempt goes straight to the answer.
         writeStatus({
           state: "waiting",
           stage: "answering",
@@ -315,9 +370,6 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
         });
         throw new TurnDeferredError("rate-limit", error.waitMs + 1_000);
       }
-      // The window is too far away to defer for, or will not reopen (a
-      // daily limit). Send the request anyway: the fetch wrapper still
-      // handles a 429 reactively (short sleep or fallback).
       logInfo("synthesis-unbudgeted", { requestId, waitMs: error.waitMs });
       leased = {
         model: resolved.mainModel,
@@ -331,8 +383,6 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
         ? initialSystem
         : buildSystemFor(leased.modelId);
 
-    // The wait for the model's window may have used up the time the answer
-    // was going to have. Research is checkpointed, so hand the turn over.
     const answerWindowMs = input.finishBy - deps.now();
     if (answerWindowMs < serverConfig.synthesis.minWindowMs) {
       throw new TurnDeferredError("handoff", 0);
@@ -353,9 +403,6 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
         "synthesis",
         input.effort.level,
       ),
-      // Waiting and model choice are owned by the scheduler, and surprise
-      // 429s by `createResilientGroqFetch`, so AI SDK blind retries are
-      // disabled.
       maxOutputTokens: outputTokensFor(leased.modelId),
       maxRetries: 0,
       timeout: {
@@ -397,10 +444,8 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
     emitStart: input.emitStart,
     onSettled: async (deferral) => {
       if (releaseSlot) {
-        // Held a slot: free it, whether the turn finished or deferred.
         await releaseSlot();
       } else if (admission && !deferral) {
-        // Never got a slot and is not coming back: leave the queue.
         await admission.queue.cancel(admission.ticket);
       }
     },

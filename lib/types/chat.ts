@@ -13,8 +13,10 @@ export type ResearchSource = {
 export type ResearchStepPhase =
   | "planning"
   | "searching"
+  | "reranking"
   | "reading"
   | "checking-gaps"
+  | "synthesizing"
   | "done"
   | "error";
 
@@ -32,7 +34,7 @@ export type DegradedResearch = {
 export type ResearchStepData = {
   round: number;
   phase: ResearchStepPhase;
-  queries: string[];
+  query?: string;
   sources: ResearchSource[];
   notes?: string;
   error?: string;

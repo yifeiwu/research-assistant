@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { X } from "lucide-react";
 
 export function EditUserMessage({
@@ -13,14 +13,11 @@ export function EditUserMessage({
   onCancel: () => void;
 }) {
   const [value, setValue] = useState(initial);
-  const ref = useRef<HTMLTextAreaElement>(null);
 
   return (
     <div className="flex justify-end">
       <div className="w-full max-w-[85%] rounded-2xl border border-accent bg-surface p-2">
         <textarea
-          ref={ref}
-          // eslint-disable-next-line jsx-a11y/no-autofocus
           autoFocus
           value={value}
           onChange={(e) => setValue(e.target.value)}

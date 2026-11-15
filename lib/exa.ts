@@ -1,5 +1,5 @@
 import "server-only";
-import { isAbortError } from "./errors";
+import { createAbortError, isAbortError, sleepUntilAborted } from "./errors";
 import { logDebug, logError, logInfo } from "./logger";
 import { serverConfig } from "./config";
 import { normalizeCacheText, requestCache, type RequestCache } from "./cache";
@@ -17,6 +17,23 @@ export type ExaDocument = {
   title?: string;
   publishedDate?: string;
   text: string;
+  /** Query-relevant passages extracted across the full indexed document by Exa. */
+  highlights?: string[];
+};
+
+export type ExaSearchType = "auto" | "keyword";
+
+export type ExaSearchRequestOptions = {
+  maxCharacters?: number;
+  highlightsQuery?: string;
+  searchType?: ExaSearchType;
+  startPublishedDate?: string;
+};
+
+export type StructuredSearchQuery = {
+  query: string;
+  searchType?: ExaSearchType;
+  startPublishedDate?: string;
 };
 
 type RawExaResult = {
@@ -25,82 +42,58 @@ type RawExaResult = {
   title?: unknown;
   publishedDate?: unknown;
   text?: unknown;
+  highlights?: unknown;
 };
 
-/** Bound async work to at most `limit` in-flight promises at once. */
-function createConcurrencyLimiter(limit: number): {
-  run: <T>(fn: () => Promise<T>) => Promise<T>;
-  /** True when nothing is running or waiting. */
-  idle: () => boolean;
-} {
-  const cap = Math.max(1, Math.floor(limit));
-  let active = 0;
-  const queue: Array<() => void> = [];
+/**
+ * Parse optional planner operator prefixes (`RECENT:`, `RECENT[90d]:`, `EXACT:`)
+ * into structured Exa search parameters while stripping the prefixes from `query`.
+ */
+export function parseStructuredSearchQuery(
+  rawQuery: string,
+  now: Date = new Date(),
+): StructuredSearchQuery {
+  let rest = rawQuery.trim();
+  let searchType: ExaSearchType | undefined;
+  let startPublishedDate: string | undefined;
 
-  const next = () => {
-    active -= 1;
-    const wake = queue.shift();
-    if (wake) wake();
-  };
+  for (let i = 0; i < 2; i++) {
+    const exactMatch = rest.match(/^EXACT\s*:\s*(.+)$/i);
+    if (exactMatch) {
+      const candidate = exactMatch[1].trim();
+      if (candidate) {
+        searchType = "keyword";
+        rest = candidate;
+        continue;
+      }
+    }
+
+    const recentMatch = rest.match(
+      /^RECENT(?:\[(\d+)\s*([dmy])\])?\s*:\s*(.+)$/i,
+    );
+    if (recentMatch) {
+      const candidate = recentMatch[3].trim();
+      if (candidate) {
+        const amount = recentMatch[1] ? Number.parseInt(recentMatch[1], 10) : 365;
+        const unit = (recentMatch[2] ?? "d").toLowerCase();
+        const days =
+          unit === "y" ? amount * 365 : unit === "m" ? amount * 30 : amount;
+        const clampedDays = Math.max(1, Math.min(3_650, days));
+        const since = new Date(now.getTime() - clampedDays * 86_400_000);
+        startPublishedDate = since.toISOString().slice(0, 10);
+        rest = candidate;
+        continue;
+      }
+    }
+    break;
+  }
 
   return {
-    idle: () => active === 0 && queue.length === 0,
-    run: <T>(fn: () => Promise<T>): Promise<T> =>
-      new Promise<T>((resolve, reject) => {
-        const run = () => {
-          active += 1;
-          fn().then(
-            (val) => {
-              next();
-              resolve(val);
-            },
-            (err) => {
-              next();
-              reject(err);
-            },
-          );
-        };
-
-        if (active < cap) {
-          run();
-        } else {
-          queue.push(run);
-        }
-      }),
+    query: rest || rawQuery.trim(),
+    ...(searchType ? { searchType } : {}),
+    ...(startPublishedDate ? { startPublishedDate } : {}),
   };
 }
-
-/**
- * One concurrency limit per key, shared by everything in this process that
- * uses the same key. Limiters are dropped again once they are idle.
- */
-function createKeyedLimiter(
-  limit: number,
-): <T>(key: string, fn: () => Promise<T>) => Promise<T> {
-  const limiters = new Map<string, ReturnType<typeof createConcurrencyLimiter>>();
-  return async (key, fn) => {
-    let limiter = limiters.get(key);
-    if (!limiter) {
-      limiter = createConcurrencyLimiter(limit);
-      limiters.set(key, limiter);
-    }
-    try {
-      return await limiter.run(fn);
-    } finally {
-      if (limiter.idle() && limiters.get(key) === limiter) limiters.delete(key);
-    }
-  };
-}
-
-/**
- * At most 2 Exa calls are in flight at once for a conversation thread, however
- * many its research round asks for; the rest wait their turn. A thread has
- * one live run at a time (a new turn supersedes the old one, and detached
- * attempts take a lease), so this bounds the thread as a whole. It is kept
- * per process: a superseded run finishing on another instance is not counted.
- * The total across all threads is paced by `awaitExaRateSlot`.
- */
-const runOnThread = createKeyedLimiter(serverConfig.exa.concurrencyPerThread);
 
 function getExaApiKey(): string {
   const apiKey = process.env.EXA_API_KEY?.trim();
@@ -108,22 +101,6 @@ function getExaApiKey(): string {
     throw new Error("EXA_API_KEY environment variable is not set.");
   }
   return apiKey;
-}
-
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  if (ms <= 0 || signal?.aborted) return Promise.resolve();
-  return new Promise((resolve) => {
-    const onAbort = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
 }
 
 function backoffMs(attempt: number, response?: Response): number {
@@ -145,7 +122,7 @@ async function fetchWithTimeout(
   outerSignal?: AbortSignal,
 ): Promise<Response> {
   if (outerSignal?.aborted) {
-    throw new DOMException("The operation was aborted.", "AbortError");
+    throw createAbortError();
   }
 
   const controller = new AbortController();
@@ -175,12 +152,11 @@ async function fetchWithTimeout(
 const EXA_RATE_KEY = "ratelimit:exa:rps";
 
 /**
- * Take one slot from the Exa request budget shared by every request and
+ * Take one slot from the Exa request budget shared across every request and
  * isolate, waiting for it if needed. Returns how long it waited.
  *
- * The per-thread concurrency cap bounds one conversation's burst; this bounds
- * all of them together. It only paces: after `maxWaitMs` the call goes ahead
- * anyway, and Exa's own 429 handling (retry with backoff) takes over.
+ * It only paces: after `maxWaitMs` the call goes ahead anyway, and Exa's own
+ * 429 handling (retry with backoff) takes over.
  */
 export async function awaitExaRateSlot(opts?: {
   signal?: AbortSignal;
@@ -197,7 +173,7 @@ export async function awaitExaRateSlot(opts?: {
   const maxWaitMs = opts?.maxWaitMs ?? serverConfig.exa.globalMaxWaitMs;
   const store = opts?.store ?? sharedBucketStore();
   const now = opts?.now ?? Date.now;
-  const pause = opts?.sleep ?? sleep;
+  const pause = opts?.sleep ?? sleepUntilAborted;
   const bucket = {
     key: EXA_RATE_KEY,
     cost: 1,
@@ -208,7 +184,7 @@ export async function awaitExaRateSlot(opts?: {
   const startedAt = now();
   for (;;) {
     if (opts?.signal?.aborted) {
-      throw new DOMException("The operation was aborted.", "AbortError");
+      throw createAbortError();
     }
     const result = await store.reserve([bucket], now());
     const waitedMs = now() - startedAt;
@@ -234,7 +210,7 @@ async function postExa(
   let lastError: unknown;
   for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
     if (opts.signal?.aborted) {
-      throw new DOMException("The operation was aborted.", "AbortError");
+      throw createAbortError();
     }
 
     // Every HTTP attempt, retries included, counts against the shared rate.
@@ -283,17 +259,17 @@ async function postExa(
         attempt,
         waitMs,
       });
-      await sleep(waitMs, opts.signal);
+      await sleepUntilAborted(waitMs, opts.signal);
     } catch (error) {
       if (isAbortError(error) || opts.signal?.aborted) {
-        throw new DOMException("The operation was aborted.", "AbortError");
+        throw createAbortError();
       }
       lastError = error;
       if (attempt > MAX_RETRIES) {
         throw error;
       }
       const waitMs = backoffMs(attempt);
-      await sleep(waitMs, opts.signal);
+      await sleepUntilAborted(waitMs, opts.signal);
     }
   }
 
@@ -321,35 +297,63 @@ function parseExaResults(rawList: RawExaResult[]): ExaDocument[] {
         ? item.publishedDate.trim()
         : undefined;
     const text = typeof item.text === "string" ? item.text.trim() : "";
+    const highlights = Array.isArray(item.highlights)
+      ? item.highlights
+          .filter((h): h is string => typeof h === "string")
+          .map((h) => h.trim())
+          .filter(Boolean)
+      : undefined;
 
-    docs.push({ url, title, publishedDate, text });
+    docs.push({
+      url,
+      title,
+      publishedDate,
+      text,
+      ...(highlights && highlights.length > 0 ? { highlights } : {}),
+    });
   }
   return docs;
 }
 
 /**
- * Semantic + keyword web search via Exa REST API, returning page text in a
- * single HTTP call (no separate crawl step needed).
+ * Semantic + keyword web search via Exa REST API, returning page text (and
+ * optional full-document neural highlights) in a single HTTP call.
  */
 async function searchExa(
   query: string,
   opts: {
     numResults?: number;
     maxCharacters?: number;
+    highlightsQuery?: string;
+    searchType?: ExaSearchType;
+    startPublishedDate?: string;
     signal?: AbortSignal;
     requestId?: string;
   } = {},
 ): Promise<ExaDocument[]> {
+  const highlightsQuery = opts.highlightsQuery?.trim();
   const docs = await postExa(
     "/search",
     {
       query,
-      type: "auto",
+      type: opts.searchType ?? "auto",
       numResults: opts.numResults ?? 4,
+      ...(opts.startPublishedDate
+        ? { startPublishedDate: opts.startPublishedDate }
+        : {}),
       contents: {
         text: {
           maxCharacters: opts.maxCharacters ?? DEFAULT_MAX_CHARS,
         },
+        ...(highlightsQuery
+          ? {
+              highlights: {
+                query: highlightsQuery,
+                numSentences: serverConfig.exa.highlightSentences,
+                highlightsPerUrl: serverConfig.exa.highlightsPerUrl,
+              },
+            }
+          : {}),
       },
     },
     opts,
@@ -357,6 +361,7 @@ async function searchExa(
   logDebug("exa-search", {
     requestId: opts.requestId,
     query,
+    type: opts.searchType ?? "auto",
     results: docs.length,
   });
   return docs;
@@ -396,69 +401,82 @@ async function fetchExaContents(
 export type ExaSearchOutcome = { docs: ExaDocument[]; error?: string };
 
 /**
- * Scoped Exa client (the SearchProvider adapter): at most 2 calls in flight
- * per conversation thread, Redis request caching, and resilient error
- * reporting so individual query failures don't kill a round but are not
- * silent either.
+ * Scoped Exa client (the SearchProvider adapter): Redis request caching and
+ * resilient error reporting so individual query or URL failures don't kill a
+ * turn while still being surfaced as degraded.
  */
 export function createExaClient(opts: {
-  /**
-   * Conversation the searches belong to; clients with the same thread share
-   * its 2 parallel slots. Without one, the client gets slots of its own.
-   */
-  threadId?: string;
   signal?: AbortSignal;
   requestId?: string;
   cache?: RequestCache;
   disableCache?: boolean;
-}) {
-  const threadKey = opts.threadId ?? `client:${crypto.randomUUID()}`;
+} = {}) {
   const cache = opts.cache ?? requestCache;
 
   const searchDetailed = async (
     query: string,
     numResults: number,
+    reqOpts?: ExaSearchRequestOptions,
   ): Promise<ExaSearchOutcome> => {
+    const structured = parseStructuredSearchQuery(query);
+    const effectiveQuery = structured.query;
+    const maxChars = reqOpts?.maxCharacters ?? DEFAULT_MAX_CHARS;
+    const searchType = reqOpts?.searchType ?? structured.searchType;
+    const startPublishedDate =
+      reqOpts?.startPublishedDate ?? structured.startPublishedDate;
+    const highlightsQuery = reqOpts?.highlightsQuery?.trim() || undefined;
+
     try {
       const docs = await cache.wrap(
         "search",
         {
-          q: normalizeCacheText(query),
+          q: normalizeCacheText(effectiveQuery),
           numResults,
-          maxChars: DEFAULT_MAX_CHARS,
+          maxChars,
+          ...(searchType && searchType !== "auto" ? { type: searchType } : {}),
+          ...(startPublishedDate ? { since: startPublishedDate } : {}),
+          ...(highlightsQuery ? { hq: normalizeCacheText(highlightsQuery) } : {}),
         },
         serverConfig.cache.searchTtlSeconds,
         // Signal-free loader: this task may be coalesced across callers, so
         // one caller's abort must not fail the rest. Our own signal is passed
-        // to `wrap`, which detaches only this caller. The thread's slot is
-        // taken here, around the real Exa call, so cache hits use no slot and
-        // a call left running after an abort keeps its slot until it ends.
+        // to `wrap`, which detaches only this caller.
         () =>
-          runOnThread(threadKey, () =>
-            searchExa(query, { numResults, requestId: opts.requestId }),
-          ),
+          searchExa(effectiveQuery, {
+            numResults,
+            maxCharacters: maxChars,
+            highlightsQuery,
+            searchType,
+            startPublishedDate,
+            requestId: opts.requestId,
+          }),
         { bypass: opts.disableCache, requestId: opts.requestId, signal: opts.signal },
       );
       return { docs };
     } catch (error) {
       if (isAbortError(error) || opts.signal?.aborted) throw error;
-      logError("exa-search", error, { requestId: opts.requestId, query });
+      logError("exa-search", error, { requestId: opts.requestId, query: effectiveQuery });
       return { docs: [], error: error instanceof Error ? error.message : "Search failed" };
     }
   };
 
-  const fetchDetailed = async (urls: string[]): Promise<ExaSearchOutcome> => {
+  const fetchDetailed = async (
+    urls: string[],
+    reqOpts?: { maxCharacters?: number },
+  ): Promise<ExaSearchOutcome> => {
+    const maxChars = reqOpts?.maxCharacters ?? DEFAULT_MAX_CHARS;
     try {
       // Explicitly pasted URLs use the short contents TTL: the user may have
       // just changed the page, so long-lived caching would serve stale text.
       const docs = await cache.wrap(
         "contents",
-        { urls: [...urls].sort(), maxChars: DEFAULT_MAX_CHARS },
+        { urls: [...urls].sort(), maxChars },
         serverConfig.cache.contentsTtlSeconds,
         () =>
-          runOnThread(threadKey, () =>
-            fetchExaContents(urls, { requestId: opts.requestId }),
-          ),
+          fetchExaContents(urls, {
+            maxCharacters: maxChars,
+            requestId: opts.requestId,
+          }),
         { bypass: opts.disableCache, requestId: opts.requestId, signal: opts.signal },
       );
       return { docs };

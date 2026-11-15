@@ -2,6 +2,8 @@ import "server-only";
 import { convertToModelMessages, type UIMessage } from "ai";
 import { serverConfig } from "@/lib/config";
 import { effortConfig } from "@/lib/effort";
+import { sleepUntilAborted } from "@/lib/errors";
+import { decodeStoredJson } from "@/lib/json";
 import { logError, logInfo } from "@/lib/logger";
 import { redis } from "@/lib/redis";
 import {
@@ -92,31 +94,6 @@ const defaultDb = () => redis() as unknown as Db;
 
 const jobKey = (runId: string) => `chat:job:${runId}`;
 const checkpointKey = (runId: string) => `chat:job:${runId}:checkpoint`;
-
-/** Upstash decodes JSON values on read; other clients return the string. */
-function decode<T>(raw: unknown): T | null {
-  if (raw == null) return null;
-  if (typeof raw !== "string") return raw as T;
-  try {
-    return JSON.parse(raw) as T;
-  } catch {
-    return null;
-  }
-}
-
-/** Resolves after `ms`, or as soon as `signal` aborts. */
-function sleepFor(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal?.aborted) return resolve();
-    const finish = () => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", finish);
-      resolve();
-    };
-    const timer = setTimeout(finish, ms);
-    signal?.addEventListener("abort", finish, { once: true });
-  });
-}
 
 /** Save a turn's job, for `tailDetachedTurn` to run. */
 export async function saveDetachedTurn(job: ChatJob, db?: JobDb): Promise<void> {
@@ -370,7 +347,7 @@ async function runAttempt(job: ChatJob, ctx: DriveContext): Promise<AttemptOutco
 
     const modelMessages = await convertToModelMessages(job.messages);
     const checkpoint =
-      decode<TurnCheckpoint>(await db.get(checkpointKey(runId))) ?? undefined;
+      decodeStoredJson<TurnCheckpoint>(await db.get(checkpointKey(runId))) ?? undefined;
 
     // A turn that has been queued too long stops deferring and fails as busy.
     const queuedTooLong = now() - job.createdAt >= ctx.maxQueueWaitMs;
@@ -379,7 +356,6 @@ async function runAttempt(job: ChatJob, ctx: DriveContext): Promise<AttemptOutco
     const turn = ctx.startTurn({
       requestId,
       requestedModel: job.model,
-      threadId: chatId,
       query: job.query,
       effort: effortConfig(job.effort),
       modelMessages,
@@ -487,7 +463,7 @@ export async function driveDetachedTurn(
 ): Promise<DriveResult> {
   const config: DriveConfig = { ...serverConfig.detached, ...deps.config };
   const now = deps.now ?? Date.now;
-  const sleep = deps.sleep ?? sleepFor;
+  const sleep = deps.sleep ?? sleepUntilAborted;
   const lease = {
     key: runLeaseKey(runId),
     token: crypto.randomUUID(),
@@ -498,7 +474,7 @@ export async function driveDetachedTurn(
 
   try {
     db = deps.db ?? defaultDb();
-    const job = decode<ChatJob>(await db.get(jobKey(runId)));
+    const job = decodeStoredJson<ChatJob>(await db.get(jobKey(runId)));
     // A run's job goes when the run ends.
     if (!job) return "done";
 
@@ -606,7 +582,7 @@ function tendDetachedTurn(
   deps: DriveDeps,
 ): Tending {
   const { watch } = invocation;
-  const sleep = deps.sleep ?? sleepFor;
+  const sleep = deps.sleep ?? sleepUntilAborted;
   const watchIntervalMs =
     deps.config?.watchIntervalMs ?? serverConfig.detached.watchIntervalMs;
 

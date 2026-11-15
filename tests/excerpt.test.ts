@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { selectRelevantExcerpt } from "@/lib/excerpt";
+import { parseStructuredSearchQuery } from "@/lib/exa";
 
 describe("selectRelevantExcerpt", () => {
   it("returns short text unchanged and fast-paths unstructured single-block text", () => {
@@ -67,5 +68,61 @@ describe("selectRelevantExcerpt", () => {
     expect(leadPos).toBeGreaterThanOrEqual(0);
     expect(tablePos).toBeGreaterThan(leadPos);
     expect(excerpt).toContain("[...]");
+  });
+
+  it("appends non-redundant full-document highlights while skipping highlights already in the excerpt", () => {
+    const rawBody = [
+      "Executive overview of the 2026 semiconductor filing.",
+      "",
+      "General legal disclaimers and forward-looking statements. ".repeat(40),
+      "",
+      "## Revenue Breakdown",
+      "",
+      "Data-center segment revenue grew 48% year-over-year to $18.4B.",
+    ].join("\n");
+
+    const out = selectRelevantExcerpt(
+      rawBody,
+      "data-center revenue and wafer yield",
+      1_200,
+      [
+        "Data-center segment revenue grew 48% year-over-year to $18.4B.", // duplicate -> skipped
+        "Footnote 19 (page 84): 2nm gate-all-around wafer yield reached 71.5% in October 2026.", // beyond rawBody -> merged!
+      ],
+    );
+
+    expect(out.length).toBeLessThanOrEqual(1_200);
+    expect(out).toContain("### Full-Document Highlights");
+    expect(out).toContain("71.5%");
+    // Duplicate highlight should only appear once (in the body excerpt, not repeated in highlights).
+    expect(out.split("$18.4B").length - 1).toBe(1);
+  });
+});
+
+describe("parseStructuredSearchQuery", () => {
+  const fixedNow = new Date("2026-11-16T00:00:00.000Z");
+
+  it("parses RECENT:, RECENT[90d]:, and EXACT: operator prefixes", () => {
+    expect(parseStructuredSearchQuery("EXACT: CVE-2026-44120 advisory", fixedNow)).toEqual({
+      query: "CVE-2026-44120 advisory",
+      searchType: "keyword",
+    });
+
+    expect(parseStructuredSearchQuery("RECENT[90d]: HBM4 spot pricing", fixedNow)).toEqual({
+      query: "HBM4 spot pricing",
+      startPublishedDate: "2026-08-18",
+    });
+
+    expect(
+      parseStructuredSearchQuery("RECENT: EXACT: Form 10-K Item 7A", fixedNow),
+    ).toEqual({
+      query: "Form 10-K Item 7A",
+      searchType: "keyword",
+      startPublishedDate: "2025-11-16",
+    });
+
+    expect(parseStructuredSearchQuery("plain semantic query", fixedNow)).toEqual({
+      query: "plain semantic query",
+    });
   });
 });

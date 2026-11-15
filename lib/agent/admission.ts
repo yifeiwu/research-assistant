@@ -103,7 +103,7 @@ const ADMISSION_KEYS = [KEY_QUEUE, KEY_ACTIVE, KEY_ALIVE];
  * maxQueue, leaseMs, ticketTtlMs. Returns {1, 0} granted, {0, position}
  * queued, {-1, queueLength} full.
  */
-export const POLL_SCRIPT = `
+const POLL_SCRIPT = `
 local now = tonumber(ARGV[1])
 local id = ARGV[2]
 local enqueuedAt = tonumber(ARGV[3])
@@ -144,7 +144,7 @@ return { 0, rank + 1 }
 `;
 
 /** KEYS: active. ARGV: now, ticketId, leaseMs. */
-export const RENEW_SCRIPT = `
+const RENEW_SCRIPT = `
 if redis.call('ZSCORE', KEYS[1], ARGV[2]) then
   redis.call('ZADD', KEYS[1], tonumber(ARGV[1]) + tonumber(ARGV[3]), ARGV[2])
   return 1
@@ -153,7 +153,7 @@ return 0
 `;
 
 /** KEYS: queue, active, alive. ARGV: ticketId. */
-export const RELEASE_SCRIPT = `
+const RELEASE_SCRIPT = `
 redis.call('ZREM', KEYS[1], ARGV[1])
 redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('ZREM', KEYS[3], ARGV[1])

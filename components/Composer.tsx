@@ -57,7 +57,6 @@ export function Composer({
       >
         <textarea
           ref={ref}
-          // eslint-disable-next-line jsx-a11y/no-autofocus
           autoFocus={autoFocus}
           value={input}
           onChange={(e) => setInput(e.target.value)}

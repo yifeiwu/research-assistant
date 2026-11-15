@@ -19,7 +19,7 @@ const assistant = (id: string, opts: { research?: boolean; text?: string }): UIM
           {
             type: "data-research-step" as const,
             id: "research-r1",
-            data: { round: 1, phase: "done", queries: ["q"], sources: [] },
+            data: { round: 1, phase: "done", query: "q", sources: [] },
           },
         ]
       : []),

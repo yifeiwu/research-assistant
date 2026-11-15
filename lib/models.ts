@@ -95,8 +95,8 @@ const FALLBACK_PRIORITY: readonly string[] = [
   "qwen/qwen3.8-27b",
 ];
 
-export function isValidGroqModel(id: string | undefined | null): id is string {
-  return !!id && GROQ_MODELS.some((m) => m.id === id);
+export function isValidGroqModel(id: unknown): id is string {
+  return typeof id === "string" && GROQ_MODELS.some((m) => m.id === id);
 }
 
 /**

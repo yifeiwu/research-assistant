@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { collectSources, normalizeUrlKey } from "@/lib/sources";
+import {
+  collectSources,
+  normalizeUrlKey,
+  splitSourcesByCitation,
+} from "@/lib/sources";
 import { chatRequestSchema } from "@/lib/types/chat";
 
 describe("normalizeUrlKey", () => {
@@ -19,6 +23,37 @@ describe("collectSources", () => {
       ],
     };
     expect(collectSources(message)).toHaveLength(1);
+  });
+});
+
+describe("splitSourcesByCitation", () => {
+  const read = (url: string, title: string) => ({ type: "source-url", url, title });
+
+  it("puts the sources the answer links to first, and keeps the rest as also read", () => {
+    const message = {
+      parts: [
+        read("https://a.com/one", "One"),
+        read("https://b.com/two", "Two"),
+        read("https://en.wikipedia.org/wiki/Foo_(bar)", "Foo"),
+        read("https://d.com/four", "Four"),
+        {
+          type: "text",
+          text: "As [Two](https://www.b.com/two/) says, and [Foo](https://en.wikipedia.org/wiki/Foo_(bar)). See https://d.com/four.",
+        },
+      ],
+    };
+    const { cited, other } = splitSourcesByCitation(message);
+    expect(cited.map((s) => s.title)).toEqual(["Two", "Foo", "Four"]);
+    expect(other.map((s) => s.title)).toEqual(["One"]);
+  });
+
+  it("cites nothing for an answer without links", () => {
+    const message = {
+      parts: [read("https://a.com/one", "One"), { type: "text", text: "No links here." }],
+    };
+    const { cited, other } = splitSourcesByCitation(message);
+    expect(cited).toEqual([]);
+    expect(other).toHaveLength(1);
   });
 });
 

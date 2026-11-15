@@ -1,10 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { Chat } from "@ai-sdk/react";
 import type { UIMessage } from "ai";
 
 type ChatStatus = Chat<UIMessage>["status"];
+
+/**
+ * A `Chat` is a store outside React, and assigning to `messages` is how the
+ * AI SDK has them replaced. Subscribers (below) are told as usual.
+ */
+function replaceMessages<UI_MESSAGE extends UIMessage>(
+  chat: Chat<UI_MESSAGE>,
+  messages: UI_MESSAGE[],
+): void {
+  chat.messages = messages;
+}
 
 type Snapshot<UI_MESSAGE extends UIMessage> = {
   chat: Chat<UI_MESSAGE>;
@@ -99,18 +110,16 @@ export function useChatState<UI_MESSAGE extends UIMessage = UIMessage>(
     };
   }, [chat, throttleMs]);
 
-  const chatRef = useRef(chat);
-  chatRef.current = chat;
-
   const setMessages = useCallback(
     (messagesParam: UI_MESSAGE[] | ((messages: UI_MESSAGE[]) => UI_MESSAGE[])) => {
-      const next =
+      replaceMessages(
+        chat,
         typeof messagesParam === "function"
-          ? messagesParam(chatRef.current.messages)
-          : messagesParam;
-      chatRef.current.messages = next;
+          ? messagesParam(chat.messages)
+          : messagesParam,
+      );
     },
-    [],
+    [chat],
   );
 
   return {

@@ -102,7 +102,7 @@ Guidelines:
 - Ground your claims in the research notes. Synthesize across sources rather than repeating each source one by one.
 - Distinguish established facts from claims, projections, or opinions attributed to specific sources, and note any reliability caveats surfaced in the notes.
 - Cite sources inline using markdown links — e.g. [Source Name](https://example.com/...) — using ONLY the exact URLs provided in the research notes. Never invent URLs.
-- End your answer with a compact "Sources" section listing the markdown links you relied on.
+- Do not end with a "Sources" or "References" list: the interface already lists every source below your answer, with the ones you linked first.
 - If the research notes do not fully answer part of the question or conflict with each other, state that transparently rather than guessing.
 - Be concise, direct, and well-structured with markdown headings/lists where helpful.${degradedLine}
 

@@ -3,7 +3,8 @@ import { activeChatRun, isChatId } from "@/lib/agent/chat-stream";
 import { tailDetachedTurn } from "@/lib/agent/detached";
 
 // Besides tailing, this request may run the turn itself, after (and
-// regardless of) the response; see lib/agent/detached.ts.
+// regardless of) the response; see lib/agent/detached.ts. Has to match
+// `detached.invocationLimitMs` in lib/config.ts (tests/config.test.ts checks).
 export const maxDuration = 300;
 export const dynamic = "force-dynamic";
 

@@ -53,6 +53,12 @@ type RunMeta = {
   answerStarted?: string | number;
   /** Attempts made so far. */
   attempts?: string | number;
+  /** Times an invocation handed the run over to a later request. */
+  handOvers?: string | number;
+  /** Times a later request's invocation took the run on. */
+  continuations?: string | number;
+  /** Time the run spent with no invocation driving it, past when it was due (ms). */
+  parkedMs?: string | number;
 };
 
 /**
@@ -307,6 +313,12 @@ export type ChatRunState = {
   chunkCount: number;
   /** When a `waiting` run's next attempt is due; 0 if none was scheduled. */
   wakeAt: number;
+  /** When the run last showed a sign of life. */
+  updatedAt: number;
+  /** How the run has been passed between invocations; see `RunMeta`. */
+  handOvers: number;
+  continuations: number;
+  parkedMs: number;
 };
 
 export async function readChatRunState(
@@ -328,21 +340,45 @@ export async function readChatRunState(
     attempts: Number(meta.attempts) || 0,
     chunkCount: Number(chunkCount) || 0,
     wakeAt: Number(meta.wakeAt) || 0,
+    updatedAt: Number(meta.updatedAt) || 0,
+    handOvers: Number(meta.handOvers) || 0,
+    continuations: Number(meta.continuations) || 0,
+    parkedMs: Number(meta.parkedMs) || 0,
   };
 }
 
-/** Mark a run as being streamed again and count the attempt. */
+/**
+ * Mark a run as being streamed again and count the attempt. `continued` is
+ * given by an invocation taking the run on from another, with how long the
+ * run had been left waiting for it.
+ */
 export async function beginChatRunAttempt(
   runId: string,
   db: ChatRedis = redis(),
-): Promise<number> {
-  const results = await db
+  continued?: { parkedMs: number },
+): Promise<void> {
+  const pipe = db.pipeline();
+  pipe.hincrby(metaKey(runId), "attempts", 1);
+  if (continued) {
+    pipe.hincrby(metaKey(runId), "continuations", 1);
+    pipe.hincrby(metaKey(runId), "parkedMs", Math.max(0, Math.round(continued.parkedMs)));
+  }
+  pipe.hset(metaKey(runId), { status: "streaming", updatedAt: String(Date.now()) });
+  pipe.expire(metaKey(runId), STREAM_TTL_SECONDS);
+  await pipe.exec();
+}
+
+/** Count an invocation handing the run over. Only feeds the turn's summary. */
+export async function countChatRunHandOver(
+  runId: string,
+  db: ChatRedis = redis(),
+): Promise<void> {
+  await db
     .pipeline()
-    .hincrby(metaKey(runId), "attempts", 1)
-    .hset(metaKey(runId), { status: "streaming", updatedAt: String(Date.now()) })
+    .hincrby(metaKey(runId), "handOvers", 1)
+    // So that counting on a run that has since expired leaves nothing behind.
     .expire(metaKey(runId), STREAM_TTL_SECONDS)
     .exec();
-  return Number(results[0]) || 1;
 }
 
 /** Give back an attempt that did no work (it only waited in the queue). */
@@ -397,10 +433,16 @@ export type AttemptIngest = {
 };
 
 /**
- * Consume one attempt's UI message chunks into the run's SSE buffer,
- * batching writes to Redis every ~150ms (or 16 KB) while polling for remote
- * stop / supersede signals at least once per second even during quiet
- * retrieval/condensation stages.
+ * Consume one attempt's UI message chunks into the run's SSE buffer.
+ *
+ * Two things go to Redis, on separate clocks:
+ * - What the attempt streams, batched every ~150ms (or 16 KB). A flush
+ *   writes the batch and nothing else, since it is the hot path while an
+ *   answer streams.
+ * - A heartbeat once a second, however much or little is streaming. It
+ *   keeps the run alive (its `updatedAt`, its keys' TTLs and the driving
+ *   invocation's lease) and reads whether the run was stopped, replaced or
+ *   ended elsewhere, in which case the attempt's work is aborted.
  */
 export async function ingestChunkStream(
   run: ChatRun,
@@ -413,135 +455,171 @@ export async function ingestChunkStream(
 
   let pending = "";
   let flushedBatches = 0;
-  let lastSyncAt = Date.now();
   let finished = false;
+  // Set once the run is closed, by this attempt or from elsewhere. Nothing
+  // more is written to it after that.
   let finalized = false;
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  let heartbeatQueued = false;
   let answerStarted = false;
   let answerStartRecorded = false;
 
-  const answerStartFields = (): Record<string, string> => {
-    if (!answerStarted || answerStartRecorded) return {};
-    return { answerStarted: "1" };
+  const cancelFlushTimer = () => {
+    if (!flushTimer) return;
+    clearTimeout(flushTimer);
+    flushTimer = undefined;
   };
 
-  async function syncToRedis(finalize: boolean): Promise<void> {
-    // Finalize is idempotent, and no heartbeat/flush may touch a done run.
-    if (finalized) return;
-    if (flushTimer) {
-      clearTimeout(flushTimer);
-      flushTimer = undefined;
+  /**
+   * Run a pipeline that writes `taken` (what was just removed from
+   * `pending`). If it fails (a transient Redis error), `taken` goes back to
+   * the front of `pending` so that the next write retries it, instead of
+   * leaving a hole in the buffered stream that clients replay.
+   */
+  const execOrRestore = async (
+    pipe: ReturnType<ChatRedis["pipeline"]>,
+    taken: string,
+    wrote: { batch: boolean; answerStart: boolean },
+  ): Promise<void> => {
+    try {
+      await pipe.exec();
+    } catch (error) {
+      pending = taken + pending;
+      throw error;
     }
+    if (wrote.batch) flushedBatches += 1;
+    if (wrote.answerStart) answerStartRecorded = true;
+  };
 
-    if (!finalize) {
-      const status = await db.hget<string>(metaKey(runId), "status");
-      if (status === "done") {
-        finalized = true;
-        return;
-      }
-    }
-
-    // The stream has closed by the time of the final sync, so this is
-    // already settled.
-    const wakeAt = finalize ? await attempt.wakeAt : undefined;
-
+  /** Write what the attempt has streamed since the last flush. */
+  async function flush(): Promise<void> {
+    cancelFlushTimer();
+    if (finalized || pending.length === 0) return;
     const taken = pending;
     pending = "";
-    // The closing frame goes out with the last batch, and only if the run is
-    // over: a parked run's stream is continued by a later attempt.
-    const batch = finalize && wakeAt === undefined ? taken + DONE_FRAME : taken;
-    const now = String(Date.now());
-    const metaExtras = answerStartFields();
-
-    // If the pipeline fails (transient Redis error), put what was taken back
-    // at the front of `pending` so the next flush/finalize retries it instead
-    // of leaving a hole in the buffered stream that resume clients replay.
-    const execOrRestore = async (
-      pipe: ReturnType<ChatRedis["pipeline"]>,
-    ): Promise<unknown[]> => {
-      try {
-        const results = await pipe.exec();
-        if (batch.length > 0) flushedBatches += 1;
-        if (metaExtras.answerStarted) answerStartRecorded = true;
-        return results;
-      } catch (error) {
-        pending = taken + pending;
-        throw error;
-      }
-    };
-
-    if (finalize) {
-      const pipe = db.pipeline();
-      if (batch.length > 0) {
-        pipe.rpush(chunksKey(runId), batch);
-        pipe.expire(chunksKey(runId), STREAM_TTL_SECONDS);
-      }
-      // Always RPUSH final bytes BEFORE marking status="done" in the pipeline
-      // so readers polling HGETALL before LRANGE never miss trailing frames.
-      pipe.hset(
-        metaKey(runId),
-        wakeAt !== undefined
-          ? { status: "waiting", wakeAt: String(wakeAt), updatedAt: now, ...metaExtras }
-          : { status: "done", updatedAt: now, ...metaExtras },
-      );
-      pipe.expire(metaKey(runId), STREAM_TTL_SECONDS);
-      pipe.expire(activeKey(chatId), STREAM_TTL_SECONDS);
-      await execOrRestore(pipe);
-      finalized = true;
-      lastSyncAt = Date.now();
-      return;
-    }
+    const answerStart = answerStarted && !answerStartRecorded;
 
     const pipe = db.pipeline();
-    if (batch.length > 0) {
-      pipe.rpush(chunksKey(runId), batch);
-      pipe.expire(chunksKey(runId), STREAM_TTL_SECONDS);
-    }
-    pipe.hset(metaKey(runId), { updatedAt: now, ...metaExtras });
+    // Goes with (and ahead of) the first of the answer's text, not at the
+    // next heartbeat: were the invocation to die in between, the answer
+    // would be taken for unstarted and written a second time.
+    if (answerStart) pipe.hset(metaKey(runId), { answerStarted: "1" });
+    pipe.rpush(chunksKey(runId), taken);
+    // The list may only come into being with this write, and must not be
+    // left without a TTL if the invocation dies before its first heartbeat.
+    if (flushedBatches === 0) pipe.expire(chunksKey(runId), STREAM_TTL_SECONDS);
+    await execOrRestore(pipe, taken, { batch: true, answerStart });
+  }
+
+  /** Keep the run alive, and stop this attempt's work if the run is over. */
+  async function heartbeat(): Promise<void> {
+    if (finalized) return;
+    const pipe = db.pipeline();
+    pipe.hget<string>(metaKey(runId), "status");
+    pipe.hget<string | number>(metaKey(runId), "stopped");
+    pipe.get<string>(activeKey(chatId));
+    pipe.hset(metaKey(runId), { updatedAt: String(Date.now()) });
     pipe.expire(metaKey(runId), STREAM_TTL_SECONDS);
+    pipe.expire(chunksKey(runId), STREAM_TTL_SECONDS);
     pipe.expire(activeKey(chatId), STREAM_TTL_SECONDS);
-    // Keep the driving invocation's claim on the run alive while it streams.
+    // The driving invocation's claim on the run.
     pipe.set(attempt.lease.key, attempt.lease.token, {
       ex: attempt.lease.ttlSeconds,
     });
-    pipe.hget<string | number>(metaKey(runId), "stopped");
-    pipe.get<string>(activeKey(chatId));
+    const [status, stoppedVal, currentActive] = (await pipe.exec()) as [
+      string | null,
+      string | number | null,
+      string | null,
+    ];
 
-    const results = await execOrRestore(pipe);
-    lastSyncAt = Date.now();
-
-    const stoppedVal = results[results.length - 2];
-    const currentActive = results[results.length - 1] as string | null;
+    // Closed by someone else: a stop that found the run waiting, or another
+    // invocation that took it for dead. Nothing this attempt streams from
+    // here on would be seen, so its work stops too.
+    const endedElsewhere = status === "done";
     const isStopped = String(stoppedVal) === "1";
     const isSuperseded = Boolean(currentActive && currentActive !== runId);
+    if (endedElsewhere) finalized = true;
 
-    if ((isStopped || isSuperseded) && !abortController.signal.aborted) {
+    if (
+      (endedElsewhere || isStopped || isSuperseded) &&
+      !abortController.signal.aborted
+    ) {
       abortController.abort();
       logInfo("stream-abort-remote", {
         chatId,
         runId,
         stopped: isStopped,
         superseded: isSuperseded,
+        endedElsewhere,
       });
     }
   }
 
-  function scheduleSync(): void {
+  /**
+   * Close the attempt: write what is left and either end the run or park it
+   * for a later attempt. Does nothing for a run that is already closed.
+   */
+  async function finalize(): Promise<void> {
+    cancelFlushTimer();
+    if (finalized) return;
+    // The stream has closed by now, so this is already settled.
+    const wakeAt = await attempt.wakeAt;
+
+    const taken = pending;
+    pending = "";
+    // The closing frame goes out with the last batch, and only if the run is
+    // over: a parked run's stream is continued by a later attempt.
+    const batch = wakeAt === undefined ? taken + DONE_FRAME : taken;
+    const now = String(Date.now());
+    const answerStart = answerStarted && !answerStartRecorded;
+    const metaExtras: Record<string, string> = answerStart
+      ? { answerStarted: "1" }
+      : {};
+
+    const pipe = db.pipeline();
+    if (batch.length > 0) {
+      pipe.rpush(chunksKey(runId), batch);
+      pipe.expire(chunksKey(runId), STREAM_TTL_SECONDS);
+    }
+    // Always RPUSH final bytes BEFORE marking status="done" in the pipeline
+    // so readers polling HGETALL before LRANGE never miss trailing frames.
+    pipe.hset(
+      metaKey(runId),
+      wakeAt !== undefined
+        ? { status: "waiting", wakeAt: String(wakeAt), updatedAt: now, ...metaExtras }
+        : { status: "done", updatedAt: now, ...metaExtras },
+    );
+    pipe.expire(metaKey(runId), STREAM_TTL_SECONDS);
+    pipe.expire(activeKey(chatId), STREAM_TTL_SECONDS);
+    await execOrRestore(pipe, taken, { batch: batch.length > 0, answerStart });
+    finalized = true;
+  }
+
+  function scheduleFlush(): void {
     if (finished) return;
     void runSerial(async () => {
       if (finished) return;
       try {
-        await syncToRedis(false);
+        await flush();
       } catch (error) {
-        logError("stream-sync", error, { chatId, runId });
+        logError("stream-flush", error, { chatId, runId });
       }
     });
   }
 
   const heartbeatTimer = setInterval(() => {
-    if (!finished && Date.now() - lastSyncAt >= HEARTBEAT_INTERVAL_MS) {
-      scheduleSync();
-    }
+    // One at a time: a slow Redis must not build up a queue of them.
+    if (finished || heartbeatQueued) return;
+    heartbeatQueued = true;
+    void runSerial(async () => {
+      try {
+        if (!finished) await heartbeat();
+      } catch (error) {
+        logError("stream-heartbeat", error, { chatId, runId });
+      } finally {
+        heartbeatQueued = false;
+      }
+    });
   }, HEARTBEAT_INTERVAL_MS);
 
   const reader = stream.getReader();
@@ -557,7 +635,7 @@ export async function ingestChunkStream(
       if (pending.length >= FLUSH_CHAR_THRESHOLD) {
         await runSerial(async () => {
           try {
-            await syncToRedis(false);
+            await flush();
           } catch (error) {
             logError("stream-flush", error, { chatId, runId });
           }
@@ -565,7 +643,7 @@ export async function ingestChunkStream(
       } else if (!flushTimer) {
         flushTimer = setTimeout(() => {
           flushTimer = undefined;
-          scheduleSync();
+          scheduleFlush();
         }, FLUSH_INTERVAL_MS);
       }
     }
@@ -574,20 +652,17 @@ export async function ingestChunkStream(
   } finally {
     finished = true;
     clearInterval(heartbeatTimer);
-    if (flushTimer) {
-      clearTimeout(flushTimer);
-      flushTimer = undefined;
-    }
+    cancelFlushTimer();
     reader.releaseLock();
 
     try {
-      await runSerial(() => syncToRedis(true));
+      await runSerial(finalize);
     } catch (error) {
       // The failed batch was restored to `pending`; retry finalize once so a
       // transient Redis blip doesn't leave the run stuck in "streaming".
       logError("stream-finalize", error, { chatId, runId });
       try {
-        await runSerial(() => syncToRedis(true));
+        await runSerial(finalize);
       } catch (retryError) {
         logError("stream-finalize-retry", retryError, { chatId, runId });
       }
@@ -600,6 +675,21 @@ export async function ingestChunkStream(
       aborted: abortController.signal.aborted,
     });
   }
+}
+
+/**
+ * The batches up to the one that closes the stream. The closing frame is
+ * always the end of the batch that carries it, and it ends the stream for
+ * readers whatever follows: an attempt that has not yet noticed its run was
+ * ended elsewhere may append to the buffer for up to a heartbeat.
+ */
+function untilClosed(batches: string[]): { batches: string[]; closed: boolean } {
+  const end = batches.findIndex(
+    (batch) => typeof batch === "string" && batch.endsWith(DONE_FRAME),
+  );
+  return end === -1
+    ? { batches, closed: false }
+    : { batches: batches.slice(0, end + 1), closed: true };
 }
 
 /**
@@ -637,7 +727,9 @@ export async function resumeChatStream(
       return new Response(null, { status: 202 });
     }
 
-    const chunks = await db.lrange<string>(chunksKey(runId), 0, -1);
+    const { batches: chunks } = untilClosed(
+      await db.lrange<string>(chunksKey(runId), 0, -1),
+    );
     if (chunks.length === 0) return null;
 
     const payload = chunks.join("");
@@ -692,10 +784,11 @@ export async function resumeChatStream(
       };
 
       try {
-        enqueueChunks(initialChunks);
+        const initial = untilClosed(initialChunks);
+        enqueueChunks(initial.batches);
         let cursor = initialChunks.length;
 
-        if (initialDone || initialStale) {
+        if (initialDone || initialStale || initial.closed) {
           safeClose();
           return;
         }
@@ -723,15 +816,16 @@ export async function resumeChatStream(
             break;
           }
 
+          const next = untilClosed(nextChunks);
           if (nextChunks.length > 0) {
-            enqueueChunks(nextChunks);
+            enqueueChunks(next.batches);
             cursor += nextChunks.length;
             emptyPolls = 0;
           } else {
             emptyPolls += 1;
           }
 
-          if (!meta?.status || meta.status === "done") {
+          if (next.closed || !meta?.status || meta.status === "done") {
             break;
           }
 

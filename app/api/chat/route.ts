@@ -24,7 +24,8 @@ import {
 // The response relays the turn's output from Redis, and the turn itself runs
 // in this invocation after (and regardless of) the response, both for at
 // most this long. A turn that needs longer is continued by a later request;
-// see lib/agent/detached.ts, where `handoffAfterMs` depends on this limit.
+// see lib/agent/detached.ts. `detached.invocationLimitMs` in lib/config.ts
+// has to say the same (tests/config.test.ts checks).
 export const maxDuration = 300;
 
 /** How soon a client should retry after the research queue was full. */

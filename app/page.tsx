@@ -1,7 +1,6 @@
 "use client";
 
-import { Chat } from "@ai-sdk/react";
-import { DefaultChatTransport, type UIMessage } from "ai";
+import type { UIMessage } from "ai";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, RotateCw } from "lucide-react";
 import { Message } from "@/components/Message";
@@ -10,241 +9,85 @@ import { Composer } from "@/components/Composer";
 import { EmptyState } from "@/components/EmptyState";
 import { ConversationSidebar } from "@/components/ConversationSidebar";
 import { SettingsPanel } from "@/components/SettingsPanel";
+import { UnansweredNotice } from "@/components/UnansweredNotice";
 import { useChatState } from "@/lib/hooks/useChatState";
 import { useConversations } from "@/lib/hooks/useConversations";
 import { useChatSettings } from "@/lib/hooks/useChatSettings";
 import { useScrollAnchor } from "@/lib/hooks/useScrollAnchor";
 import { useHeartbeat } from "@/lib/hooks/useHeartbeat";
 import { useChatActions } from "@/lib/hooks/useChatActions";
-import {
-  useResumeOnVisible,
-  type ReconnectOutcome,
-} from "@/lib/hooks/useResumeOnVisible";
-import { useTurnMachine } from "@/lib/hooks/turnMachine";
+import { useReconnect } from "@/lib/hooks/useReconnect";
+import { useTurnMachine } from "@/lib/hooks/useTurnMachine";
+import { createChatSession } from "@/lib/chat-session";
 import { busyLabel, formatDuration } from "@/lib/format";
-import { findLastUserMessageId } from "@/lib/messages";
+import { endsUnanswered, findLastUserMessageId } from "@/lib/messages";
 import {
   CHAT_STREAM_THROTTLE_MS,
   createConversationId,
 } from "@/lib/conversations";
 import { describeChatError } from "@/lib/chat-error";
+import { isPending, streamEndEvent, type TurnEvent } from "@/lib/turn-machine";
 import { activeTurnStatus } from "@/lib/turn-status";
-import { fetchWithRetryAfter } from "@/lib/retry-fetch";
-import { failIfUnfinished } from "@/lib/unfinished-stream";
-
-function isNetworkDisconnectError(err: unknown): boolean {
-  return (
-    err instanceof TypeError &&
-    /fetch|network|load failed/i.test(err.message)
-  );
-}
+import { withHeldMessage } from "@/lib/turn-view";
 
 export default function Home() {
   const [chatId, setChatId] = useState(createConversationId);
-  const turnMachine = useTurnMachine(chatId);
-  const turnDispatch = turnMachine.dispatch;
-  const isStopped = useCallback(
-    (id: string) => turnMachine.stateRef.current.stoppedChatId === id,
-    [turnMachine.stateRef],
+
+  // The state of every thread's latest turn (lib/turn-machine.ts). Whether a
+  // turn is pending, and whether to reconnect to it, is read from here and
+  // nowhere else.
+  const {
+    state: turnState,
+    dispatch: dispatchTurn,
+    getState: getTurnState,
+  } = useTurnMachine(chatId);
+  const activeTurn = turnState.threads[chatId];
+  // In flight as far as the user is concerned, whether or not the page is
+  // connected to it right now: the answer so far, the clock and Stop all
+  // stay where they are through a reconnect.
+  const turnActive = isPending(activeTurn?.phase);
+
+  const openThread = useCallback(
+    (id: string) => {
+      dispatchTurn({ type: "ACTIVATE", chatId: id });
+      setChatId(id);
+    },
+    [dispatchTurn],
   );
-  const settleRef = useRef<(id: string, finalMessages?: UIMessage[]) => void>(
-    () => {},
-  );
 
-  // Create an isolated `Chat` + abortable transport per `chatId` so:
-  //   1. `onFinish` / `onError` are permanently bound to `instanceId` and can
-  //      never clobber another thread's saved messages after a sidebar switch.
-  //   2. `GET /api/chat/:id/stream` (used by `resumeStream()`) is wired to an
-  //      `AbortController` so switching threads or clicking Stop aborts live
-  //      reconnect streams immediately.
-  //   3. HTTP `204` vs `200` reconnect status is recorded directly rather than
-  //      inferred from React-lagged refs.
-  const chatSession = useMemo(() => {
-    const instanceId = chatId;
-    let reconnectController: AbortController | null = null;
-    let lastReconnectOutcome: ReconnectOutcome = null;
-    let lastErrorWasNetwork = false;
-    let lastRequestWasHttpRejection = false;
+  const session = useMemo(() => createChatSession(chatId), [chatId]);
 
-    const abortReconnect = () => {
-      if (reconnectController) {
-        reconnectController.abort();
-        reconnectController = null;
-      }
-    };
-
-    const consumeReconnectOutcome = (): ReconnectOutcome => {
-      const outcome = lastReconnectOutcome;
-      lastReconnectOutcome = null;
-      return outcome;
-    };
-
-    const transport = new DefaultChatTransport({
-      api: "/api/chat",
-      fetch: async (input, init) => {
-        const method = (init?.method ?? "GET").toUpperCase();
-        const url =
-          typeof input === "string"
-            ? input
-            : input instanceof URL
-              ? input.href
-              : input.url;
-        const isReconnect = method === "GET" && url.includes("/stream");
-
-        if (isReconnect) {
-          abortReconnect();
-          const ctrl = new AbortController();
-          reconnectController = ctrl;
-          lastReconnectOutcome = null;
-
-          try {
-            const response = await globalThis.fetch(input, {
-              ...init,
-              signal: ctrl.signal,
-            });
-            if (response.status === 204) {
-              lastReconnectOutcome = "empty";
-            } else if (response.ok) {
-              lastReconnectOutcome = "replayed";
-            } else {
-              lastReconnectOutcome = "error";
-            }
-            // Known only once the replay has been read to its end.
-            return failIfUnfinished(response, () => {
-              lastReconnectOutcome = "unfinished";
-            });
-          } catch (err) {
-            if (ctrl.signal.aborted) {
-              lastReconnectOutcome = "aborted";
-            } else if (isNetworkDisconnectError(err)) {
-              lastReconnectOutcome = "network-error";
-            } else {
-              lastReconnectOutcome = "error";
-            }
-            throw err;
-          } finally {
-            if (reconnectController === ctrl && ctrl.signal.aborted) {
-              reconnectController = null;
-            }
-          }
-        }
-
-        lastErrorWasNetwork = false;
-        lastRequestWasHttpRejection = false;
-        // A 429 with a short Retry-After (per-visitor limit, or a full
-        // research queue) is retried once here instead of becoming an error.
-        const response = await fetchWithRetryAfter(globalThis.fetch, input, init);
-        if (!response.ok) {
-          lastRequestWasHttpRejection = true;
-        }
-        // A stream the server ends before the turn is over (it hands long
-        // turns on to a later request) is treated as a dropped connection,
-        // so the turn stays `pending` and is reconnected to.
-        return failIfUnfinished(response);
-      },
-    });
-
-    const chat = new Chat({
-      id: instanceId,
-      transport,
-      onFinish: ({
-        messages: finishedMessages,
-        isAbort,
-        isDisconnect,
-        isError,
-        finishReason,
-      }) => {
-        const wasNetworkDrop = isDisconnect || lastErrorWasNetwork;
-        const wasHttpRejection = lastRequestWasHttpRejection;
-        lastErrorWasNetwork = false;
-        lastRequestWasHttpRejection = false;
-
-        if (turnMachine.stateRef.current.stoppedChatId === instanceId) {
-          turnDispatch({ type: "SETTLE", chatId: instanceId });
-          settleRef.current(instanceId, finishedMessages);
-          return;
-        }
-        if (isAbort || wasNetworkDrop) {
-          // Detached on thread switch or dropped by network: keep `pending: true`
-          // so the thread can resume or be collected from Upstash Redis.
-          turnDispatch({ type: "FINISH_DETACHED", chatId: instanceId });
-          return;
-        }
-        if (isError) {
-          // Server HTTP 4xx/5xx rejections have no active Redis stream even if
-          // the tab was hidden when the error arrived.
-          if (wasHttpRejection || document.visibilityState === "visible") {
-            settleRef.current(instanceId);
-          }
-          return;
-        }
-        // If the tab is hidden and no `finish` chunk arrived (`finishReason == null`),
-        // the browser silently closed the socket — keep `pending: true` to resume.
-        if (document.visibilityState !== "visible" && finishReason == null) {
-          return;
-        }
-        turnDispatch({ type: "FINISH_OK", chatId: instanceId });
-        settleRef.current(instanceId, finishedMessages);
-      },
-      onError: (err) => {
-        const networkDrop = isNetworkDisconnectError(err);
-        lastErrorWasNetwork = networkDrop;
-        turnDispatch(
-          networkDrop
-            ? { type: "NETWORK_ERROR" }
-            : { type: "NON_NETWORK_ERROR" },
-        );
-        if (
-          !networkDrop &&
-          (lastRequestWasHttpRejection ||
-            document.visibilityState === "visible")
-        ) {
-          settleRef.current(instanceId);
-        }
-      },
-    });
-
-    return { chat, abortReconnect, consumeReconnectOutcome };
-  }, [chatId]);
-
-  // Ensure any in-flight local stream or reconnect poll on a previous `Chat`
-  // instance is torn down cleanly on thread switch or unmount.
+  // Let go of a thread's stream and any reconnect when it is left, or the
+  // page goes away. Its turn carries on, on the server.
   useEffect(() => {
     return () => {
-      chatSession.abortReconnect();
-      void chatSession.chat.stop();
+      session.abortReconnect();
+      void session.chat.stop();
     };
-  }, [chatSession]);
+  }, [session]);
 
-  const {
-    messages,
-    sendMessage,
-    status,
-    error,
-    stop,
-    setMessages,
-    resumeStream,
-  } = useChatState(chatSession.chat, CHAT_STREAM_THROTTLE_MS);
+  const { messages, sendMessage, status, error, stop, setMessages } =
+    useChatState(session.chat, CHAT_STREAM_THROTTLE_MS);
 
   const [input, setInput] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // The assistant message taken out of the chat while its turn's stream is
+  // replayed, shown in its place until the replay catches up.
+  const [held, setHeld] = useState<{ chatId: string; message: UIMessage } | null>(
+    null,
+  );
+  // Read out once by screen readers when a turn completes.
+  const [announcement, setAnnouncement] = useState("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const wasBusyRef = useRef(false);
+  const wasActiveRef = useRef(false);
 
   const isBusy = status === "submitted" || status === "streaming";
-  const hasMessages = messages.length > 0;
   const errorInfo = error ? describeChatError(error) : null;
 
   useEffect(() => {
-    if (status === "submitted" || status === "streaming") {
-      turnDispatch({ type: "STATUS", status, chatId });
-    }
-  }, [status, chatId, turnDispatch]);
-
-  useEffect(() => {
-    turnDispatch({ type: "THREAD_SWITCH", chatId });
-  }, [chatId, turnDispatch]);
+    if (status === "streaming") dispatchTurn({ type: "STREAMING", chatId });
+  }, [status, chatId, dispatchTurn]);
 
   const { settings, updateSettings, requestBody } = useChatSettings();
 
@@ -253,93 +96,162 @@ export default function Home() {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(turnId ? { turnId } : {}),
+      // May be sent as the page is closing (a delete becoming final).
+      keepalive: true,
     });
   }, []);
 
+  const getTurn = useCallback(
+    (id: string) => getTurnState().threads[id],
+    [getTurnState],
+  );
+
   const detachStream = useCallback(() => {
-    turnDispatch({ type: "DETACH", chatId });
-    chatSession.abortReconnect();
+    session.abortReconnect();
     void stop();
-  }, [chatId, chatSession, stop, turnDispatch]);
+  }, [session, stop]);
 
   const {
     conversations,
     activeId,
-    activePending,
     isSeeded,
     selectConversation,
     newConversation,
     deleteConversation,
+    deleted,
+    undoDelete,
     settleConversation,
   } = useConversations({
     chatId,
-    setChatId,
+    setChatId: openThread,
     messages,
     setMessages,
     isBusy,
-    isStopped,
+    activeTurn,
+    getTurn,
+    dispatchTurn,
     detach: detachStream,
     stopServer,
   });
 
-  settleRef.current = (id, finalMessages) => {
-    settleConversation(id, finalMessages);
-    turnDispatch({ type: "SETTLE", chatId: id });
-  };
+  // The sidebar marks the threads whose turn is pending.
+  const listedConversations = useMemo(
+    () =>
+      conversations.map((conv) => {
+        const pending = isPending(turnState.threads[conv.id]?.phase);
+        return Boolean(conv.pending) === pending ? conv : { ...conv, pending };
+      }),
+    [conversations, turnState.threads],
+  );
+
+  /**
+   * Apply a turn event, and write the outcome down when it ends the turn:
+   * the thread's saved copy is no longer pending, and takes `finalMessages`
+   * if there are any. (Given for a turn that had already ended, they are
+   * saved all the same: a stopped turn's stream ends a moment after it.)
+   */
+  const applyTurn = useCallback(
+    (event: TurnEvent, finalMessages?: UIMessage[]) => {
+      const id = "chatId" in event ? event.chatId : null;
+      const wasPending =
+        id !== null && isPending(getTurnState().threads[id]?.phase);
+      const next = dispatchTurn(event);
+      if (id === null || isPending(next.threads[id]?.phase)) return;
+      if (wasPending || finalMessages) settleConversation(id, finalMessages);
+    },
+    [dispatchTurn, getTurnState, settleConversation],
+  );
+
+  // What is on screen: the chat's messages, except that a message being
+  // replayed after a reconnect is shown as it was until the replay catches up.
+  const heldMessage = held?.chatId === chatId ? held.message : null;
+  const shownMessages = useMemo(
+    () => withHeldMessage(messages, heldMessage),
+    [messages, heldMessage],
+  );
+  const holding = shownMessages !== messages;
+  const hasMessages = shownMessages.length > 0;
+
+  // What the end of a stream means for the turn is the turn machine's call.
+  useEffect(() => {
+    return session.onStreamEnd((end) => {
+      const event = streamEndEvent(chatId, end);
+      if (getTurnState().threads[chatId]?.phase === "stopped") {
+        // The stream of a turn that was stopped, ending a moment later.
+        // What it leaves is saved, unless a replay was cut short behind
+        // what was already showing.
+        const final = withHeldMessage(end.messages, heldMessage);
+        if (final !== end.messages) setMessages(final);
+        applyTurn(event, final);
+        return;
+      }
+      applyTurn(event, event.type === "FINISHED" ? end.messages : undefined);
+      if (event.type === "FINISHED") {
+        setAnnouncement(
+          endsUnanswered(end.messages)
+            ? "The response ended without an answer."
+            : "Answer ready.",
+        );
+      }
+    });
+  }, [session, chatId, applyTurn, getTurnState, heldMessage, setMessages]);
 
   const stopGeneration = useCallback(() => {
-    const currentMessages = chatSession.chat.messages;
-    const turnId = findLastUserMessageId(currentMessages);
-    turnDispatch({ type: "STOP", chatId });
-    stopServer(chatId, turnId);
-    chatSession.abortReconnect();
+    const finalMessages = withHeldMessage(session.chat.messages, heldMessage);
+    stopServer(chatId, findLastUserMessageId(finalMessages));
+    session.abortReconnect();
     void stop();
-    settleConversation(chatId, currentMessages);
-  }, [chatId, chatSession, stop, stopServer, settleConversation, turnDispatch]);
+    applyTurn({ type: "STOP", chatId }, finalMessages);
+    setAnnouncement("Stopped.");
+  }, [chatId, session, heldMessage, stop, stopServer, applyTurn]);
 
-  useResumeOnVisible({
+  const holdMessage = useCallback((id: string, message: UIMessage | null) => {
+    setHeld(message ? { chatId: id, message } : null);
+  }, []);
+
+  useReconnect({
+    session,
     chatId,
-    status,
-    messages,
-    setMessages,
-    resumeStream,
-    consumeReconnectOutcome: chatSession.consumeReconnectOutcome,
-    isStopped,
+    turn: activeTurn,
     isSeeded,
-    activePending,
-    onNothingToResume: (id, restored) => {
-      turnDispatch({ type: "RESUME_EMPTY", chatId: id });
-      settleConversation(id, restored);
-    },
-    onResumeStart: (id) => turnDispatch({ type: "RESUME_START", chatId: id }),
+    applyTurn,
+    onHold: holdMessage,
   });
 
   const { scrollRef, atBottom, handleScroll, scrollToBottom } = useScrollAnchor(
-    messages,
-    isBusy,
+    shownMessages,
+    turnActive,
   );
 
-  const heartbeat = useHeartbeat(isBusy, messages);
+  const heartbeat = useHeartbeat(turnActive, messages, activeTurn?.since);
 
+  const lastMessage = shownMessages[shownMessages.length - 1];
+  const lastIsAssistant = lastMessage?.role === "assistant";
   // True while the live turn is queued or waiting on a rate limit; the
   // message itself shows the reason, so the busy line only says "Waiting…".
-  const lastMessage = messages[messages.length - 1];
   const turnPaused =
-    status === "streaming" &&
-    lastMessage?.role === "assistant" &&
-    activeTurnStatus(lastMessage) !== null;
+    turnActive && lastIsAssistant && activeTurnStatus(lastMessage) !== null;
 
-  const clearStoppedForActiveChat = useCallback(() => {
-    turnDispatch({ type: "SEND", chatId });
-  }, [chatId, turnDispatch]);
+  // An error is the turn's only if the turn failed. One left over from a
+  // connection that dropped says nothing about a turn that has since been
+  // stopped, or found to have expired.
+  const showError = activeTurn?.phase === "failed" && errorInfo !== null;
+  // A settled thread whose latest message never got an answer.
+  const showUnanswered =
+    isSeeded && !turnActive && !showError && endsUnanswered(shownMessages);
+
+  const beginTurn = useCallback(() => {
+    dispatchTurn({ type: "SEND", chatId, at: Date.now() });
+    setAnnouncement("");
+  }, [chatId, dispatchTurn]);
 
   const { handleEditUser, handleRegenerate, handleRetry } = useChatActions({
     messages,
     setMessages,
     sendMessage,
-    isBusy,
+    isBusy: isBusy || turnActive,
     requestBody,
-    onBeforeSend: clearStoppedForActiveChat,
+    onBeforeSend: beginTurn,
   });
 
   // Show the history sidebar by default on wider screens; keep it hidden on
@@ -348,18 +260,18 @@ export default function Home() {
     if (window.matchMedia("(min-width: 768px)").matches) setSidebarOpen(true);
   }, []);
 
-  // Return focus to the input once a response finishes streaming.
+  // Return focus to the input once a turn is over.
   useEffect(() => {
-    if (wasBusyRef.current && !isBusy && hasMessages) {
+    if (wasActiveRef.current && !turnActive && hasMessages) {
       inputRef.current?.focus();
     }
-    wasBusyRef.current = isBusy;
-  }, [isBusy, hasMessages]);
+    wasActiveRef.current = turnActive;
+  }, [turnActive, hasMessages]);
 
   function submit(text: string) {
     const trimmed = text.trim();
-    if (!trimmed || isBusy) return;
-    turnDispatch({ type: "SEND", chatId });
+    if (!trimmed || isBusy || turnActive) return;
+    beginTurn();
     void sendMessage({ text: trimmed }, { body: requestBody() });
     setInput("");
   }
@@ -367,7 +279,7 @@ export default function Home() {
   return (
     <div className="flex h-dvh bg-background">
       <ConversationSidebar
-        conversations={conversations}
+        conversations={listedConversations}
         activeId={activeId}
         open={sidebarOpen}
         settings={settings}
@@ -385,6 +297,9 @@ export default function Home() {
           }
         }}
         onDelete={deleteConversation}
+        deleted={deleted}
+        onUndoDelete={undoDelete}
+        closeOnEscape={!settingsOpen}
         onClose={() => setSidebarOpen(false)}
         onOpenSettings={() => setSettingsOpen(true)}
       />
@@ -415,18 +330,14 @@ export default function Home() {
               onScroll={handleScroll}
               className="relative flex-1 overflow-y-auto"
             >
-              <div
-                className="mx-auto flex max-w-3xl flex-col gap-5 px-4 py-6"
-                aria-live="polite"
-                aria-busy={isBusy}
-              >
-                {messages.map((message, i) => (
+              <div className="mx-auto flex max-w-3xl flex-col gap-5 px-4 py-6">
+                {shownMessages.map((message, i) => (
                   <Message
                     key={message.id}
                     message={message}
                     streaming={
-                      status === "streaming" &&
-                      i === messages.length - 1 &&
+                      turnActive &&
+                      i === shownMessages.length - 1 &&
                       message.role === "assistant"
                     }
                     onEdit={handleEditUser}
@@ -434,22 +345,61 @@ export default function Home() {
                   />
                 ))}
 
-                {isBusy && (
-                  <div
-                    role="status"
-                    aria-live="polite"
-                    className="flex items-center gap-2 text-sm text-muted"
-                  >
-                    <span className="loading-dot text-accent">●</span>
-                    <span>{busyLabel(status, heartbeat.idle, turnPaused)}</span>
-                    <span className="text-xs text-muted/70 tabular-nums">
-                      {formatDuration(heartbeat.elapsed)}
-                    </span>
-                  </div>
+                {/* The one live region for the turn. The answer itself is not
+                    announced as it streams (that would read it out again on
+                    every update): only what the turn is doing, and once when
+                    it completes. The ticking clock is left out of it. */}
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className={
+                    turnActive
+                      ? "flex items-center gap-2 text-sm text-muted"
+                      : "sr-only"
+                  }
+                >
+                  {turnActive ? (
+                    <>
+                      <span className="loading-dot text-accent" aria-hidden>
+                        ●
+                      </span>
+                      <span>
+                        {busyLabel(activeTurn?.phase, heartbeat.idle, {
+                          nothingYet:
+                            !lastIsAssistant || lastMessage.parts.length === 0,
+                          paused: turnPaused,
+                          replaying: holding,
+                        })}
+                      </span>
+                      <span
+                        className="text-xs text-muted/70 tabular-nums"
+                        aria-hidden
+                      >
+                        {formatDuration(heartbeat.elapsed)}
+                      </span>
+                    </>
+                  ) : (
+                    announcement
+                  )}
+                </div>
+
+                {showUnanswered && (
+                  <UnansweredNotice
+                    reason={
+                      activeTurn?.phase === "stopped" ||
+                      activeTurn?.phase === "expired"
+                        ? activeTurn.phase
+                        : undefined
+                    }
+                    onRetry={handleRetry}
+                  />
                 )}
 
-                {error && errorInfo && (
-                  <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-300">
+                {showError && errorInfo && (
+                  <div
+                    role="alert"
+                    className="rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-300"
+                  >
                     <div className="flex items-start justify-between gap-3">
                       <div className="font-medium">{errorInfo.title}</div>
                       <button
@@ -503,10 +453,10 @@ export default function Home() {
                   onSubmit={() => submit(input)}
                   onStop={stopGeneration}
                   disabled={false}
-                  busy={isBusy}
+                  busy={turnActive}
                   settings={settings}
                   onSettingsChange={updateSettings}
-                      />
+                />
               </div>
             </div>
           </>

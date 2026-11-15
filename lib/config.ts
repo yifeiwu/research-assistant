@@ -78,8 +78,14 @@ export const serverConfig = {
   planner: { timeoutMs: 30_000, maxOutputTokens: 300 },
   gapCheck: { timeoutMs: 25_000, maxOutputTokens: 250, notesTokenBudget: 1_000 },
   synthesis: {
+    // Upper bounds. An answer also has to be over before its invocation is
+    // (see `detached.invocationLimitMs`), so it gets the smaller of these
+    // and the time that is left.
     totalTimeoutMs: 180_000,
     stepTimeoutMs: 120_000,
+    // With less time than this left in the invocation, the answer is not
+    // started there at all: the turn is handed over instead.
+    minWindowMs: 30_000,
     // Output cap includes reasoning tokens (gpt-oss spent ~700 of the old
     // 2,500 cap on reasoning in production, truncating answers mid-table
     // with finishReason "length"). 3,500 leaves room for both while still
@@ -146,11 +152,17 @@ export const serverConfig = {
     retryDelayMs: 5_000,
     // Longest rate-limit wait a turn defers for instead of answering degraded.
     maxDeferMs: 90_000,
+    // How long an invocation may run: the routes' `maxDuration`, in ms. They
+    // have to agree, which tests/config.test.ts checks.
+    invocationLimitMs: 300_000,
+    // Kept back at the end of an invocation for closing the run in Redis
+    // once the answer's stream has ended.
+    finishMarginMs: 10_000,
     // An invocation older than this starts nothing long: no wait, no new
     // attempt and no answer. It hands the run over to the next request that
-    // tails it, so the answer is not cut off by the 300s function limit (it
-    // may wait up to `budgetWait.synthesisMs` for its model and then has to
-    // stream).
+    // tails it. An answer started just before this point may still wait up
+    // to `budgetWait.synthesisMs` for its model, and then streams with what
+    // is left of the invocation as its timeout.
     handoffAfterMs: 150_000,
     // How often a request tailing a run driven elsewhere checks that the
     // driver is still alive.

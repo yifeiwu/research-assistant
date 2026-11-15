@@ -7,6 +7,9 @@ export type CollectedSource = {
 
 const URL_REGEX = /https?:\/\/[^\s)\]}"'<>]+/g;
 const MARKDOWN_LINK_REGEX = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
+/** A markdown link's destination, allowing one level of brackets in the URL. */
+const MARKDOWN_LINK_BALANCED_REGEX =
+  /\]\((https?:\/\/[^\s)]+(?:\([^\s)]*\)[^\s)]*)*)\)/g;
 
 function stripTrailingPunctuation(url: string): string {
   return url.replace(/[.,;:!?)\]}'"]+$/, "");
@@ -131,4 +134,29 @@ export function collectSources(message: {
   }
 
   return Array.from(byKey.values());
+}
+
+/**
+ * Split a message's sources into the ones its answer text links to and the
+ * rest (read during research, but not cited). Both keep their order.
+ */
+export function splitSourcesByCitation(
+  message: { parts: MessagePart[] },
+  sources: CollectedSource[] = collectSources(message),
+): { cited: CollectedSource[]; other: CollectedSource[] } {
+  const citedKeys = new Set<string>();
+  for (const part of message.parts) {
+    if (part.type !== "text" || typeof part.text !== "string") continue;
+    // Link destinations first: unlike a bare URL, one may contain brackets.
+    for (const match of part.text.matchAll(MARKDOWN_LINK_BALANCED_REGEX)) {
+      citedKeys.add(normalizeUrlKey(match[1]));
+    }
+    for (const url of extractUrls(part.text)) citedKeys.add(normalizeUrlKey(url));
+  }
+  const cited: CollectedSource[] = [];
+  const other: CollectedSource[] = [];
+  for (const source of sources) {
+    (citedKeys.has(normalizeUrlKey(source.url)) ? cited : other).push(source);
+  }
+  return { cited, other };
 }

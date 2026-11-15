@@ -17,7 +17,7 @@ function truncate(value: string | undefined, max = 4000): string | undefined {
  * Pull Groq's `failed_generation` (the raw text the model produced that could
  * not be parsed into a valid tool call) out of an API error, if present.
  */
-export function extractFailedGeneration(error: unknown): string | undefined {
+function extractFailedGeneration(error: unknown): string | undefined {
   if (!APICallError.isInstance(error)) return undefined;
   try {
     const parsed: unknown =

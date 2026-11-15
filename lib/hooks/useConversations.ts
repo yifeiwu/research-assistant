@@ -17,32 +17,63 @@ import {
   migrateLegacyMessages,
   saveActiveConversationId,
   saveConversations,
+  withTurnPrompt,
 } from "@/lib/conversations";
 import { findLastUserMessageId } from "@/lib/messages";
+import { isPending, type ThreadTurn, type TurnEvent } from "@/lib/turn-machine";
 
 const BG_POLL_INTERVAL_MS = 3_000;
+/** How long a deleted conversation can be brought back. */
+const UNDO_DELETE_MS = 6_000;
+
+type UndoableDelete = {
+  conversation: Conversation;
+  /** It was the open thread, so undoing reopens it. */
+  wasActive: boolean;
+  /** Set when a turn was generating: stop it once the delete is final. */
+  stop?: { turnId?: string };
+  timer: number;
+};
 
 type UseConversationsArgs = {
   chatId: string;
+  /** Open a thread. */
   setChatId: (id: string) => void;
   messages: UIMessage[];
   setMessages: (messages: UIMessage[]) => void;
   isBusy: boolean;
-  isStopped: (id: string) => boolean;
+  /** The open thread's turn (lib/turn-machine.ts). */
+  activeTurn: ThreadTurn | undefined;
+  /** A thread's turn as of right now, for code that runs between renders. */
+  getTurn: (id: string) => ThreadTurn | undefined;
+  /**
+   * Tell the turn machine what this hook learns about turns: the ones found
+   * pending in storage, the ones it collects in the background, and threads
+   * that are deleted or brought back.
+   */
+  dispatchTurn: (event: TurnEvent) => void;
   /** Detach the client fetch/reconnect stream without cancelling server Redis generation. */
   detach: () => void;
   /** Explicitly cancel server-side generation for a thread (e.g. on delete). */
   stopServer: (id: string, turnId?: string) => void;
 };
 
+/**
+ * A saved conversation's `pending` flag is the turn machine's state written
+ * down, so that it survives a reload: set here when a turn is sent, cleared
+ * by `settleConversation` when the machine says the turn is over, and read
+ * back into the machine when the page loads. Nothing else decides it.
+ */
 export type UseConversations = {
   conversations: Conversation[];
   activeId: string;
-  activePending: boolean;
   isSeeded: boolean;
   selectConversation: (id: string) => void;
   newConversation: () => void;
+  /** Removes a conversation; `undoDelete` brings it back while `deleted` is set. */
   deleteConversation: (id: string) => void;
+  deleted: { id: string; title: string } | null;
+  undoDelete: () => void;
   settleConversation: (id: string, finalMessages?: UIMessage[]) => void;
 };
 
@@ -109,7 +140,9 @@ export function useConversations({
   messages,
   setMessages,
   isBusy,
-  isStopped,
+  activeTurn,
+  getTurn,
+  dispatchTurn,
   detach,
   stopServer,
 }: UseConversationsArgs): UseConversations {
@@ -132,7 +165,7 @@ export function useConversations({
   const setActive = useCallback(
     (id: string) => {
       // Abort any background poll for the thread becoming active so the live
-      // `useResumeOnVisible` stream takes over without contention.
+      // reconnect (`useReconnect`) takes over without contention.
       const bgCtrl = bgControllersRef.current.get(id);
       if (bgCtrl) {
         bgCtrl.abort();
@@ -162,6 +195,14 @@ export function useConversations({
 
     conversationsRef.current = list;
     setConversations(list);
+    // Turns that were pending when the page was last open still are, as far
+    // as anyone knows: each is reconnected to, or collected, to find out.
+    dispatchTurn({
+      type: "HYDRATE",
+      pending: list
+        .filter((c) => c.pending)
+        .map((c) => ({ chatId: c.id, since: c.pendingSince })),
+    });
 
     const activeConv = active ? list.find((c) => c.id === active) : undefined;
     if (activeConv) {
@@ -198,17 +239,22 @@ export function useConversations({
 
   // Immediately persist user turns as `pending: true` when generation starts so
   // reloads, tab closes, and thread switches can resume from Upstash Redis.
+  const turnPending = isPending(activeTurn?.phase);
   useEffect(() => {
-    if (!isSeeded || !isBusy || messages.length === 0) return;
+    if (!isSeeded || !isBusy || !turnPending || messages.length === 0) return;
 
-    const id = chatIdRef.current;
-    if (isStopped(id)) return;
+    // The thread these messages belong to: the one this render was for. Not
+    // `chatIdRef`, which already names the next thread when another has just
+    // been opened, and would have this one's prompt saved under that one.
+    const id = chatId;
     const last = messages[messages.length - 1];
     const promptMessages =
       last?.role === "assistant" ? messages.slice(0, -1) : messages;
     if (promptMessages.length === 0) return;
-
     const lastPromptId = promptMessages[promptMessages.length - 1]?.id;
+
+    // The usual case while a turn streams (this runs for every update to
+    // its message): saved already, so no state update is even queued.
     const current = conversationsRef.current.find((c) => c.id === id);
     if (
       current?.pending &&
@@ -219,43 +265,16 @@ export function useConversations({
     }
 
     setConversations((prev) => {
-      const existing = prev.find((c) => c.id === id);
-      const existingLastId =
-        existing?.messages[existing.messages.length - 1]?.id;
-      if (
-        existing?.pending &&
-        existing.messages.length === promptMessages.length &&
-        existingLastId === lastPromptId
-      ) {
-        return prev;
-      }
-
-      const now = Date.now();
-      const title = existing?.title ?? deriveTitle(promptMessages);
-      const updated: Conversation = existing
-        ? {
-            ...existing,
-            messages: promptMessages,
-            title,
-            pending: true,
-            updatedAt: now,
-          }
-        : {
-            id,
-            title,
-            messages: promptMessages,
-            pending: true,
-            createdAt: now,
-            updatedAt: now,
-          };
-      const next = saveConversations([
-        updated,
-        ...prev.filter((c) => c.id !== id),
-      ]);
+      // An effect runs a little after the render it belongs to, and the
+      // turn can be over by then. So how it stands is asked for now, not
+      // taken from that render.
+      const updated = withTurnPrompt(prev, id, promptMessages, getTurn(id), Date.now());
+      if (!updated) return prev;
+      const next = saveConversations(updated);
       conversationsRef.current = next;
       return next;
     });
-  }, [isSeeded, isBusy, messages, isStopped]);
+  }, [chatId, isSeeded, isBusy, turnPending, messages, getTurn]);
 
   const settleConversation = useCallback(
     (id: string, finalMessages?: UIMessage[]) => {
@@ -271,6 +290,7 @@ export function useConversations({
                 messages: finalMessages,
                 title,
                 pending: false,
+                pendingSince: undefined,
                 updatedAt: now,
               }
             : {
@@ -291,7 +311,9 @@ export function useConversations({
 
         if (!existing?.pending) return prev;
         const next = saveConversations(
-          prev.map((c) => (c.id === id ? { ...c, pending: false } : c)),
+          prev.map((c) =>
+            c.id === id ? { ...c, pending: false, pendingSince: undefined } : c,
+          ),
         );
         conversationsRef.current = next;
         return next;
@@ -352,8 +374,11 @@ export function useConversations({
                     }
                   : res.assistantMessage;
               settleConversation(conv.id, [...base, collected]);
+              dispatchTurn({ type: "COLLECTED", chatId: conv.id });
             } else if (res.state === "empty") {
+              // Nothing left of the turn on the server.
               settleConversation(conv.id);
+              dispatchTurn({ type: "RESUME_EMPTY", chatId: conv.id });
             }
           })
           .catch(() => {
@@ -385,7 +410,7 @@ export function useConversations({
         checkPendingBackgroundThreads,
       );
     };
-  }, [restored, hasBackgroundPending, settleConversation]);
+  }, [restored, hasBackgroundPending, settleConversation, dispatchTurn]);
 
   const selectConversation = useCallback(
     (id: string) => {
@@ -401,8 +426,37 @@ export function useConversations({
     setActive(createConversationId());
   }, [isBusy, detach, setActive]);
 
+  // A deleted conversation can be brought back for a few seconds. It leaves
+  // the list and storage at once; what cannot be taken back (stopping its
+  // generation on the server) waits until the chance to undo has passed.
+  const undoableDeleteRef = useRef<UndoableDelete | null>(null);
+  const [deleted, setDeleted] = useState<{ id: string; title: string } | null>(
+    null,
+  );
+
+  const commitDelete = useCallback(() => {
+    const entry = undoableDeleteRef.current;
+    if (!entry) return;
+    window.clearTimeout(entry.timer);
+    undoableDeleteRef.current = null;
+    setDeleted(null);
+    if (entry.stop) stopServer(entry.conversation.id, entry.stop.turnId);
+  }, [stopServer]);
+
+  // Leaving the page ends the chance to undo.
+  useEffect(() => {
+    window.addEventListener("pagehide", commitDelete);
+    return () => {
+      window.removeEventListener("pagehide", commitDelete);
+      commitDelete();
+    };
+  }, [commitDelete]);
+
   const deleteConversation = useCallback(
     (id: string) => {
+      // One undo at a time: an earlier delete becomes final.
+      commitDelete();
+
       const bgCtrl = bgControllersRef.current.get(id);
       if (bgCtrl) {
         bgCtrl.abort();
@@ -412,12 +466,14 @@ export function useConversations({
       const target = conversationsRef.current.find((c) => c.id === id);
       const isCurrent = chatIdRef.current === id;
 
-      if ((isCurrent && isBusy) || target?.pending) {
-        const turnId = findLastUserMessageId(
-          isCurrent ? messages : (target?.messages ?? []),
-        );
-        stopServer(id, turnId);
-      }
+      const generating = (isCurrent && isBusy) || Boolean(target?.pending);
+      const stop = generating
+        ? {
+            turnId: findLastUserMessageId(
+              isCurrent ? messages : (target?.messages ?? []),
+            ),
+          }
+        : undefined;
 
       setConversations((prev) => {
         const next = prev.filter((c) => c.id !== id);
@@ -427,25 +483,68 @@ export function useConversations({
       });
 
       if (isCurrent) {
+        // Only lets go of the stream; the turn itself runs on for now.
         if (isBusy) detach();
         setActive(createConversationId());
       }
+      dispatchTurn({ type: "FORGET", chatId: id });
+
+      if (!target) {
+        // Nothing saved to bring back.
+        if (stop) stopServer(id, stop.turnId);
+        return;
+      }
+      undoableDeleteRef.current = {
+        conversation: target,
+        wasActive: isCurrent,
+        stop,
+        timer: window.setTimeout(commitDelete, UNDO_DELETE_MS),
+      };
+      setDeleted({ id, title: target.title });
     },
-    [isBusy, messages, detach, stopServer, setActive],
+    [isBusy, messages, detach, stopServer, setActive, commitDelete, dispatchTurn],
   );
 
-  const activePending = Boolean(
-    conversations.find((c) => c.id === chatId)?.pending,
-  );
+  const undoDelete = useCallback(() => {
+    const entry = undoableDeleteRef.current;
+    if (!entry) return;
+    window.clearTimeout(entry.timer);
+    undoableDeleteRef.current = null;
+    setDeleted(null);
+
+    const { conversation } = entry;
+    setConversations((prev) => {
+      const next = saveConversations([
+        conversation,
+        ...prev.filter((c) => c.id !== conversation.id),
+      ]);
+      conversationsRef.current = next;
+      return next;
+    });
+    // A turn that was still generating was never stopped, so it is pending
+    // again, and reconnected to or collected as usual.
+    dispatchTurn({
+      type: "RESTORE",
+      chatId: conversation.id,
+      pending: Boolean(conversation.pending),
+      since: conversation.pendingSince,
+    });
+    // Back to where it was deleted from.
+    if (entry.wasActive && chatIdRef.current !== conversation.id) {
+      if (isBusy) detach();
+      setActive(conversation.id);
+    }
+  }, [isBusy, detach, setActive, dispatchTurn]);
 
   return {
     conversations,
     activeId: chatId,
-    activePending,
     isSeeded,
     selectConversation,
     newConversation,
     deleteConversation,
+    deleted,
+    undoDelete,
     settleConversation,
   };
 }

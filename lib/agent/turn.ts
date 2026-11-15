@@ -40,7 +40,42 @@ import {
 } from "./stream";
 
 /** Work a later attempt of the same turn can skip. */
-export type TurnCheckpoint = { outcome: ResearchOutcome };
+export type TurnCheckpoint = {
+  outcome: ResearchOutcome;
+  /** How long the turn waited for its research slot (ms), for its summary. */
+  queueWaitMs?: number;
+};
+
+/**
+ * What an attempt learned about its turn, for the turn's summary log line
+ * (lib/agent/detached.ts). Filled in as the attempt runs, and complete once
+ * its stream has closed. Times are epoch ms.
+ */
+export type TurnStats = {
+  /** Time spent waiting for a research slot (ms). */
+  queueWaitMs?: number;
+  /** Present once research is done, in this attempt or an earlier one. */
+  research?: {
+    searched: boolean;
+    sources: number;
+    degraded: boolean;
+    stages?: ResearchOutcome["stats"];
+  };
+  /** Present once the answer was started. */
+  answer?: {
+    model: string;
+    startedAt: number;
+    firstTextAt?: number;
+    endedAt?: number;
+    finishReason?: string;
+    usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+  };
+  /** The attempt ended in an error that was shown to the user. */
+  failed?: boolean;
+};
+
+/** One attempt at a turn: its output, and what it learned on the way. */
+export type TurnAttempt = PipelineStream & { stats: TurnStats };
 
 export type TurnAdmission = {
   queue: AdmissionQueue;
@@ -83,6 +118,12 @@ export type TurnInput = {
    * limit part-way, which cannot be retried.
    */
   answerBy: number;
+  /**
+   * When the answer has to be complete in this invocation. It streams with
+   * the time left until then as its timeout, so that it ends with an error
+   * the user sees rather than by the function being killed.
+   */
+  finishBy: number;
   deps?: Partial<TurnDeps>;
 };
 
@@ -115,8 +156,9 @@ const STATUS_STAGE: Record<GroqStage, "planning" | "reading" | "answering"> = {
  * model has no room yet, or the invocation is too old to start the answer.
  * A later attempt continues from the research checkpoint.
  */
-export function startTurn(input: TurnInput): PipelineStream | ModelResolutionError {
+export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError {
   const { requestId, signal } = input;
+  const stats: TurnStats = { queueWaitMs: input.checkpoint?.queueWaitMs };
   // The queue rations research. A turn that already has its research gave
   // its slot back when the earlier attempt deferred, and must not line up
   // (or be turned away by a full queue) a second time just to answer: the
@@ -198,6 +240,7 @@ export function startTurn(input: TurnInput): PipelineStream | ModelResolutionErr
       }
       if (state.state !== "granted") throw new AdmissionBusyError();
       releaseSlot = admission.queue.hold(admission.ticket);
+      stats.queueWaitMs = Math.max(0, deps.now() - admission.ticket.enqueuedAt);
     }
     writeStatus({ state: "clear" });
 
@@ -216,12 +259,18 @@ export function startTurn(input: TurnInput): PipelineStream | ModelResolutionErr
         threadId: input.threadId,
       });
       try {
-        await input.saveCheckpoint({ outcome });
+        await input.saveCheckpoint({ outcome, queueWaitMs: stats.queueWaitMs });
       } catch (error) {
         // Only costs a repeat of (cached) research if this attempt dies.
         logError("turn-checkpoint", error, { requestId });
       }
     }
+    stats.research = {
+      searched: outcome.searched,
+      sources: outcome.totalSources,
+      degraded: Boolean(outcome.degraded),
+      stages: outcome.stats,
+    };
     allowedSources = outcome.sources;
     // Stopped during research (or before a resumed attempt got this far).
     throwIfAborted(signal);
@@ -273,6 +322,19 @@ export function startTurn(input: TurnInput): PipelineStream | ModelResolutionErr
     }
     activeModelInfo = `groq ${leased.modelId}`;
 
+    // The wait for the model's window may have used up the time the answer
+    // was going to have. Research is checkpointed, so hand the turn over.
+    const answerWindowMs = input.finishBy - deps.now();
+    if (answerWindowMs < serverConfig.synthesis.minWindowMs) {
+      throw new TurnDeferredError("handoff", 0);
+    }
+
+    const answer: NonNullable<TurnStats["answer"]> = {
+      model: leased.modelId,
+      startedAt: deps.now(),
+    };
+    stats.answer = answer;
+
     return deps.streamText({
       model: leased.model,
       system,
@@ -284,8 +346,8 @@ export function startTurn(input: TurnInput): PipelineStream | ModelResolutionErr
       maxOutputTokens: outputTokensFor(leased.modelId),
       maxRetries: 0,
       timeout: {
-        totalMs: serverConfig.synthesis.totalTimeoutMs,
-        stepMs: serverConfig.synthesis.stepTimeoutMs,
+        totalMs: Math.min(serverConfig.synthesis.totalTimeoutMs, answerWindowMs),
+        stepMs: Math.min(serverConfig.synthesis.stepTimeoutMs, answerWindowMs),
       },
       abortSignal: signal,
       onAbort: () => {
@@ -295,6 +357,13 @@ export function startTurn(input: TurnInput): PipelineStream | ModelResolutionErr
         logError("streamText", error, { requestId, model: activeModelInfo });
       },
       onFinish: ({ finishReason, usage }) => {
+        answer.endedAt = deps.now();
+        answer.finishReason = finishReason;
+        answer.usage = {
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          totalTokens: usage.totalTokens,
+        };
         logInfo("finish", {
           requestId,
           model: activeModelInfo,
@@ -307,7 +376,7 @@ export function startTurn(input: TurnInput): PipelineStream | ModelResolutionErr
     }) as StreamResult;
   };
 
-  return createPipelineStream(execute, {
+  const pipeline = createPipelineStream(execute, {
     requestId,
     modelInfo: () => activeModelInfo,
     signal,
@@ -322,5 +391,12 @@ export function startTurn(input: TurnInput): PipelineStream | ModelResolutionErr
         await admission.queue.cancel(admission.ticket);
       }
     },
+    onAnswerText: () => {
+      if (stats.answer) stats.answer.firstTextAt ??= deps.now();
+    },
+    onFailed: () => {
+      stats.failed = true;
+    },
   });
+  return { ...pipeline, stats };
 }

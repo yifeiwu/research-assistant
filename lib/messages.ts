@@ -18,6 +18,18 @@ export function getMessageText(message: UIMessage, separator = "\n\n"): string {
     .join(separator);
 }
 
+/**
+ * True when a thread's latest turn has no answer: it ends on the user's
+ * message, or on an assistant message with no answer text (research progress
+ * only, or nothing at all).
+ */
+export function endsUnanswered(messages: UIMessage[]): boolean {
+  const last = messages[messages.length - 1];
+  if (!last) return false;
+  if (last.role === "user") return true;
+  return last.role === "assistant" && getMessageText(last).trim().length === 0;
+}
+
 /** Id of the most recent user message (identifies the current turn for Stop). */
 export function findLastUserMessageId(messages: UIMessage[]): string | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {

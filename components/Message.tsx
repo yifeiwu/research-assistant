@@ -5,7 +5,7 @@ import type { UIMessage } from "ai";
 import { Pencil, RotateCcw } from "lucide-react";
 import { ResearchStep } from "./ResearchStep";
 import { Markdown } from "./Markdown";
-import { collectSources } from "@/lib/sources";
+import { collectSources, splitSourcesByCitation } from "@/lib/sources";
 import { getMessageText } from "@/lib/messages";
 import type { ModelFallbackData, ResearchStepData } from "@/lib/types/chat";
 import { ActionButton } from "./message/ActionButton";
@@ -35,6 +35,15 @@ export const Message = memo(function Message({
   const sources = useMemo(
     () => (isUser ? [] : collectSources(message)),
     [isUser, message],
+  );
+  // Sorted into cited and not only once the answer is complete, so the list
+  // does not rearrange itself while links are still arriving.
+  const { cited, other } = useMemo(
+    () =>
+      streaming
+        ? { cited: [], other: sources }
+        : splitSourcesByCitation(message, sources),
+    [streaming, message, sources],
   );
 
   // Only a live turn can be queued or waiting; a stale status left in a
@@ -157,7 +166,9 @@ export const Message = memo(function Message({
             />
           )}
 
-          {!isUser && sources.length > 0 && <SourcesBar sources={sources} />}
+          {!isUser && sources.length > 0 && (
+            <SourcesBar cited={cited} other={other} />
+          )}
         </div>
 
         {/* Row of message actions, revealed on hover. */}

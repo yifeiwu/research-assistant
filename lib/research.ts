@@ -32,7 +32,23 @@ import type {
 const MAX_EXPLICIT_URLS = 4;
 const MAX_QUERY_LENGTH = 240;
 
+/**
+ * Where a turn's research time went: wall time per stage in ms, summed over
+ * its rounds. Each figure includes any wait for a model's rate-limit window
+ * or an Exa slot, since that is time the user waited too.
+ */
+export type ResearchStats = {
+  /** Rounds that searched. */
+  rounds: number;
+  planMs: number;
+  searchMs: number;
+  readMs: number;
+  gapCheckMs: number;
+};
+
 export type ResearchOutcome = {
+  /** Absent when no research was attempted (and on older checkpoints). */
+  stats?: ResearchStats;
   searched: boolean;
   /** True when search was attempted but no sources could be retrieved at all.
    * Distinct from `searched: false` via NO_SEARCH/low effort, so the caller
@@ -268,6 +284,26 @@ export async function runResearchPipeline(opts: {
     };
   };
 
+  const stats: ResearchStats = {
+    rounds: 0,
+    planMs: 0,
+    searchMs: 0,
+    readMs: 0,
+    gapCheckMs: 0,
+  };
+  /** Run one stage's work, adding the time it took to that stage's total. */
+  const timed = async <T>(
+    stage: Exclude<keyof ResearchStats, "rounds">,
+    work: () => Promise<T>,
+  ): Promise<T> => {
+    const startedAt = Date.now();
+    try {
+      return await work();
+    } finally {
+      stats[stage] += Date.now() - startedAt;
+    }
+  };
+
   const emitStep = (id: string, data: ResearchStepData) => {
     writer.write({ type: "data-research-step", id, data });
   };
@@ -284,7 +320,9 @@ export async function runResearchPipeline(opts: {
   let round1Queries: string[] = [];
   let skipSearch = false;
   try {
-    const parsed = await planner.planQueries({ messages, maxQueries: initialQueries, signal, requestId });
+    const parsed = await timed("planMs", () =>
+      planner.planQueries({ messages, maxQueries: initialQueries, signal, requestId }),
+    );
     if (parsed.stopped && explicitUrls.length === 0) {
       skipSearch = true;
     } else if (parsed.queries.length > 0) {
@@ -303,7 +341,7 @@ export async function runResearchPipeline(opts: {
 
   if (skipSearch) {
     emitStep(round1Id, { round: 1, phase: "done", queries: [], sources: [] });
-    return { searched: false, evidenceBlock: "", totalSources: 0, sources: [] };
+    return { stats, searched: false, evidenceBlock: "", totalSources: 0, sources: [] };
   }
 
   // --- Sequential retrieval rounds ---
@@ -320,14 +358,17 @@ export async function runResearchPipeline(opts: {
     const queries = nextQueries;
     allQueries.push(...queries);
     emitStep(roundId, { round, phase: "searching", queries, sources: [] });
+    stats.rounds = round;
 
     // Explicit URLs are fetched once, alongside Round 1's searches.
-    const [explicitOutcome, ...searchOutcomes] = await Promise.all([
-      round === 1 && explicitUrls.length > 0
-        ? search.fetchContents(explicitUrls, { signal, requestId })
-        : Promise.resolve<{ docs: ExaDocument[]; error?: string }>({ docs: [] }),
-      ...queries.map((q) => search.search(q, resultsPerQuery, { signal, requestId })),
-    ]);
+    const [explicitOutcome, ...searchOutcomes] = await timed("searchMs", () =>
+      Promise.all([
+        round === 1 && explicitUrls.length > 0
+          ? search.fetchContents(explicitUrls, { signal, requestId })
+          : Promise.resolve<{ docs: ExaDocument[]; error?: string }>({ docs: [] }),
+        ...queries.map((q) => search.search(q, resultsPerQuery, { signal, requestId })),
+      ]),
+    );
     if (round === 1) {
       if (explicitOutcome.error) failedContents = true;
       // Exa can succeed overall yet return fewer documents than requested
@@ -357,7 +398,7 @@ export async function runResearchPipeline(opts: {
           error: "No web sources could be retrieved for these queries.",
           degraded: currentDegraded(),
         });
-        return { searched: false, searchFailed: true, evidenceBlock: "", totalSources: 0, sources: [], degraded: currentDegraded() };
+        return { stats, searched: false, searchFailed: true, evidenceBlock: "", totalSources: 0, sources: [], degraded: currentDegraded() };
       }
       emitStep(roundId, {
         round,
@@ -377,7 +418,9 @@ export async function runResearchPipeline(opts: {
     // --- Map condense (one batched summarizer call per round) ---
     emitStep(roundId, { round, phase: "reading", queries, sources: roundSources });
 
-    const condensed = await condenser.condense(roundDocs, { query, signal, requestId });
+    const condensed = await timed("readMs", () =>
+      condenser.condense(roundDocs, { query, signal, requestId }),
+    );
     fallbackSources += condensed.fallbackCount;
     allNotes.push(...condensed.notes);
     totalSources += roundDocs.length;
@@ -405,14 +448,16 @@ export async function runResearchPipeline(opts: {
 
     let followUpQueries: string[] = [];
     try {
-      const parsedGap = await planner.planFollowUps({
-        query,
-        priorQueries: allQueries,
-        notes: truncateToTokenBudget(allNotes.join("\n\n"), serverConfig.gapCheck.notesTokenBudget),
-        maxQueries: effort.followUpQueries,
-        signal,
-        requestId,
-      });
+      const parsedGap = await timed("gapCheckMs", () =>
+        planner.planFollowUps({
+          query,
+          priorQueries: allQueries,
+          notes: truncateToTokenBudget(allNotes.join("\n\n"), serverConfig.gapCheck.notesTokenBudget),
+          maxQueries: effort.followUpQueries,
+          signal,
+          requestId,
+        }),
+      );
       if (!parsedGap.stopped) {
         const priorSet = new Set(allQueries.map((q) => q.toLowerCase()));
         followUpQueries = parsedGap.queries.filter((q) => !priorSet.has(q.toLowerCase()));
@@ -464,6 +509,7 @@ export async function runResearchPipeline(opts: {
   }
   const evidenceBlock = evidenceParts.join("\n\n---\n\n");
   return {
+    stats,
     searched: true,
     evidenceBlock,
     totalSources,

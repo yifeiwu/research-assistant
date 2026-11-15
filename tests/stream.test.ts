@@ -3,12 +3,15 @@ import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { Chat } from "@ai-sdk/react";
 import {
+  APICallError,
   DefaultChatTransport,
   UI_MESSAGE_STREAM_HEADERS,
   type UIMessage,
 } from "ai";
 import { describe, expect, it } from "vitest";
+import { AdmissionBusyError } from "@/lib/agent/admission";
 import { createPipelineStream, type StreamResult } from "@/lib/agent/stream";
+import { describeChatError } from "@/lib/chat-error";
 import { CHAT_STREAM_THROTTLE_MS } from "@/lib/conversations";
 import { useChatState } from "@/lib/hooks/useChatState";
 import { readAll } from "./turn-fakes";
@@ -47,6 +50,16 @@ const textChunks = (deltas: string[]) => [
   ...deltas.map((delta) => ({ type: "text-delta", id: "t1", delta })),
   { type: "text-end", id: "t1" },
 ];
+
+describe("createPipelineStream message identity", () => {
+  it("opens the message with an id that is the same every time the turn is streamed", async () => {
+    const first = await runChunks(textChunks(["Answer.\n"]));
+    const again = await runChunks(textChunks(["Answer.\n"]));
+    expect(first[0]).toMatchObject({ type: "start", messageId: expect.any(String) });
+    // A client that reconnects rebuilds the message it already has.
+    expect(again[0].messageId).toBe(first[0].messageId);
+  });
+});
 
 describe("createPipelineStream citation verification", () => {
   it("preserves URLs inside a fenced block split across flushes", async () => {
@@ -136,6 +149,79 @@ describe("createPipelineStream citation verification", () => {
     expect(text).toContain("You've hit the rate limit for GPT-OSS 20B");
     // A failed turn is over, not handed back to the queue.
     expect(await deferral).toBeUndefined();
+  });
+});
+
+describe("createPipelineStream error messages", () => {
+  /** The error text a client is sent when the turn's work throws `error`. */
+  async function errorTextFor(error: unknown): Promise<string> {
+    const { stream } = createPipelineStream(
+      async () => {
+        throw error;
+      },
+      { requestId: "req12345", modelInfo: "groq openai/gpt-oss-120b", emitStart: true },
+    );
+    const events = (await readAll(stream)) as Event[];
+    return String(events.find((e) => e.type === "error")?.errorText);
+  }
+
+  const SECRET = "org_01hxsecret";
+  const providerError = (statusCode: number) =>
+    new APICallError({
+      message: `Provider said no to organization ${SECRET}`,
+      url: "https://api.groq.com/openai/v1/chat/completions",
+      requestBodyValues: {},
+      statusCode,
+      responseBody: JSON.stringify({ error: { message: `details for ${SECRET}` } }),
+    });
+
+  it("tells the user what kind of failure it was, in words the client can explain", async () => {
+    const timeout = new Error("The operation was aborted due to timeout");
+    timeout.name = "TimeoutError";
+    const cases: Array<[unknown, string]> = [
+      [providerError(401), "API key rejected"],
+      [providerError(404), "Model not available"],
+      [providerError(413), "Request too large for the model"],
+      [providerError(503), "The server hit an error"],
+      [providerError(429), "Model rate limit reached"],
+      [timeout, "The request timed out"],
+      [new AdmissionBusyError(), "The server is busy"],
+      [providerError(400), "Something went wrong"],
+      [new Error(`internal failure involving ${SECRET}`), "Something went wrong"],
+    ];
+    for (const [error, title] of cases) {
+      const text = await errorTextFor(error);
+      // What the page shows for it (lib/chat-error.ts).
+      expect(describeChatError(new Error(text)).title).toBe(title);
+    }
+  });
+
+  it("never passes an error's own text on, and gives a reference to the server log instead", async () => {
+    for (const error of [
+      providerError(400),
+      providerError(401),
+      providerError(500),
+      new Error(`internal failure involving ${SECRET}`),
+      `a thrown string naming ${SECRET}`,
+    ]) {
+      const text = await errorTextFor(error);
+      expect(text).not.toContain(SECRET);
+      expect(text).not.toContain("Provider said");
+    }
+    expect(await errorTextFor(new Error("anything"))).toContain("reference req12345");
+  });
+
+  it("takes only the wait from a rate-limit message", async () => {
+    const error = new APICallError({
+      message: `Rate limit reached for model \`openai/gpt-oss-120b\` in organization ${SECRET} on tokens per minute (TPM): Limit 8000. Please try again in 7.66s. Need more tokens? Upgrade at https://console.groq.com/settings/billing`,
+      url: "https://api.groq.com/openai/v1/chat/completions",
+      requestBodyValues: {},
+      statusCode: 429,
+    });
+    const text = await errorTextFor(error);
+    expect(text).toContain("try again in about 7.66s");
+    expect(text).not.toContain(SECRET);
+    expect(text).not.toContain("console.groq.com");
   });
 });
 

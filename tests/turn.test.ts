@@ -6,6 +6,7 @@ import {
 } from "@/lib/agent/admission";
 import { BudgetDeniedError, type StageRunner } from "@/lib/agent/stage";
 import { startTurn, type TurnCheckpoint, type TurnInput } from "@/lib/agent/turn";
+import { serverConfig } from "@/lib/config";
 import { effortConfig } from "@/lib/effort";
 import {
   FALLBACK,
@@ -44,6 +45,7 @@ function harness(opts?: {
       },
       maxDeferMs: 90_000,
       answerBy: Number.POSITIVE_INFINITY,
+      finishBy: Number.POSITIVE_INFINITY,
       deps: fakes.deps,
       ...over,
     });
@@ -228,6 +230,41 @@ describe("startTurn", () => {
     expect(deferral).toMatchObject({ reason: "handoff", delayMs: 0 });
     expect(h.calls.synthesis).toHaveLength(0);
     // No terminal frame: the next attempt continues this stream.
+    expect(types).not.toContain("finish");
+    expect(types).not.toContain("error");
+  });
+
+  it("gives the answer no longer than is left of the invocation", async () => {
+    const h = harness({ now: () => 200_000 });
+
+    // Plenty of time: the configured timeouts apply.
+    await h.run();
+    expect(h.calls.synthesis[0].timeout).toEqual({
+      totalMs: serverConfig.synthesis.totalTimeoutMs,
+      stepMs: serverConfig.synthesis.stepTimeoutMs,
+    });
+
+    // 90s left: the answer times out then, not when the function is killed.
+    await h.run({ finishBy: 290_000 });
+    expect(h.calls.synthesis[1].timeout).toEqual({ totalMs: 90_000, stepMs: 90_000 });
+  });
+
+  it("hands the turn over when waiting for the model left too little time to answer", async () => {
+    const clock = { now: 140_000 };
+    const h = harness({
+      now: () => clock.now,
+      // The wait for the model's rate-limit window ran long.
+      synthesisLease: async () => {
+        clock.now = 270_000;
+        return { model: model(SELECTED), modelId: SELECTED, waitedMs: 130_000 };
+      },
+    });
+    const { types, deferral, saved } = await h.run({ answerBy: 150_000, finishBy: 290_000 });
+
+    expect(deferral).toMatchObject({ reason: "handoff", delayMs: 0 });
+    expect(h.calls.synthesis).toHaveLength(0);
+    // Research is kept, and nothing terminal was written.
+    expect(saved).toHaveLength(1);
     expect(types).not.toContain("finish");
     expect(types).not.toContain("error");
   });

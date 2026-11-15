@@ -123,6 +123,7 @@ export function ResearchStep({ data }: { data: ResearchStepData }) {
         type="button"
         onClick={() => hasDetails && setOpen((o) => !o)}
         disabled={!hasDetails}
+        aria-expanded={hasDetails ? open : undefined}
         className="flex w-full items-center gap-2 px-3 py-2 text-left disabled:cursor-default"
       >
         <Icon className="h-4 w-4 shrink-0 text-muted" aria-hidden />

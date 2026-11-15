@@ -1,5 +1,6 @@
 import type { UIMessage } from "ai";
 import { getMessageText } from "./messages";
+import { isPending, type ThreadTurn } from "./turn-machine";
 
 /** A single saved chat thread, persisted in the browser. */
 export type Conversation = {
@@ -8,6 +9,8 @@ export type Conversation = {
   messages: UIMessage[];
   /** True while an assistant response is still generating (or uncollected) in Redis. */
   pending?: boolean;
+  /** When the pending turn was sent (epoch ms); the elapsed clock counts from here. */
+  pendingSince?: number;
   createdAt: number;
   updatedAt: number;
 };
@@ -108,6 +111,53 @@ export function deriveTitle(messages: UIMessage[]): string {
   return trimmed.length > MAX_TITLE_LENGTH
     ? `${trimmed.slice(0, MAX_TITLE_LENGTH).trimEnd()}…`
     : trimmed;
+}
+
+/**
+ * The saved conversations with a turn's prompt written into its thread, as
+ * soon as the turn is under way: a reload, or a switch to another thread,
+ * finds the question there and (through `pending`) knows to go and look for
+ * the answer. Returns null when there is nothing to write.
+ *
+ * `turn` has to be the thread's turn as it stands now, not as it stood in
+ * whichever render asked for this. By the time this runs the turn may be
+ * over (a request refused at once), or the thread deleted.
+ */
+export function withTurnPrompt(
+  conversations: Conversation[],
+  id: string,
+  promptMessages: UIMessage[],
+  turn: ThreadTurn | undefined,
+  now: number,
+): Conversation[] | null {
+  // No turn at all: the thread was deleted in the meantime.
+  if (!turn || promptMessages.length === 0) return null;
+  const existing = conversations.find((c) => c.id === id);
+  const lastPromptId = promptMessages[promptMessages.length - 1].id;
+  const pending = isPending(turn.phase);
+  if (pending) {
+    // Already saved as pending with this prompt.
+    if (
+      existing?.pending &&
+      existing.messages.length === promptMessages.length &&
+      existing.messages[existing.messages.length - 1]?.id === lastPromptId
+    ) {
+      return null;
+    }
+  } else if (existing?.messages.some((m) => m.id === lastPromptId)) {
+    // The turn is over and what it left has been saved, prompt included.
+    return null;
+  }
+
+  const updated: Conversation = {
+    ...(existing ?? { id, createdAt: now }),
+    title: existing?.title ?? deriveTitle(promptMessages),
+    messages: promptMessages,
+    pending,
+    pendingSince: pending ? (turn.since ?? now) : undefined,
+    updatedAt: now,
+  };
+  return [updated, ...conversations.filter((c) => c.id !== id)];
 }
 
 export function loadConversations(): Conversation[] {
@@ -224,6 +274,7 @@ function isConversation(value: unknown): value is Conversation {
     typeof v.title === "string" &&
     Array.isArray(v.messages) &&
     (v.pending === undefined || typeof v.pending === "boolean") &&
+    (v.pendingSince === undefined || typeof v.pendingSince === "number") &&
     typeof v.createdAt === "number" &&
     typeof v.updatedAt === "number"
   );

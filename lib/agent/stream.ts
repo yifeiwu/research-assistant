@@ -9,10 +9,11 @@ import {
   type InferUIMessageChunk,
   type UIMessageStreamWriter,
 } from "ai";
-import { logInfo, logError, extractFailedGeneration } from "@/lib/logger";
+import { logInfo, logError } from "@/lib/logger";
 import { groqModelLabel } from "@/lib/models";
 import { verifyCitations } from "@/lib/citations";
 import type { ChatUIMessage, ResearchSource } from "@/lib/types/chat";
+import { AdmissionBusyError } from "./admission";
 import { isTurnDeferred, type TurnDeferredError } from "./defer";
 
 /** The parts of a `streamText` result this module consumes. */
@@ -66,7 +67,10 @@ function rateLimitMessage(
   const idFromMessage = rawMessage.match(/model `([^`]+)`/)?.[1];
   const label = groqModelLabel(idFromInfo ?? idFromMessage);
 
-  const retryIn = rawMessage.match(/try again in ([^.]+?)\./i)?.[1]?.trim();
+  // Only a duration is taken from the provider's text ("7.66s", "1m30s").
+  const retryIn = rawMessage.match(
+    /try again in ((?:\d[\d.]*(?:ms|[hms]))+)/i,
+  )?.[1];
   const waitHint = retryIn
     ? ` You can try again in about ${retryIn}, or`
     : " You can wait a bit, or";
@@ -77,22 +81,54 @@ function rateLimitMessage(
   );
 }
 
-/** Turn an error into a user-facing message, including Groq's failed_generation. */
-function clientErrorMessage(error: unknown, modelInfo?: string): string {
-  const rateLimited = rateLimitMessage(error, modelInfo);
+function isTimeoutError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.name === "TimeoutError" || /timed? ?out/i.test(error.message);
+}
+
+/**
+ * What the user is told about a failed turn: one of a fixed set of messages,
+ * chosen by the kind of failure. An error's own text is never passed on,
+ * because a provider's can carry org ids, request details and model output;
+ * it goes to the server log, which the reference in the catch-all message
+ * leads back to.
+ *
+ * The wording is what lib/chat-error.ts keys its explanations on (status
+ * codes, "timed out", "rate limit"); tests/stream.test.ts holds the two
+ * together.
+ */
+function clientErrorMessage(
+  error: unknown,
+  ctx: { requestId: string; modelInfo?: string },
+): string {
+  const rateLimited = rateLimitMessage(error, ctx.modelInfo);
   if (rateLimited) return rateLimited;
 
-  let message = "Unknown error";
-  if (typeof error === "string") message = error;
-  else if (error instanceof Error) message = error.message;
-  else if (error != null) message = JSON.stringify(error);
+  const root = rootError(error);
+  // Written for the user in the first place.
+  if (root instanceof AdmissionBusyError) return root.message;
 
-  const failed = extractFailedGeneration(error);
-  if (failed) {
-    const snippet = failed.length > 600 ? `${failed.slice(0, 600)}…` : failed;
-    message += `\n\nModel output:\n${snippet}`;
+  if (APICallError.isInstance(root) && root.statusCode != null) {
+    const status = root.statusCode;
+    if (status === 401 || status === 403) {
+      return `The model provider rejected the server's API key (HTTP ${status}).`;
+    }
+    if (status === 404) {
+      return "The selected model is not available at the provider (HTTP 404).";
+    }
+    if (status === 413) {
+      return "The request was too large for the model (HTTP 413).";
+    }
+    if (status >= 500) {
+      return `The model provider had a server error (HTTP ${status}).`;
+    }
+    return `The model provider rejected the request (HTTP ${status}).`;
   }
-  return message;
+
+  if (isTimeoutError(root)) {
+    return "The model took too long to respond, and the request timed out.";
+  }
+  return `Something went wrong on the server while answering (reference ${ctx.requestId}).`;
 }
 
 /**
@@ -108,6 +144,11 @@ function noAnswerMessage(finishReason: string | undefined): string {
     default:
       return "I finished without producing an answer. This can happen intermittently with some models — try sending the message again, or switch models in Settings.";
   }
+}
+
+/** Id of the assistant message a turn streams into; stable across attempts. */
+function turnMessageId(requestId: string): string {
+  return `msg-${requestId}`;
 }
 
 /**
@@ -136,6 +177,10 @@ export function createPipelineStream(
      * deferral if the turn was left for a later attempt.
      */
     onSettled?: (deferral: TurnDeferredError | undefined) => void | Promise<void>;
+    /** Called when the first of the answer's text is written to the stream. */
+    onAnswerText?: () => void;
+    /** Called when the turn ends in an error that is shown to the user. */
+    onFailed?: () => void;
   },
 ): PipelineStream {
   const currentModelInfo = () =>
@@ -151,7 +196,10 @@ export function createPipelineStream(
     writer: UIMessageStreamWriter<ChatUIMessage>,
   ): Promise<void> => {
     if (ctx.emitStart) {
-      writer.write({ type: "start" });
+      // The id is the same every time this turn's stream is replayed, so a
+      // client that reconnects rebuilds the message it already shows instead
+      // of a new one.
+      writer.write({ type: "start", messageId: turnMessageId(ctx.requestId) });
     }
 
     let result: StreamResult;
@@ -179,10 +227,17 @@ export function createPipelineStream(
       .toUIMessageStream<ChatUIMessage>({
         sendStart: false,
         sendFinish: false,
+        // A failure part-way through the answer. `streamText` has logged it.
+        onError: (error) =>
+          clientErrorMessage(error, {
+            requestId: ctx.requestId,
+            modelInfo: currentModelInfo(),
+          }),
       })
       .getReader();
 
     let sawText = false;
+    let wroteText = false;
     let sawTerminal = false;
     let strippedCitations = 0;
     // Per-text-part buffer plus fenced-code state. Citation verification is
@@ -260,6 +315,10 @@ export function createPipelineStream(
       }
       const text = verifyFragment(state, emit);
       if (text) {
+        if (!wroteText) {
+          wroteText = true;
+          ctx.onAnswerText?.();
+        }
         writer.write({ type: "text-delta", id, delta: text });
       }
     };
@@ -302,6 +361,7 @@ export function createPipelineStream(
         }
         if (value.type === "abort" || value.type === "error") {
           sawTerminal = true;
+          if (value.type === "error") ctx.onFailed?.();
         }
         writer.write(value);
       }
@@ -371,11 +431,15 @@ export function createPipelineStream(
     },
     onError: (error) => {
       const info = currentModelInfo();
+      ctx.onFailed?.();
       logError("stream", error, {
         requestId: ctx.requestId,
         modelInfo: info,
       });
-      return clientErrorMessage(error, info);
+      return clientErrorMessage(error, {
+        requestId: ctx.requestId,
+        modelInfo: info,
+      });
     },
   });
 

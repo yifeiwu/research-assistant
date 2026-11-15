@@ -128,6 +128,11 @@ and no worker endpoint: Redis holds all of a turn's state.
   `[DONE]` frame. The browser treats that as a dropped connection and
   reconnects (`lib/unfinished-stream.ts`), and that request
   (`GET /api/chat/:id/stream`) takes the turn on in a fresh invocation.
+- An answer that does start gets what is left of the invocation as its
+  timeout (less 10s for closing the run), so one that runs long ends with an
+  error the user sees, not by the function being killed. If waiting for the
+  model's rate-limit window has left under 30s, the turn is handed over
+  instead.
 - If an invocation dies, its lease lapses within 12 seconds and the next
   request for the turn continues it: a reconnect, a reload, or the
   background check on pending threads. A turn whose answer had not started
@@ -148,15 +153,58 @@ Things to know:
 - Each continuation by a later request is logged as `detached-continued`
   (and each hand-over as `detached-handed-over`), so the logs show how often
   turns outgrow one invocation.
+- Every turn that ends logs one `turn-summary` line: how it ended, time in
+  the queue, time per research stage, time to the first answer text, the
+  answer's token usage (research calls are not counted), attempts,
+  hand-overs, continuations, and how long it sat parked waiting for a
+  request. A turn that is never finished logs none.
 - Answer tokens reach the browser through Redis polling, so they arrive in
   bursts a few hundred milliseconds apart instead of token by token.
-- The 150s hand-over point (`handoffAfterMs` in `lib/config.ts`) assumes the
-  routes' 300s `maxDuration`. Change the two together.
+- While a turn streams, a write to Redis carries the new output and nothing
+  else. Keeping the run alive (TTLs, the driving invocation's lease) and
+  checking for Stop happen once a second, so a Stop can take up to a second
+  to reach a turn that is running.
+- Errors shown in the chat are one of a fixed set of messages, chosen by the
+  kind of failure. The provider's own text stays in the server logs; the
+  catch-all message carries the request id to find it by.
+- `detached.invocationLimitMs` in `lib/config.ts` has to equal the routes'
+  `maxDuration`, and the 150s hand-over point (`handoffAfterMs`) has to leave
+  an answer room inside it. `tests/config.test.ts` checks both.
+
+### In the browser
+
+The page keeps one state per thread for its latest turn
+(`lib/turn-machine.ts`): sending, streaming, detached (not connected, though
+the turn may still be running), resuming, or over (answered, stopped, expired
+or failed). Whether a turn is pending, and whether and when to reconnect to
+it, is read from that state and nowhere else. A saved conversation's
+`pending` flag is the same state written down so that it survives a reload.
+
+- A stream that ends with the closing frame has ended its turn. One that
+  ends any other way leaves the turn pending, and the page reconnects:
+  at once the first time, after half a second when the server ended the
+  stream early, and otherwise when the user returns to the page (or every
+  15 seconds while it stays open).
+- A reconnect replays the turn's stream from the start. The message already
+  on screen is kept there until the replay has caught up with it, and the
+  elapsed clock counts from when the turn was sent, so a reconnect or a
+  hand-over does not reset what the user is looking at.
+- A thread that ends without an answer (stopped early, expired, or failed
+  before a reload) shows why and offers Retry.
+- Sources are listed once, under the answer: the ones it links to first,
+  then anything else that was read.
+- Deleting a conversation can be undone for 6 seconds. Its turn, if one is
+  running, is only stopped on the server once that time is up.
 
 Files:
 
-- `app/page.tsx` — homepage prompt box + streaming chat UI; turn lifecycle is
-  modelled by the explicit state machine in `lib/hooks/turnMachine.ts`.
+- `app/page.tsx` — homepage prompt box + streaming chat UI.
+- `lib/turn-machine.ts` — the state of each thread's latest turn on the
+  client, and the decisions that follow from it (see
+  [In the browser](#in-the-browser)).
+- `lib/chat-session.ts` — one thread's `Chat` and transport: abortable
+  reconnects, and how each request's stream ended.
+- `lib/hooks/useReconnect.ts` — reconnects the open thread to a pending turn.
 - `app/api/chat/route.ts` — validates the request, joins the research queue,
   saves the turn, then runs it and tails its output.
 - `app/api/chat/[id]/stream/route.ts` — reconnects to a turn, and continues

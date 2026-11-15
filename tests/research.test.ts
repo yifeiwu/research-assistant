@@ -126,6 +126,42 @@ describe("runResearchPipeline degraded reporting", () => {
     expect(outcome.degraded?.failedStages?.join(" ")).toContain("query planning failed");
   });
 
+  it("reports how many rounds ran and where the time went", async () => {
+    const writer = { write: () => {} } as never;
+    const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    let searches = 0;
+    const outcome = await runResearchPipeline({
+      messages: [],
+      query: "what happened",
+      effort: effortConfig("medium"),
+      stages,
+      writer,
+      requestId: "test1234",
+      deps: {
+        planner: {
+          planQueries: async () => ({ stopped: false, queries: ["first"] }),
+          // One follow-up round, then enough.
+          planFollowUps: async () => ({ stopped: false, queries: ["second"] }),
+        },
+        search: {
+          search: async () => {
+            await pause(40);
+            return { docs: [doc(`https://a.com/${++searches}`)] };
+          },
+          fetchContents: async () => ({ docs: [] }),
+        },
+        condenser: { condense: async () => ({ notes: ["note"], fallbackCount: 0 }) },
+      },
+    });
+
+    expect(outcome.stats?.rounds).toBe(2);
+    // Two rounds of one 40ms search each; the other stages took no time.
+    expect(outcome.stats?.searchMs).toBeGreaterThanOrEqual(70);
+    for (const stage of ["planMs", "readMs", "gapCheckMs"] as const) {
+      expect(outcome.stats?.[stage]).toBeLessThan(30);
+    }
+  });
+
   it("trims the evidence block to the synthesis token budget and discloses it", async () => {
     const writer = { write: () => {} } as never;
     const bigNote = "x".repeat(30_000); // ~7,500 tokens, over the 3,000 budget

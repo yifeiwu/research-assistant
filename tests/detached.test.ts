@@ -1,5 +1,5 @@
 import type { UIMessage } from "ai";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createAdmissionQueue,
   createMemoryAdmissionStore,
@@ -423,14 +423,11 @@ describe("driveDetachedTurn", () => {
     const t = await setup();
     t.hooks.onResearch = async (input) => {
       await stopChatStream(CHAT, "u1", t.db);
-      // A large part forces a flush, which is when the attempt's ingester
-      // reads the stop flag from Redis and aborts the turn.
-      input.writer.write({
-        type: "data-research-step",
-        id: "research-big",
-        data: { round: 1, phase: "reading", queries: [], sources: [], notes: "x".repeat(17_000) },
+      // The attempt's ingester reads the stop flag from Redis at its next
+      // heartbeat, a second away at most, and aborts the turn.
+      await vi.waitFor(() => expect(input.signal?.aborted).toBe(true), {
+        timeout: 3_000,
       });
-      await vi.waitFor(() => expect(input.signal?.aborted).toBe(true));
     };
 
     expect(await t.drive()).toBe("done");
@@ -496,6 +493,108 @@ describe("driveDetachedTurn", () => {
     // No ticket: the busy queue is not consulted at all.
     expect(await t.drive()).toBe("done");
     expect(types(t.buffered()).at(-1)).toBe("finish");
+  });
+});
+
+describe("turn-summary log line", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  /** Every `turn-summary` logged since this was called. */
+  function watchSummaries(): () => Array<Record<string, unknown>> {
+    const log = vi.spyOn(console, "log");
+    return () =>
+      log.mock.calls
+        .filter((call) => call[0] === "[web-seek] turn-summary")
+        .map((call) => JSON.parse(String(call[1])) as Record<string, unknown>);
+  }
+
+  it("is written once when the turn is answered, with where the time went", async () => {
+    const t = await setup();
+    const summaries = watchSummaries();
+    // Research takes 4s, and the turn was asked for 1s before it ran.
+    t.hooks.onResearch = () => {
+      t.clock.now += 4_000;
+    };
+    t.clock.now += 1_000;
+
+    expect(await t.drive()).toBe("done");
+    // A later request for the finished run adds nothing.
+    expect(await t.drive({ origin: "resume" })).toBe("done");
+
+    expect(summaries()).toEqual([
+      expect.objectContaining({
+        requestId: "req12345",
+        runId: t.job.runId,
+        outcome: "answered",
+        effort: "medium",
+        model: "openai/gpt-oss-120b",
+        totalMs: 5_000,
+        // From when its ticket was issued (at 1 on this clock) to when it
+        // was given a slot (at 11,000).
+        queueWaitMs: 10_999,
+        research: { searched: true, sources: 1, degraded: false },
+        firstTextMs: 5_000,
+        answerMs: 0,
+        attempts: 1,
+        handOvers: 0,
+        continuations: 0,
+        parkedMs: 0,
+      }),
+    ]);
+  });
+
+  it("counts how the run was passed on, and how long it waited for a request", async () => {
+    const t = await setup({ busy: true });
+    const summaries = watchSummaries();
+
+    expect(await t.step()).toBe("handed-over"); // parked, due in 5s
+    expect(summaries()).toEqual([]);
+    // The buffer keeps real time; put its last sign of life on the test's clock.
+    t.fake.hashes.get(`chat:run:${t.job.runId}:meta`)!.updatedAt = String(t.clock.now);
+
+    // Nobody asks after the run until 7s after it fell due.
+    t.clock.now += 12_000;
+    await t.queue.cancel(t.other);
+    expect(await t.drive({ origin: "resume" })).toBe("done");
+
+    expect(summaries()).toEqual([
+      expect.objectContaining({
+        outcome: "answered",
+        // Waiting in line is not an attempt.
+        attempts: 1,
+        handOvers: 1,
+        continuations: 1,
+        parkedMs: 7_000,
+        totalMs: 12_000,
+      }),
+    ]);
+  });
+
+  it("says how a turn ended when it was not with an answer", async () => {
+    const exhausted = await setup({ config: { maxAttempts: 1 } });
+    let summaries = watchSummaries();
+    exhausted.setSynthesisLease(async () => {
+      throw new BudgetDeniedError("synthesis", 40_000);
+    });
+    expect(await exhausted.drive()).toBe("done");
+    expect(summaries()).toEqual([
+      expect.objectContaining({ outcome: "exhausted", attempts: 1 }),
+    ]);
+    vi.restoreAllMocks();
+
+    const stopped = await setup({ busy: true });
+    summaries = watchSummaries();
+    stopped.hooks.onSleep = () => stopChatStream(CHAT, "u1", stopped.db).then(() => {});
+    expect(await stopped.drive()).toBe("done");
+    expect(summaries()).toEqual([expect.objectContaining({ outcome: "cancelled" })]);
+    vi.restoreAllMocks();
+
+    const failed = await setup({ busy: true });
+    summaries = watchSummaries();
+    failed.clock.now += 121_000; // queued for too long
+    await failed.queue.poll(failed.other);
+    expect(await failed.drive()).toBe("done");
+    expect(summaries()).toEqual([expect.objectContaining({ outcome: "failed" })]);
   });
 });
 

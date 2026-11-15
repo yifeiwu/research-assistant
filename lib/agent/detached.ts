@@ -11,6 +11,7 @@ import {
 } from "./admission";
 import {
   beginChatRunAttempt,
+  countChatRunHandOver,
   endChatRun,
   ingestChunkStream,
   parkChatRun,
@@ -18,9 +19,10 @@ import {
   refundChatRunAttempt,
   resumeChatStream,
   runLeaseKey,
+  type ChatRunState,
 } from "./chat-stream";
 import { isResolutionError } from "./models";
-import { startTurn, type TurnCheckpoint } from "./turn";
+import { startTurn, type TurnCheckpoint, type TurnStats } from "./turn";
 
 /**
  * A turn does not depend on the request that asked for it. It is saved as a
@@ -155,6 +157,8 @@ export type DriveConfig = {
   retries: number;
   retryDelayMs: number;
   maxDeferMs: number;
+  invocationLimitMs: number;
+  finishMarginMs: number;
   handoffAfterMs: number;
   watchIntervalMs: number;
 };
@@ -204,6 +208,8 @@ type DriveContext = {
   lease: { key: string; token: string; ttlSeconds: number };
   /** Past this, the invocation starts nothing that takes long. */
   startBy: number;
+  /** When the invocation's work has to be over, with time left to close the run. */
+  finishBy: number;
   /** Attempts this invocation has begun. */
   begun: number;
   /** Called once the run is visibly in this invocation's hands. */
@@ -217,6 +223,67 @@ type DriveContext = {
  * - `resumeInMs`: the run is unfinished, and its next attempt is due then.
  */
 type AttemptOutcome = "over" | "failed" | "handoff" | { resumeInMs: number };
+
+/**
+ * How a turn ended:
+ * - `answered`: with an answer.
+ * - `failed`: with an error from its last attempt.
+ * - `cancelled`: stopped by the user, or replaced by a newer turn.
+ * - `interrupted`: its invocation died mid-answer.
+ * - `exhausted`: out of attempts, or every retry of an attempt threw.
+ * - `misconfigured`: the server could not build its models.
+ */
+type TurnOutcome =
+  | "answered"
+  | "failed"
+  | "cancelled"
+  | "interrupted"
+  | "exhausted"
+  | "misconfigured";
+
+/**
+ * The one log line that describes a whole turn, written when its run ends:
+ * how it ended, where the time went, and how the run got there (attempts,
+ * and how often it was passed between invocations). Durations are in ms.
+ *
+ * A turn that is never finished logs none: one parked for a request that
+ * did not come has `detached-handed-over` as its last line.
+ */
+function logTurnSummary(
+  job: ChatJob,
+  outcome: TurnOutcome,
+  input: {
+    now: number;
+    /** The run's counters as of the end, including the attempt just made. */
+    run: Pick<ChatRunState, "attempts" | "handOvers" | "continuations" | "parkedMs">;
+    stats?: TurnStats;
+  },
+): void {
+  const { now, run, stats } = input;
+  const answer = stats?.answer;
+  logInfo("turn-summary", {
+    requestId: job.requestId,
+    runId: job.runId,
+    outcome,
+    effort: typeof job.effort === "string" ? job.effort : undefined,
+    model: answer?.model ?? job.model,
+    totalMs: now - job.createdAt,
+    queueWaitMs: stats?.queueWaitMs,
+    research: stats?.research,
+    // From when the turn was asked for, so it includes queueing and research.
+    firstTextMs:
+      answer?.firstTextAt != null ? answer.firstTextAt - job.createdAt : undefined,
+    answerMs: answer ? (answer.endedAt ?? now) - answer.startedAt : undefined,
+    finishReason: answer?.finishReason,
+    // The answer's tokens only: research calls are not counted here.
+    usage: answer?.usage,
+    attempts: run.attempts,
+    handOvers: run.handOvers,
+    continuations: run.continuations,
+    // Time spent waiting for a request to continue it.
+    parkedMs: run.parkedMs,
+  });
+}
 
 const INTERRUPTED_MESSAGE =
   "The answer was interrupted on the server before it finished. Please retry.";
@@ -235,16 +302,21 @@ async function runAttempt(job: ChatJob, ctx: DriveContext): Promise<AttemptOutco
       // expired. Only the job is left, possibly still holding a queue place.
       await forgetJob(job, { db, queue });
       logInfo("detached-skip", { runId, requestId, reason: "finished" });
+      // Ended by a stop, which has no invocation of its own to say so.
+      if (before?.cancelled) {
+        logTurnSummary(job, "cancelled", { now: now(), run: before });
+      }
       return "over";
     }
 
     const finish = async (
       end: Parameters<typeof endChatRun>[2],
-      reason: string,
+      reason: Exclude<TurnOutcome, "answered" | "failed">,
     ): Promise<AttemptOutcome> => {
       await endChatRun(chatId, runId, end, db);
       await forgetJob(job, { db, queue });
       logInfo("detached-ended", { runId, requestId, reason });
+      logTurnSummary(job, reason, { now: now(), run: before });
       return "over";
     };
 
@@ -270,19 +342,30 @@ async function runAttempt(job: ChatJob, ctx: DriveContext): Promise<AttemptOutco
       return "handoff";
     }
 
+    // The run's counters as they will stand once this attempt has begun.
+    const run = { ...before, attempts: before.attempts + 1 };
+    let continued: { parkedMs: number } | undefined;
     if (ctx.origin !== "start" && ctx.begun === 0) {
       // The invocation that was driving this run handed it over or died.
+      // Since then (or since its next attempt fell due) it has been waiting
+      // for a request to arrive.
+      continued = {
+        parkedMs: Math.max(0, now() - Math.max(before.wakeAt, before.updatedAt)),
+      };
+      run.continuations += 1;
+      run.parkedMs += continued.parkedMs;
       logInfo("detached-continued", {
         runId,
         requestId,
         via: ctx.origin,
         from: before.status === "waiting" ? "parked" : "abandoned",
-        attempt: before.attempts + 1,
+        attempt: run.attempts,
         ageMs: now() - job.createdAt,
+        parkedMs: continued.parkedMs,
       });
     }
     ctx.begun += 1;
-    await beginChatRunAttempt(runId, db);
+    await beginChatRunAttempt(runId, db, continued);
     ctx.onEngaged();
 
     const modelMessages = await convertToModelMessages(job.messages);
@@ -317,6 +400,7 @@ async function runAttempt(job: ChatJob, ctx: DriveContext): Promise<AttemptOutco
       },
       maxDeferMs: config.maxDeferMs,
       answerBy: ctx.startBy,
+      finishBy: ctx.finishBy,
     });
     if (isResolutionError(turn)) {
       return finish({ type: "error", errorText: turn.error }, "misconfigured");
@@ -346,7 +430,16 @@ async function runAttempt(job: ChatJob, ctx: DriveContext): Promise<AttemptOutco
 
     // The turn gave its research slot back when its stream closed.
     await db.del(jobKey(runId), checkpointKey(runId));
-    logInfo("detached-done", { runId, requestId, attempt: before.attempts + 1 });
+    logInfo("detached-done", { runId, requestId, attempt: run.attempts });
+    logTurnSummary(
+      job,
+      abortController.signal.aborted
+        ? "cancelled"
+        : turn.stats.failed
+          ? "failed"
+          : "answered",
+      { now: now(), run, stats: turn.stats },
+    );
     return "over";
   } catch (error) {
     logError("detached-attempt", error, { runId, requestId });
@@ -374,6 +467,12 @@ async function abandonRun(job: ChatJob, ctx: DriveContext): Promise<void> {
   }
   await forgetJob(job, { db, queue });
   logInfo("detached-failed", { runId: job.runId, requestId: job.requestId });
+  if (state) {
+    logTurnSummary(job, state.answerStarted ? "interrupted" : "exhausted", {
+      now: ctx.now(),
+      run: state,
+    });
+  }
 }
 
 /**
@@ -420,11 +519,19 @@ export async function driveDetachedTurn(
       origin: invocation.origin,
       lease,
       startBy: invocation.startedAt + config.handoffAfterMs,
+      finishBy:
+        invocation.startedAt + config.invocationLimitMs - config.finishMarginMs,
       begun: 0,
       onEngaged: () => invocation.onEngaged?.(),
     };
-    const handOver = (reason: string): DriveResult => {
+    const handOver = async (reason: string): Promise<DriveResult> => {
       logInfo("detached-handed-over", { runId, requestId: job.requestId, reason });
+      try {
+        await countChatRunHandOver(runId, ctx.db);
+      } catch (error) {
+        // Only the summary's count is lost.
+        logError("detached-hand-over-count", error, { runId });
+      }
       return "handed-over";
     };
 

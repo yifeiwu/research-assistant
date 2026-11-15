@@ -278,4 +278,29 @@ describe("startTurn", () => {
     expect(types).toContain("abort");
     expect(h.calls.research).toHaveLength(0);
   });
+
+  it("adapts synthesis prompt depth to effort level and switches to compact prompt on Qwen fallback", async () => {
+    const hDeep = harness();
+    await hDeep.run({ effort: effortConfig("high") });
+    expect(hDeep.calls.synthesis[0].system).toContain("Depth & Structure (Deep Research)");
+    expect(hDeep.calls.synthesis[0].providerOptions).toEqual({
+      groq: { reasoningFormat: "parsed", reasoningEffort: "medium" },
+    });
+
+    const hQwenFallback = harness({
+      synthesisLease: async () => ({
+        model: model("qwen/qwen3.8-27b"),
+        modelId: "qwen/qwen3.8-27b",
+        waitedMs: 0,
+      }),
+    });
+    await hQwenFallback.run({ effort: effortConfig("high") });
+    expect(hQwenFallback.calls.synthesis[0].maxOutputTokens).toBe(900);
+    expect(hQwenFallback.calls.synthesis[0].system).toContain(
+      "Depth & Structure (Compact Output Budget)",
+    );
+    expect(hQwenFallback.calls.synthesis[0].providerOptions).toEqual({
+      groq: { reasoningFormat: "parsed" },
+    });
+  });
 });

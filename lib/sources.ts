@@ -15,11 +15,31 @@ function stripTrailingPunctuation(url: string): string {
   return url.replace(/[.,;:!?)\]}'"]+$/, "");
 }
 
+const TRACKING_PARAM_NAMES = new Set([
+  "fbclid",
+  "gclid",
+  "dclid",
+  "msclkid",
+  "yclid",
+  "mc_cid",
+  "mc_eid",
+  "igshid",
+  "ref_src",
+  "_hsenc",
+  "_hsmi",
+]);
+
+function isTrackingParam(name: string): boolean {
+  const lower = name.toLowerCase();
+  return lower.startsWith("utm_") || TRACKING_PARAM_NAMES.has(lower);
+}
+
 /**
  * Canonical comparison key for URL deduplication: lowercases/strips `www.`
- * from the host, drops the fragment and trailing path slashes, and removes
- * sentence punctuation stuck to the end, so `https://www.A.com/x/#f` and
- * `https://a.com/x` dedupe to the same source. Falls back to a plain string
+ * from the host, drops the fragment and trailing path slashes, strips common
+ * analytics/tracking parameters, sorts remaining query parameters, and removes
+ * sentence punctuation stuck to the end, so `https://www.A.com/x/?utm_source=x#f`
+ * and `https://a.com/x` dedupe to the same source. Falls back to a plain string
  * cleanup for unparseable values.
  */
 export function normalizeUrlKey(url: string): string {
@@ -28,6 +48,12 @@ export function normalizeUrlKey(url: string): string {
     const parsed = new URL(cleaned);
     parsed.hostname = parsed.hostname.replace(/^www\./i, "").toLowerCase();
     parsed.hash = "";
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (isTrackingParam(key)) {
+        parsed.searchParams.delete(key);
+      }
+    }
+    parsed.searchParams.sort();
     const path = parsed.pathname.replace(/\/+$/, "") || "/";
     return `${parsed.protocol}//${parsed.hostname}${parsed.port ? `:${parsed.port}` : ""}${path}${parsed.search}`;
   } catch {

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  budgetNotesFairly,
   parsePlainTextLines,
+  parseQueryPlan,
   runResearchPipeline,
   selectDeduplicatedDocs,
 } from "@/lib/research";
@@ -29,11 +31,109 @@ describe("parsePlainTextLines", () => {
   });
 });
 
+describe("parseQueryPlan", () => {
+  it("extracts BRIEF line and remaining search queries", () => {
+    const raw = [
+      "<think>resolve pronouns</think>",
+      "BRIEF: Compare Acme Corp and Beta Inc Q4 2026 operating margins",
+      "Acme Corp Q4 2026 operating margin filing",
+      "Beta Inc Q4 2026 operating margin filing",
+      "Acme vs Beta margin analyst critique 2026",
+    ].join("\n");
+    expect(parseQueryPlan(raw, { maxQueries: 3 })).toEqual({
+      stopped: false,
+      brief: "Compare Acme Corp and Beta Inc Q4 2026 operating margins",
+      queries: [
+        "Acme Corp Q4 2026 operating margin filing",
+        "Beta Inc Q4 2026 operating margin filing",
+        "Acme vs Beta margin analyst critique 2026",
+      ],
+    });
+  });
+
+  it("handles NO_SEARCH and plain query lists without BRIEF", () => {
+    expect(parseQueryPlan("NO_SEARCH", { maxQueries: 2 })).toEqual({
+      stopped: true,
+      queries: [],
+    });
+    expect(parseQueryPlan("alpha query\nbeta query", { maxQueries: 2 })).toEqual({
+      stopped: false,
+      queries: ["alpha query", "beta query"],
+    });
+  });
+});
+
 describe("selectDeduplicatedDocs", () => {
   it("interleaves batches and dedupes by trailing slash", () => {
     const seen = new Set<string>();
     const out = selectDeduplicatedDocs([], [[doc("https://a.com/1"), doc("https://a.com/2")], [doc("https://a.com/1/"), doc("https://b.com/1")]], seen, 3);
     expect(out.map((d) => d.url)).toEqual(["https://a.com/1", "https://a.com/2", "https://b.com/1"]);
+  });
+
+  it("drops empty pages, caps per-domain clustering on Pass 1, and backfills when sparse", () => {
+    const substantive = (url: string, body = " substantive analysis ".repeat(15)): ExaDocument => ({
+      url,
+      title: url,
+      text: body,
+    });
+
+    // Empty search doc is skipped; 3 subdomains of vendor.com get capped at 2 so independent org is included.
+    const seen = new Set<string>();
+    const diverse = selectDeduplicatedDocs(
+      [],
+      [
+        [
+          { url: "https://empty.org/dead", title: "Dead", text: "   " },
+          substantive("https://www.vendor.com/p1"),
+          substantive("https://blog.vendor.com/p2"),
+          substantive("https://docs.vendor.com/p3"),
+        ],
+        [substantive("https://independent.edu/study")],
+      ],
+      seen,
+      3,
+    );
+    expect(diverse.map((d) => d.url)).toEqual([
+      "https://www.vendor.com/p1",
+      "https://independent.edu/study",
+      "https://blog.vendor.com/p2",
+    ]);
+
+    // When only one domain has results, Pass 2 backfills up to maxCount rather than starving the round.
+    const sparseSeen = new Set<string>();
+    const backfilled = selectDeduplicatedDocs(
+      [],
+      [
+        [
+          substantive("https://onlydomain.com/1"),
+          substantive("https://onlydomain.com/2"),
+          substantive("https://onlydomain.com/3"),
+        ],
+      ],
+      sparseSeen,
+      3,
+    );
+    expect(backfilled).toHaveLength(3);
+  });
+});
+
+describe("budgetNotesFairly", () => {
+  it("sheds irrelevant notes first and preserves short later-round notes via water-filling", () => {
+    const round1Long = "R1 ".repeat(3_500); // ~10,500 chars
+    const round1Irrelevant = "### Off-topic\nURL: https://x.com\n- Irrelevant to research question.";
+    const round2Concise = "### Round 2 Gap Fill\nURL: https://r2.org\n- [Fact] Exact figure is 93.4%.";
+
+    const out = budgetNotesFairly(
+      [round1Long, round1Irrelevant, round2Concise],
+      1_500, // 6,000 chars budget
+      { separator: "\n\n---\n\n", labelSources: true, trimMarker: "[Trimmed]" },
+    );
+
+    expect(out.text).not.toContain("Irrelevant to research question");
+    // Short Round 2 note is kept completely intact rather than dropped behind Round 1's oversized note!
+    expect(out.text).toContain("Exact figure is 93.4%.");
+    expect(out.text).toContain("[Trimmed]");
+    expect(out.trimmedCount).toBe(2); // 1 dropped irrelevant + 1 truncated R1 note
   });
 });
 
@@ -352,5 +452,51 @@ describe("runResearchPipeline degraded reporting", () => {
       },
     });
     expect(outcome.degraded).toBeUndefined();
+  });
+
+  it("propagates planner BRIEF to condenser and gap-check, and plans 3 initial queries on high effort", async () => {
+    const writer = { write: () => {} } as never;
+    let seenMaxQueries = 0;
+    const condenseQueries: string[] = [];
+    const gapQueries: string[] = [];
+
+    await runResearchPipeline({
+      messages: [],
+      query: "how do their margins compare?",
+      effort: effortConfig("high"),
+      stages,
+      writer,
+      requestId: "testbrief",
+      deps: {
+        planner: {
+          planQueries: async ({ maxQueries }) => {
+            seenMaxQueries = maxQueries;
+            return {
+              stopped: false,
+              brief: "Compare Q4 2026 operating margins of Nvidia and AMD",
+              queries: ["nvidia q4 2026 margin", "amd q4 2026 margin", "nvidia vs amd margin analysis"],
+            };
+          },
+          planFollowUps: async ({ query: gapQ }) => {
+            gapQueries.push(gapQ);
+            return { stopped: true, queries: [] };
+          },
+        },
+        search: {
+          search: async (q) => ({ docs: [doc(`https://ex.com/${encodeURIComponent(q)}`)] }),
+          fetchContents: async () => ({ docs: [] }),
+        },
+        condenser: {
+          condense: async (docs, input) => {
+            condenseQueries.push(input.query);
+            return { notes: docs.map((d) => `note ${d.url}`), fallbackCount: 0 };
+          },
+        },
+      },
+    });
+
+    expect(seenMaxQueries).toBe(3);
+    expect(condenseQueries).toEqual(["Compare Q4 2026 operating margins of Nvidia and AMD"]);
+    expect(gapQueries).toEqual(["Compare Q4 2026 operating margins of Nvidia and AMD"]);
   });
 });

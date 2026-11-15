@@ -22,6 +22,11 @@ export type GroqModel = {
    */
   maxSynthesisTokens?: number;
   /**
+   * Per-model cap on batched summary `maxOutputTokens` so 2 sequential rounds
+   * fit inside Qwen 3.8 27B's 1,000 OTPM limit (2 * 450 = 900).
+   */
+  maxSummaryTokens?: number;
+  /**
    * Per-minute token limits used to seed the shared budgets in
    * `lib/agent/scheduler.ts`. `tpm` is Groq's combined limit and is corrected
    * at runtime from the `x-ratelimit-limit-tokens` response header; `itpm` /
@@ -40,6 +45,7 @@ export type GroqModelLimits = {
 export type GroqModelRole = "synthesis" | "auxiliary";
 
 const DEFAULT_SYNTHESIS_MAX_TOKENS = 3_500;
+const DEFAULT_SUMMARY_MAX_TOKENS = 650;
 
 /**
  * Curated list of Groq models available on the free tier. Because the research
@@ -54,6 +60,7 @@ export const GROQ_MODELS: GroqModel[] = [
     reasoning: true,
     supportsZeroReasoning: true,
     maxSynthesisTokens: 900,
+    maxSummaryTokens: 450,
     limits: { tpm: 8_000, itpm: 7_000, otpm: 1_000 },
   },
   {
@@ -104,7 +111,10 @@ export function groqModelLabel(id: string | undefined | null): string {
 
 /**
  * Provider options for a Groq call given its pipeline role:
- * - `"synthesis"` surfaces parsed reasoning tokens to the UI.
+ * - `"synthesis"` surfaces parsed reasoning tokens to the UI, and on models
+ *   without a tight 1k OTPM cap sets `reasoningEffort` to `"low"` (direct low
+ *   effort) or `"medium"` (research synthesis — deliberately avoiding `"high"`
+ *   so `<think>` tokens cannot starve the 3,500 output cap).
  * - `"auxiliary"` (planner, gap check, summarizer) disables reasoning on Qwen
  *   (`effort: "none", format: "hidden"`) and minimizes it on GPT-OSS
  *   (`effort: "low"`), avoiding wasted output-token reservations.
@@ -113,11 +123,20 @@ export function groqModelLabel(id: string | undefined | null): string {
 export function groqReasoningOptions(
   id: string | undefined | null,
   role: GroqModelRole,
+  effortLevel?: import("./effort").EffortLevel,
 ): { groq: GroqProviderOptions } | undefined {
   const known = id ? GROQ_MODELS.find((m) => m.id === id) : undefined;
   if (!known?.reasoning) return undefined;
 
   if (role === "synthesis") {
+    if (effortLevel && known.maxSynthesisTokens == null) {
+      return {
+        groq: {
+          reasoningFormat: "parsed",
+          reasoningEffort: effortLevel === "low" ? "low" : "medium",
+        },
+      };
+    }
     return { groq: { reasoningFormat: "parsed" } };
   }
 
@@ -149,6 +168,22 @@ export function maxSynthesisOutputTokens(
   const known = id ? GROQ_MODELS.find((m) => m.id === id) : undefined;
   if (known?.maxSynthesisTokens != null) {
     return Math.min(known.maxSynthesisTokens, defaultMax);
+  }
+  return defaultMax;
+}
+
+/**
+ * Safe `maxOutputTokens` reservation for batched source condensation on `id`.
+ * Caps Qwen at 450 tokens so two sequential rounds fit inside its 1,000 OTPM
+ * limit, while allowing 650 tokens on GPT-OSS models.
+ */
+export function maxSummaryOutputTokens(
+  id: string | undefined | null,
+  defaultMax: number = DEFAULT_SUMMARY_MAX_TOKENS,
+): number {
+  const known = id ? GROQ_MODELS.find((m) => m.id === id) : undefined;
+  if (known?.maxSummaryTokens != null) {
+    return Math.min(known.maxSummaryTokens, defaultMax);
   }
   return defaultMax;
 }

@@ -12,6 +12,17 @@ describe("normalizeUrlKey", () => {
       normalizeUrlKey("https://example.com/a"),
     );
   });
+
+  it("strips tracking query parameters while preserving and sorting meaningful ones", () => {
+    expect(
+      normalizeUrlKey(
+        "https://www.example.com/report/?utm_source=newsletter&b=2&fbclid=abc123&a=1&utm_medium=email",
+      ),
+    ).toBe("https://example.com/report?a=1&b=2");
+    expect(normalizeUrlKey("https://example.com/post?gclid=xyz&mc_cid=11")).toBe(
+      "https://example.com/post",
+    );
+  });
 });
 
 describe("collectSources", () => {

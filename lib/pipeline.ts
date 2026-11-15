@@ -2,10 +2,12 @@ import "server-only";
 import { isAbortError } from "./errors";
 import { generateText } from "ai";
 import type { ExaDocument } from "./exa";
+import { selectRelevantExcerpt } from "./excerpt";
 import { logDebug, logError } from "./logger";
 import { serverConfig } from "./config";
-import { groqReasoningOptions } from "./models";
+import { groqReasoningOptions, maxSummaryOutputTokens } from "./models";
 import { normalizeCacheText, requestCache, type RequestCache } from "./cache";
+import { domainOf } from "./sources";
 import { estimateTokens } from "./tokens";
 import type { StageRunner } from "./agent/stage";
 
@@ -26,25 +28,26 @@ export function stripThinking(text: string): string {
 }
 
 function formatSourceHeader(doc: ExaDocument): string {
-  const lines = [`### ${doc.title ?? doc.url}`, `URL: ${doc.url}`];
-  if (doc.publishedDate) lines.push(`Published: ${doc.publishedDate}`);
-  return lines.join("\n");
+  return [
+    `### ${doc.title ?? doc.url}`,
+    `URL: ${doc.url}`,
+    `Domain: ${domainOf(doc.url)} | Published: ${doc.publishedDate ?? "unlisted"}`,
+  ].join("\n");
 }
 
 
-const SUMMARY_SYSTEM_PROMPT = `You compress raw web content into concise, factual research notes while critically evaluating the source.
+const SUMMARY_SYSTEM_PROMPT = `You compress web source excerpts into high-density, critically evaluated research notes.
 
 Rules:
-- Keep only information relevant to the research question.
-- Preserve concrete facts: names, numbers, dates, quotes, and conclusions.
-- Read the source skeptically. Distinguish verifiable facts from the source's own claims, opinions, or interpretations. Attribute claims to the source rather than stating them as established fact (e.g. "The article claims..." / "According to the author...").
-- Flag signs of low reliability: missing evidence or citations, anonymous or unnamed sources, marketing/promotional or advertorial framing, opinion or editorial content, undisclosed conflicts of interest, emotionally loaded or one-sided language, vague or unfalsifiable assertions, outdated information, and claims that contradict well-established consensus.
-- Note what the source does NOT substantiate: unsupported figures, cherry-picked data, or conclusions that outrun the evidence presented.
-- If credibility signals are relevant, add a short "Reliability:" line noting the source type (e.g. peer-reviewed, news, blog, vendor page) and any caveats a reader should keep in mind.
-- Use short bullet points. Keep critique factual and specific; do not editorialize beyond what the content supports.
-- Output plain text bullet points only. Do not call tools or wrap output in JSON.
-- If the content is not relevant to the question, say so in one line.
-- You may receive several sources in one request. Condense each source separately under its own "### Source N" heading (N matching the source number given), in order, with no introduction or conclusion. Never merge facts across sources.`;
+- If a source contains NO information relevant to the research question, output ONLY the single bullet:
+  - Irrelevant to research question.
+- For relevant sources, output:
+  1. First bullet: \`- Profile: <peer-reviewed | official-docs | news | vendor | blog/forum> | Caveat: <concise reliability caveat or none>\` (flag vendor/promotional framing, missing citations, small/unrepresentative samples, outdated data, or conflicts of interest).
+  2. Up to 5 dense factual bullets packing maximum empirical signal per token: exact figures, percentages, units, sample sizes/conditions, dates, named entities, causal mechanisms, and methodological scope.
+- Tag verifiable empirical data or official specs with \`[Fact]\` and single-source assertions, forecasts, or opinions with \`[Claim]\` rather than writing wordy attribution filler.
+- Note unsupported leaps or missing baselines concisely when claims outrun presented evidence.
+- Output plain text bullet points only. No JSON, no tool calls, no intro/outro prose.
+- Condense each source separately under its own "### Source N" heading (N matching the given source number), in order. Never merge facts across sources.`;
 
 type CondenseSourceOutcome = { note: string; usedFallback: boolean };
 
@@ -86,12 +89,12 @@ function buildBatchPrompt(
 ): string {
   const blocks = entries.map(
     ({ doc, input }, i) =>
-      `<source ${i + 1}>\nTitle: ${doc.title ?? doc.url}\nURL: ${doc.url}\nContent:\n"""\n${input}\n"""\n</source ${i + 1}>`,
+      `<source ${i + 1}>\nTitle: ${doc.title ?? doc.url}\nURL: ${doc.url}${doc.publishedDate ? `\nPublished: ${doc.publishedDate}` : ""}\nContent:\n"""\n${input}\n"""\n</source ${i + 1}>`,
   );
   return [
     `Research question:\n${query || "(not provided)"}`,
     "",
-    `Condense EACH of the ${entries.length} sources below into concise research notes (bullet points). Attribute claims to the source, distinguish fact from opinion, and flag any reliability concerns. Keep each source's notes very brief — at most 3 short bullets, prioritising concrete facts (names, numbers, dates) over commentary.`,
+    `Condense EACH of the ${entries.length} sources below. For irrelevant sources output only "- Irrelevant to research question." so relevant sources get full detail (1 "- Profile: ... | Caveat: ..." bullet + up to 5 dense bullets with exact metrics, dates, conditions, and [Fact]/[Claim] tags).`,
     `Output exactly one section per source, in order, headed "### Source N" (N = the source number), with no introduction or conclusion.`,
     "",
     ...blocks,
@@ -136,11 +139,17 @@ export async function condenseSourcesDetailed(
       PER_SOURCE_INPUT_CHAR_CAP,
       Math.floor(BATCH_INPUT_CHAR_CAP / pending.length),
     );
-    const entries = pending.map((p) => ({ doc: p.doc, input: p.rawBody.slice(0, perSourceCap) }));
+    const entries = pending.map((p) => ({
+      doc: p.doc,
+      input: selectRelevantExcerpt(p.rawBody, opts.query, perSourceCap),
+    }));
     const fallbackFor = (i: number): CondenseSourceOutcome => ({
       note: `${pending[i].header}\n${entries[i].input.slice(0, FALLBACK_CHAR_CAP)}`,
       usedFallback: true,
     });
+
+    const summaryTokensFor = (modelId: string) =>
+      maxSummaryOutputTokens(modelId, serverConfig.summary.batchMaxOutputTokens);
 
     const cache = opts.cache ?? requestCache;
     try {
@@ -160,12 +169,12 @@ export async function condenseSourcesDetailed(
           // source falls back to a raw excerpt below.
           const leased = await opts.stage.lease({
             estInputTokens: estimateTokens(SUMMARY_SYSTEM_PROMPT) + estimateTokens(prompt),
-            maxOutputTokens: serverConfig.summary.batchMaxOutputTokens,
+            maxOutputTokens: summaryTokensFor,
           });
           const { text } = await generateText({
             model: leased.model,
             system: SUMMARY_SYSTEM_PROMPT,
-            maxOutputTokens: serverConfig.summary.batchMaxOutputTokens,
+            maxOutputTokens: summaryTokensFor(leased.modelId),
             providerOptions: groqReasoningOptions(leased.modelId, "auxiliary"),
             // Signal-free loader (shared/coalesced via the cache); the
             // caller's own signal is passed to `wrap` below and only

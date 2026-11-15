@@ -67,9 +67,10 @@ export const serverConfig = {
     perSourceInputCharCap: 3_000,
     fallbackCharCap: 4_000,
     // Groq reserves the full max-output budget against the summary model's
-    // 1k OTPM, so one round's batch must leave room for the next round's:
-    // ~350 lets 2-3 sequential rounds' batches fit inside one minute.
-    batchMaxOutputTokens: 350,
+    // OTPM. `maxSummaryOutputTokens` caps Qwen 3.8 27B at 450 (so 2 rounds
+    // = 900 <= 1,000 OTPM), while GPT-OSS models without a 1k OTPM cap get
+    // 650 tokens to accommodate "low" reasoning + dense factual bullets.
+    batchMaxOutputTokens: 650,
     timeoutMs: 25_000,
   },
   // Planner/gap-check outputs are a handful of short query lines (or DONE /

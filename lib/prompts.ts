@@ -44,67 +44,109 @@ Guidelines:
 }
 
 /**
- * Stage 1 prompt: turns the conversation into 1..maxQueries plain-text web
- * search queries (one per line), or `NO_SEARCH` when external lookup is clearly
- * unnecessary.
+ * Stage 1 prompt: turns the conversation into a self-contained `BRIEF:` line
+ * plus 1..maxQueries plain-text web search queries (one per line), or
+ * `NO_SEARCH` when external lookup is clearly unnecessary.
  */
 export function buildQueryPlanPrompt(maxQueries: number): string {
   return `${currentDateLine()}
 
-You plan web search queries for a research assistant.
+You plan web search queries for an analytical research assistant.
 
 Given the conversation so far, decide whether answering the user's latest message benefits from web search.
 
 Output format rules (STRICT):
 - If the latest message is purely a greeting, small talk, pure math/logic, or a self-contained rewrite/formatting of text already in the conversation, output ONLY the single token:
 NO_SEARCH
-- Otherwise, output 1 to ${maxQueries} focused, diverse web search queries — ONE query per line.
-- Make each query self-contained (resolve pronouns like "it" or "they" using prior turns) and cover distinct angles of the user's question.
-- Include the current year when freshness matters.
-- Output ONLY the raw search queries, one per line. No numbering, no bullets, no quotes, no commentary, no JSON.`;
+- Otherwise:
+  1. On the FIRST line, output \`BRIEF: <concise self-contained research question>\` (1 sentence, under 35 words) resolving all pronouns ("it", "they", "that"), named entities, timeframe, and comparison/analytical criteria from prior conversation turns.
+  2. On the following lines, output 1 to ${maxQueries} focused, non-overlapping web search queries — ONE query per line — covering distinct angles:
+     - Angle 1: Primary empirical data, official documentation, filings, or original announcements.
+     - Angle 2: Mechanisms, technical comparisons, or methodology details.
+     - Angle 3 (when ${maxQueries} >= 3 or warranted): Independent benchmarks, critiques, limitations, or counterarguments.
+- Make every search query self-contained and include the current year when freshness matters.
+- Output ONLY the \`BRIEF:\` line followed by raw search queries (one per line). No numbering, no bullets, no quotes, no commentary, no JSON.`;
 }
 
 /**
- * High-effort gap-check prompt: inspects Round 1 research notes and either
- * finishes (`DONE`) or emits targeted follow-up search queries to fill gaps.
+ * Gap-check prompt: inspects gathered research notes across rounds and either
+ * finishes (`DONE`) or emits targeted follow-up search queries to fill
+ * empirical, primary-source, contradiction, or counterpoint gaps.
  */
-export function buildGapCheckPrompt(maxFollowUps: number): string {
+export function buildGapCheckPrompt(
+  maxFollowUps: number,
+  effortLevel?: import("./effort").EffortLevel,
+): string {
+  const depthGuidance =
+    effortLevel === "high"
+      ? "\n- Because high-effort deep research is requested, do NOT output DONE until independent benchmarks/primary sources AND meaningful counterarguments, limitations, or failure modes have been checked."
+      : "";
   return `${currentDateLine()}
 
-You evaluate whether gathered web research notes are sufficient to thoroughly answer the user's question.
+You evaluate whether gathered web research notes are sufficient to produce a rigorous, well-corroborated answer to the user's question.
+
+Before outputting DONE, verify ALL four criteria against the research notes:
+1. Completeness: Every sub-question, requested comparison dimension, timeframe, and entity in the user's question is directly addressed.
+2. Primary & independent evidence: Key claims do not rely solely on vendor/marketing pages (` + "`Profile: vendor`" + `) or unverified secondary commentary when official docs, filings, peer-reviewed studies, or independent benchmarks should exist.
+3. Contradiction resolution: Any conflicting numbers, dates, or conclusions across sources can either be explained or arbitrated with a targeted check.
+4. Counterpoints & caveats: Significant limitations, trade-offs, or opposing evidence are represented where relevant.${depthGuidance}
 
 Output format rules (STRICT):
-- If the notes already cover the key facts needed to answer accurately, output ONLY the single token:
+- If all four criteria are satisfied (or remaining gaps cannot plausibly be answered via web search), output ONLY the single token:
 DONE
-- If important facts, specifics, primary sources, or counterpoints are still missing, output 1 to ${maxFollowUps} targeted follow-up web search queries — ONE query per line — aimed strictly at the missing information.
-- Do not repeat queries that were already run.
+- Otherwise, output 1 to ${maxFollowUps} targeted follow-up web search queries — ONE query per line — aimed strictly at the specific missing primary data, unresolved contradiction, or counterpoint.
+- Do not repeat or trivially rephrase queries that were already run.
 - Output ONLY "DONE" or raw search queries (one per line). No numbering, no bullets, no quotes, no commentary.`;
 }
 
+export type SynthesisPromptOptions = {
+  effort?: import("./effort").EffortLevel;
+  maxOutputTokens?: number;
+};
+
 /**
  * Stage 4 (reduce) prompt: synthesizes the pre-fetched, condensed research
- * notes into a grounded, inline-cited final answer.
+ * notes into a grounded, cross-source analytical answer scaled to effort and
+ * output-token headroom.
  */
 export function buildSynthesisPrompt(
   evidenceBlock: string,
   degraded?: import("./types/chat").DegradedResearch,
+  opts?: SynthesisPromptOptions,
 ): string {
   const degradedLine = degraded
-    ? `\n- Research was partially degraded (${degraded.messages.join("; ")}). Disclose in your answer that some evidence could not be retrieved and may be incomplete rather than answering with false confidence.`
+    ? `\n- Research was partially degraded (${degraded.messages.join("; ")}). Disclose briefly that some evidence could not be retrieved or was trimmed rather than answering with false confidence.`
     : "";
+
+  const isCompactBudget =
+    opts?.maxOutputTokens != null && opts.maxOutputTokens < 1_500;
+  const isDeepEffort = opts?.effort === "high" && !isCompactBudget;
+
+  const depthSection = isDeepEffort
+    ? `Depth & Structure (Deep Research):
+- Produce a thorough, structured analytical brief adapted to the shape of the question (e.g. side-by-side comparison table + trade-off analysis for comparisons; causal mechanisms + empirical evidence for "why/how" questions; status + timeline + open risks for evolving topics).
+- Cover: (1) direct executive thesis with headline numbers/conclusions, (2) cross-source thematic and technical/mechanistic analysis, (3) evidence quality, limitations, and strongest counterarguments or failure modes, and (4) concrete, decision-relevant takeaways.`
+    : isCompactBudget
+      ? `Depth & Structure (Compact Output Budget):
+- Deliver a high-signal executive answer followed by tight thematic synthesis and key caveats. Keep prose dense and complete within ~500-650 words so the response never truncates mid-section.`
+      : `Depth & Structure (Balanced Analysis):
+- Open with a clear bottom-line answer, then organize supporting analysis thematically using concise markdown headings, bullet points, or compact comparison tables where they sharpen clarity, ending with key trade-offs or caveats.`;
+
   return `${currentDateLine()}
 
-You are a meticulous web research assistant.
+You are a rigorous web research analyst.
 
 Web research has already been executed for you. Answer the user's question using the gathered research notes below as your primary evidence.
 
-Guidelines:
-- Ground your claims in the research notes. Synthesize across sources rather than repeating each source one by one.
-- Distinguish established facts from claims, projections, or opinions attributed to specific sources, and note any reliability caveats surfaced in the notes.
+Analytical Standards:
+- Lead with the bottom line: open immediately with a direct, thesis-driven answer stating the core conclusion, key numbers, and main conditions up front.
+- Synthesize across sources rather than summarizing source by source. Explicitly triangulate where independent sources agree, and when sources conflict, surface the discrepancy and explain likely causes (publication date, methodology, sample/workload differences, or vendor vs. independent incentives).
+- Weight evidence by source rigor: prioritize peer-reviewed studies, official documentation, and primary data (\`Profile: peer-reviewed\` / \`official-docs\`) over vendor marketing or informal commentary (\`Profile: vendor\` / \`blog/forum\`). Anchor claims in specific metrics, dates, and scope rather than vague qualifiers.
+- Separate established \`[Fact]\` findings from single-source \`[Claim]\` assertions, projections, or opinions, and state transparently what the gathered evidence does not resolve.
 - Cite sources inline using markdown links — e.g. [Source Name](https://example.com/...) — using ONLY the exact URLs provided in the research notes. Never invent URLs.
-- Do not end with a "Sources" or "References" list: the interface already lists every source below your answer, with the ones you linked first.
-- If the research notes do not fully answer part of the question or conflict with each other, state that transparently rather than guessing.
-- Be concise, direct, and well-structured with markdown headings/lists where helpful.${degradedLine}
+- Do not end with a "Sources" or "References" list: the interface already lists every source below your answer, with the ones you linked first.${degradedLine}
+
+${depthSection}
 
 === RESEARCH NOTES ===
 ${evidenceBlock}

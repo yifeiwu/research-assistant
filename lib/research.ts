@@ -13,7 +13,7 @@ import { condenseSourcesDetailed, stripThinking } from "./pipeline";
 import { buildGapCheckPrompt, buildQueryPlanPrompt } from "./prompts";
 import { extractUrls, normalizeUrlKey } from "./sources";
 import { serverConfig } from "./config";
-import { estimateTokens, truncateToTokenBudget } from "./tokens";
+import { estimateTokens } from "./tokens";
 import type { StageRunner } from "./agent/stage";
 import type {
   Condenser,
@@ -31,6 +31,7 @@ import type {
 
 const MAX_EXPLICIT_URLS = 4;
 const MAX_QUERY_LENGTH = 240;
+const MAX_BRIEF_LENGTH = 360;
 
 /**
  * Where a turn's research time went: wall time per stage in ms, summed over
@@ -111,31 +112,328 @@ export function parsePlainTextLines(
 }
 
 /**
+ * Parse Stage 1 query-planner output containing an optional `BRIEF: ...` line
+ * followed by newline-separated search queries, or `NO_SEARCH`.
+ */
+export function parseQueryPlan(
+  raw: string,
+  opts: { maxQueries: number },
+): { stopped: boolean; brief?: string; queries: string[] } {
+  const cleaned = stripThinking(raw);
+  if (!cleaned) return { stopped: false, queries: [] };
+
+  const rawLines = cleaned
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (
+    rawLines.length === 1 &&
+    /^[\`"']*NO_SEARCH[\`"'.!]*$/i.test(rawLines[0])
+  ) {
+    return { stopped: true, queries: [] };
+  }
+
+  let brief: string | undefined;
+  const remainingLines: string[] = [];
+  for (const line of rawLines) {
+    const briefMatch = line.match(/^(?:[-*•]\s*)?[`"']*BRIEF[`"']*\s*:\s*(.+)$/i);
+    if (briefMatch && !brief) {
+      const candidate = briefMatch[1]
+        .replace(/^["'`]+|["'`]+$/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, MAX_BRIEF_LENGTH);
+      if (candidate && !/^NO_SEARCH[.!]*$/i.test(candidate)) {
+        brief = candidate;
+        continue;
+      }
+      if (/^NO_SEARCH[.!]*$/i.test(candidate)) {
+        return { stopped: true, queries: [] };
+      }
+    }
+    remainingLines.push(line);
+  }
+
+  const parsed = parsePlainTextLines(remainingLines.join("\n"), {
+    stopToken: "NO_SEARCH",
+    maxLines: opts.maxQueries,
+  });
+  if (parsed.stopped && !brief) {
+    return { stopped: true, queries: [] };
+  }
+  return {
+    stopped: false,
+    ...(brief ? { brief } : {}),
+    queries: parsed.lines,
+  };
+}
+
+const QUERY_STOPWORDS = new Set([
+  "the", "and", "for", "with", "that", "this", "from", "what", "when",
+  "where", "which", "who", "whom", "whose", "why", "how", "are", "was",
+  "were", "been", "being", "have", "has", "had", "does", "did", "will",
+  "would", "could", "should", "into", "about", "over", "after", "before",
+  "between", "under", "again", "further", "then", "once", "here", "there",
+  "all", "any", "both", "each", "few", "more", "most", "other", "some",
+  "such", "only", "own", "same", "than", "too", "very", "can", "just",
+]);
+
+const MULTI_PART_TLDS = new Set([
+  "co.uk", "org.uk", "gov.uk", "ac.uk",
+  "com.au", "org.au", "gov.au", "edu.au",
+  "co.jp", "co.nz", "co.in", "com.br", "com.sg",
+]);
+
+function registrableDomain(url: string): string {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./i, "").toLowerCase();
+    const parts = host.split(".").filter(Boolean);
+    if (parts.length <= 2) return host;
+    const lastTwo = `${parts[parts.length - 2]}.${parts[parts.length - 1]}`;
+    if (MULTI_PART_TLDS.has(lastTwo) && parts.length >= 3) {
+      return `${parts[parts.length - 3]}.${lastTwo}`;
+    }
+    return lastTwo;
+  } catch {
+    return url.toLowerCase();
+  }
+}
+
+function extractQueryTerms(query: string): string[] {
+  const matches = query.toLowerCase().match(/[a-z0-9]{3,}/g) ?? [];
+  const seen = new Set<string>();
+  const terms: string[] = [];
+  for (const token of matches) {
+    if (QUERY_STOPWORDS.has(token) || seen.has(token)) continue;
+    seen.add(token);
+    terms.push(token);
+  }
+  return terms;
+}
+
+function rankBatchCandidates(docs: ExaDocument[], query?: string): ExaDocument[] {
+  const nonEmpty = docs.filter((d) => d.text.trim().length > 0);
+  if (!query || !query.trim() || nonEmpty.length <= 1) return nonEmpty;
+
+  const terms = extractQueryTerms(query);
+  const freshnessSensitive = /\b(latest|recent|current|today|new|update|updated|202[4-9])\b/i.test(query);
+  const nowMs = Date.now();
+
+  const scored = nonEmpty.map((doc, idx) => {
+    // Base rank decay preserves Exa's ordering unless lexical/data/recency signals strongly favor another hit.
+    let score = Math.max(0, 1 - idx * 0.14);
+
+    if (terms.length > 0) {
+      const titleLower = (doc.title ?? "").toLowerCase();
+      const bodyLower = doc.text.slice(0, 6_000).toLowerCase();
+      let titleHits = 0;
+      let bodyHits = 0;
+      for (const term of terms) {
+        if (titleLower.includes(term)) titleHits += 1;
+        if (bodyLower.includes(term)) bodyHits += 1;
+      }
+      score += (titleHits / terms.length) * 0.65 + (bodyHits / terms.length) * 0.65;
+    }
+
+    if (/\b\d+(?:\.\d+)?%|\$\d|\b(?:19|20)\d{2}\b/.test(doc.text.slice(0, 6_000))) {
+      score += 0.2;
+    }
+
+    if (freshnessSensitive && doc.publishedDate) {
+      const pubMs = Date.parse(doc.publishedDate);
+      if (Number.isFinite(pubMs) && pubMs <= nowMs + 86_400_000) {
+        const ageDays = Math.max(0, (nowMs - pubMs) / 86_400_000);
+        if (ageDays <= 540) {
+          score += 0.35 * (1 - ageDays / 540);
+        }
+      }
+    }
+
+    return { doc, idx, score };
+  });
+
+  scored.sort((a, b) => (b.score !== a.score ? b.score - a.score : a.idx - b.idx));
+  return scored.map((s) => s.doc);
+}
+
+export type SelectDocsOptions = {
+  query?: string;
+  maxPerDomain?: number;
+  minSubstantiveChars?: number;
+};
+
+/**
  * Interleave search results round-robin across queries while deduplicating
- * against `seenUrlKeys` so every query angle gets fair representation.
+ * against `seenUrlKeys`, dropping empty pages, and preferring substantive,
+ * domain-diverse sources before backfilling remaining slots.
  */
 export function selectDeduplicatedDocs(
   priorityDocs: ExaDocument[],
   queryResultBatches: ExaDocument[][],
   seenUrlKeys: Set<string>,
   maxCount: number,
+  opts?: SelectDocsOptions,
 ): ExaDocument[] {
+  if (maxCount <= 0) return [];
+  const maxPerDomain = opts?.maxPerDomain ?? 2;
+  const minSubstantiveChars = opts?.minSubstantiveChars ?? 200;
+
   const selected: ExaDocument[] = [];
-  const tryAdd = (doc: ExaDocument) => {
-    if (selected.length >= maxCount) return;
-    const key = normalizeUrlKey(doc.url);
-    if (!key || seenUrlKeys.has(key)) return;
+  const domainCounts = new Map<string, number>();
+
+  const recordDoc = (doc: ExaDocument, key: string, domain: string) => {
     seenUrlKeys.add(key);
+    domainCounts.set(domain, (domainCounts.get(domain) ?? 0) + 1);
     selected.push(doc);
   };
-  for (const doc of priorityDocs) tryAdd(doc);
-  const maxDepth = queryResultBatches.reduce((max, batch) => Math.max(max, batch.length), 0);
+
+  // Explicit user-supplied URLs always take priority regardless of length/domain caps.
+  for (const doc of priorityDocs) {
+    if (selected.length >= maxCount) break;
+    const key = normalizeUrlKey(doc.url);
+    if (!key || seenUrlKeys.has(key)) continue;
+    recordDoc(doc, key, registrableDomain(doc.url));
+  }
+
+  // Filter out completely empty search results and rank within each query batch.
+  const rankedBatches = queryResultBatches.map((batch) =>
+    rankBatchCandidates(batch, opts?.query),
+  );
+  const maxDepth = rankedBatches.reduce((max, batch) => Math.max(max, batch.length), 0);
+
+  // Pass 1: Substantive pages respecting per-domain diversity cap.
   for (let depth = 0; depth < maxDepth && selected.length < maxCount; depth++) {
-    for (const batch of queryResultBatches) {
-      if (depth < batch.length) tryAdd(batch[depth]);
+    for (const batch of rankedBatches) {
+      if (selected.length >= maxCount) break;
+      if (depth >= batch.length) continue;
+      const doc = batch[depth];
+      if (doc.text.trim().length < minSubstantiveChars) continue;
+      const key = normalizeUrlKey(doc.url);
+      if (!key || seenUrlKeys.has(key)) continue;
+      const domain = registrableDomain(doc.url);
+      if ((domainCounts.get(domain) ?? 0) >= maxPerDomain) continue;
+      recordDoc(doc, key, domain);
     }
   }
+
+  // Pass 2 (Backfill): Relax domain and minimum-length thresholds for sparse/short results.
+  if (selected.length < maxCount) {
+    for (let depth = 0; depth < maxDepth && selected.length < maxCount; depth++) {
+      for (const batch of rankedBatches) {
+        if (selected.length >= maxCount) break;
+        if (depth >= batch.length) continue;
+        const doc = batch[depth];
+        const key = normalizeUrlKey(doc.url);
+        if (!key || seenUrlKeys.has(key)) continue;
+        recordDoc(doc, key, registrableDomain(doc.url));
+      }
+    }
+  }
+
   return selected;
+}
+
+const IRRELEVANT_NOTE_RE =
+  /(?:^|\n)\s*-\s*Irrelevant to research question\.?\s*$/i;
+
+/**
+ * Water-filling fair-share token budgeter across research notes.
+ *
+ * Unlike sequential front-slicing (which drops later gap-filling rounds when an
+ * earlier source produced a long fallback excerpt), short notes keep their full
+ * text and donate unused budget to longer notes, while off-topic notes flagged
+ * `- Irrelevant to research question.` are shed first when over budget.
+ */
+export function budgetNotesFairly(
+  notes: string[],
+  tokenBudget: number,
+  opts?: {
+    separator?: string;
+    labelSources?: boolean;
+    trimMarker?: string;
+  },
+): { text: string; trimmedCount: number } {
+  if (notes.length === 0 || tokenBudget <= 0) {
+    return { text: "", trimmedCount: notes.length };
+  }
+
+  const sep = opts?.separator ?? "\n\n";
+  const charBudget = Math.max(0, tokenBudget) * 4;
+  const items = notes.map((note, idx) => ({
+    idx,
+    formatted: opts?.labelSources ? `[Source ${idx + 1}]\n${note}` : note,
+    irrelevant: IRRELEVANT_NOTE_RE.test(note.trim()),
+  }));
+
+  const fullJoined = items.map((it) => it.formatted).join(sep);
+  if (fullJoined.length <= charBudget) {
+    return { text: fullJoined, trimmedCount: 0 };
+  }
+
+  // Shed explicitly irrelevant notes first when over budget, provided at least one relevant note exists.
+  let active = items;
+  let droppedCount = 0;
+  const relevantItems = items.filter((it) => !it.irrelevant);
+  if (relevantItems.length > 0 && relevantItems.length < items.length) {
+    droppedCount = items.length - relevantItems.length;
+    active = relevantItems;
+    const relevantJoined = active.map((it) => it.formatted).join(sep);
+    if (relevantJoined.length <= charBudget) {
+      return { text: relevantJoined, trimmedCount: droppedCount };
+    }
+  }
+
+  const sepTotal = Math.max(0, active.length - 1) * sep.length;
+  let remainingPool = Math.max(0, charBudget - sepTotal);
+  const allocations = new Array<number>(active.length).fill(0);
+  const unlocked = new Set<number>(active.map((_, i) => i));
+
+  // Iterative water-filling: lock any note that fits within the current equal share.
+  while (unlocked.size > 0) {
+    const share = Math.floor(remainingPool / unlocked.size);
+    const fitsNow: number[] = [];
+    for (const i of unlocked) {
+      if (active[i].formatted.length <= share) {
+        fitsNow.push(i);
+      }
+    }
+    if (fitsNow.length === 0) break;
+    for (const i of fitsNow) {
+      allocations[i] = active[i].formatted.length;
+      remainingPool -= allocations[i];
+      unlocked.delete(i);
+    }
+  }
+
+  // Distribute remaining pool evenly across oversized notes.
+  if (unlocked.size > 0) {
+    const baseShare = Math.floor(remainingPool / unlocked.size);
+    let remainder = remainingPool - baseShare * unlocked.size;
+    for (const i of unlocked) {
+      allocations[i] = baseShare + (remainder > 0 ? 1 : 0);
+      if (remainder > 0) remainder -= 1;
+    }
+  }
+
+  let truncatedCount = 0;
+  const parts: string[] = [];
+  for (let i = 0; i < active.length; i++) {
+    const full = active[i].formatted;
+    const cap = allocations[i];
+    if (full.length <= cap) {
+      parts.push(full);
+    } else {
+      truncatedCount += 1;
+      const sliced = full.slice(0, cap);
+      parts.push(opts?.trimMarker ? `${sliced}\n${opts.trimMarker}` : sliced);
+    }
+  }
+
+  return {
+    text: parts.join(sep),
+    trimmedCount: droppedCount + truncatedCount,
+  };
 }
 
 function toResearchSource(doc: ExaDocument): ResearchSource {
@@ -167,11 +465,11 @@ function createTextPlanner(stage: StageRunner): Planner {
         timeout: { totalMs: serverConfig.planner.timeoutMs },
         maxRetries: 0,
       });
-      const parsed = parsePlainTextLines(result.text, { stopToken: "NO_SEARCH", maxLines: maxQueries });
-      return { stopped: parsed.stopped, queries: parsed.lines };
+      const parsed = parseQueryPlan(result.text, { maxQueries });
+      return { stopped: parsed.stopped, brief: parsed.brief, queries: parsed.queries };
     },
-    async planFollowUps({ query, priorQueries, notes, maxQueries, signal }) {
-      const system = buildGapCheckPrompt(maxQueries);
+    async planFollowUps({ query, priorQueries, notes, maxQueries, effortLevel, signal }) {
+      const system = buildGapCheckPrompt(maxQueries, effortLevel);
       const prompt = `User question:\n${query}\n\nQueries already run:\n${priorQueries.map((q) => `- ${q}`).join("\n")}\n\nGathered research notes so far:\n${notes}\n\nDecide whether these notes are sufficient ("DONE") or list up to ${maxQueries} follow-up search queries (one per line).`;
       const leased = await stage.lease({
         estInputTokens: estimateTokens(system) + estimateTokens(prompt),
@@ -317,18 +615,29 @@ export async function runResearchPipeline(opts: {
   const round1Id = `research-r1-${requestId}`;
   emitStep(round1Id, { round: 1, phase: "planning", queries: [], sources: [] });
 
+  const plannedInitialQueries =
+    effort.initialQueries > 0 ? effort.initialQueries : initialQueries;
   let round1Queries: string[] = [];
+  let effectiveQuery = query;
   let skipSearch = false;
   try {
     const parsed = await timed("planMs", () =>
-      planner.planQueries({ messages, maxQueries: initialQueries, signal, requestId }),
+      planner.planQueries({
+        messages,
+        maxQueries: plannedInitialQueries,
+        signal,
+        requestId,
+      }),
     );
+    if (parsed.brief?.trim()) {
+      effectiveQuery = parsed.brief.trim();
+    }
     if (parsed.stopped && explicitUrls.length === 0) {
       skipSearch = true;
     } else if (parsed.queries.length > 0) {
       round1Queries = parsed.queries;
     } else if (!parsed.stopped) {
-      round1Queries = [query.slice(0, MAX_QUERY_LENGTH)];
+      round1Queries = [effectiveQuery.slice(0, MAX_QUERY_LENGTH)];
     }
   } catch (error) {
     if (isAbortError(error) || signal?.aborted) throw error;
@@ -337,7 +646,13 @@ export async function runResearchPipeline(opts: {
     round1Queries = [query.slice(0, MAX_QUERY_LENGTH)];
   }
 
-  logInfo("research-plan", { requestId, skipSearch, queries: round1Queries, explicitUrls: explicitUrls.length });
+  logInfo("research-plan", {
+    requestId,
+    skipSearch,
+    brief: effectiveQuery !== query ? effectiveQuery : undefined,
+    queries: round1Queries,
+    explicitUrls: explicitUrls.length,
+  });
 
   if (skipSearch) {
     emitStep(round1Id, { round: 1, phase: "done", queries: [], sources: [] });
@@ -386,6 +701,7 @@ export async function runResearchPipeline(opts: {
       searchOutcomes.map((o) => o.docs),
       seenUrlKeys,
       Math.min(sourcesPerRound, maxSources - totalSources),
+      { query: effectiveQuery },
     );
 
     if (roundDocs.length === 0) {
@@ -419,7 +735,7 @@ export async function runResearchPipeline(opts: {
     emitStep(roundId, { round, phase: "reading", queries, sources: roundSources });
 
     const condensed = await timed("readMs", () =>
-      condenser.condense(roundDocs, { query, signal, requestId }),
+      condenser.condense(roundDocs, { query: effectiveQuery, signal, requestId }),
     );
     fallbackSources += condensed.fallbackCount;
     allNotes.push(...condensed.notes);
@@ -448,12 +764,17 @@ export async function runResearchPipeline(opts: {
 
     let followUpQueries: string[] = [];
     try {
+      const gapNotes = budgetNotesFairly(
+        allNotes,
+        serverConfig.gapCheck.notesTokenBudget,
+      ).text;
       const parsedGap = await timed("gapCheckMs", () =>
         planner.planFollowUps({
-          query,
+          query: effectiveQuery,
           priorQueries: allQueries,
-          notes: truncateToTokenBudget(allNotes.join("\n\n"), serverConfig.gapCheck.notesTokenBudget),
+          notes: gapNotes,
           maxQueries: effort.followUpQueries,
+          effortLevel: effort.level,
           signal,
           requestId,
         }),
@@ -477,37 +798,20 @@ export async function runResearchPipeline(opts: {
     nextQueries = followUpQueries;
   }
 
-  // Assemble the synthesis evidence under a token budget: whole notes are
-  // included in source order until the budget is hit, the note that crosses
-  // it is truncated, and any remaining notes are dropped. Trimming is
-  // disclosed via the degraded channel so synthesis can say evidence was cut.
-  const evidenceParts: string[] = [];
-  let usedTokens = 0;
-  let trimmedNotes = 0;
-  for (const [idx, note] of allNotes.entries()) {
-    const part = `[Source ${idx + 1}]\n${note}`;
-    const partTokens = estimateTokens(part);
-    if (usedTokens + partTokens <= evidenceBudget) {
-      evidenceParts.push(part);
-      usedTokens += partTokens;
-      continue;
-    }
-    const remaining = evidenceBudget - usedTokens;
-    if (remaining >= 100) {
-      evidenceParts.push(
-        `${truncateToTokenBudget(part, remaining)}\n[Note trimmed to fit the answer token budget]`,
-      );
-    }
-    // Every note from `idx` onward was truncated or dropped entirely.
-    trimmedNotes = allNotes.length - idx;
-    break;
-  }
-  if (trimmedNotes > 0) {
+  // Assemble synthesis evidence via water-filling fair-share budgeting so short
+  // notes from later gap-filling rounds are never dropped behind a long Round 1
+  // fallback excerpt. Trimming is disclosed via `degraded`.
+  const budgeted = budgetNotesFairly(allNotes, evidenceBudget, {
+    separator: "\n\n---\n\n",
+    labelSources: true,
+    trimMarker: "[Note trimmed to fit the answer token budget]",
+  });
+  if (budgeted.trimmedCount > 0) {
     failedStages.push(
-      `${trimmedNotes} research ${trimmedNotes === 1 ? "note was" : "notes were"} trimmed or omitted to fit the answer token budget`,
+      `${budgeted.trimmedCount} research ${budgeted.trimmedCount === 1 ? "note was" : "notes were"} trimmed or omitted to fit the answer token budget`,
     );
   }
-  const evidenceBlock = evidenceParts.join("\n\n---\n\n");
+  const evidenceBlock = budgeted.text;
   return {
     stats,
     searched: true,

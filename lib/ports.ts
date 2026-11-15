@@ -9,12 +9,13 @@ export interface Planner {
   planQueries(input: {
     messages: ModelMessage[];
     maxQueries: number;
-  } & PortContext): Promise<{ stopped: boolean; queries: string[] }>;
+  } & PortContext): Promise<{ stopped: boolean; brief?: string; queries: string[] }>;
   planFollowUps(input: {
     query: string;
     priorQueries: string[];
     notes: string;
     maxQueries: number;
+    effortLevel?: import("./effort").EffortLevel;
   } & PortContext): Promise<{ stopped: boolean; queries: string[] }>;
 }
 

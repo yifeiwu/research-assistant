@@ -122,4 +122,53 @@ describe("condenseSourcesDetailed (batched)", () => {
       groq: { reasoningEffort: "low", reasoningFormat: "parsed" },
     });
   });
+
+  it("includes deterministic domain/date headers and scales summary maxOutputTokens by model", async () => {
+    mockGenerate.mockResolvedValue({ text: "### Source 1\n- [Fact] 42% gain" } as never);
+    const qwenOut = await condenseSourcesDetailed(
+      [
+        {
+          url: "https://www.nature.com/articles/s41586-026-0001",
+          title: "Study",
+          publishedDate: "2026-05-10",
+          text: "x".repeat(4_000),
+        },
+      ],
+      { ...opts, stage: stageFor("qwen/qwen3.8-27b") },
+    );
+    expect(mockGenerate.mock.calls[0][0].maxOutputTokens).toBe(450);
+    expect(qwenOut.notes[0]).toContain("Domain: nature.com | Published: 2026-05-10");
+
+    mockGenerate.mockClear();
+    mockGenerate.mockResolvedValue({ text: "### Source 1\n- [Fact] 42% gain" } as never);
+    const gptOut = await condenseSourcesDetailed(
+      [{ url: "https://docs.example.org/spec", title: "Spec", text: "y".repeat(4_000) }],
+      { ...opts, stage: stageFor("openai/gpt-oss-20b") },
+    );
+    expect(mockGenerate.mock.calls[0][0].maxOutputTokens).toBe(650);
+    expect(gptOut.notes[0]).toContain("Domain: docs.example.org | Published: unlisted");
+  });
+
+  it("extracts deep query-relevant passages rather than only top-of-page filler", async () => {
+    mockGenerate.mockRejectedValue(new Error("429"));
+    const deepDoc: ExaDocument = {
+      url: "https://bench.dev/report",
+      title: "Benchmark Report",
+      text: [
+        "Introductory overview of the annual developer survey.",
+        "",
+        " Filler paragraph about unrelated topics.".repeat(120),
+        "",
+        "## Memory Throughput Results",
+        "",
+        "The Z900 accelerator achieved 4.8 TB/s sustained HBM4 bandwidth at 620W.",
+      ].join("\n"),
+    };
+    const out = await condenseSourcesDetailed([deepDoc], {
+      ...opts,
+      query: "Z900 HBM4 bandwidth throughput",
+    });
+    expect(out.fallbackCount).toBe(1);
+    expect(out.notes[0]).toContain("4.8 TB/s");
+  });
 });

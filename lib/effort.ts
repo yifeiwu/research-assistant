@@ -1,33 +1,37 @@
 /**
- * Research "effort" controls how long the research pipeline keeps going
- * before the answer is written. It changes two things only:
+ * Research "effort" controls how long and how broadly the research pipeline
+ * searches before the answer is written:
  *
+ * - `level`: the named effort tier ("low" | "medium" | "high").
  * - `rounds`: how many sequential research rounds may run. A round after the
  *   first only runs if the gap check over the notes so far asks for more.
+ * - `initialQueries`: how many diverse query angles Round 1 may plan.
  * - `followUpQueries`: how many follow-up searches each gap check may ask for.
  *
- * Everything else about a round is the same at every effort level and lives
- * in `serverConfig.research` (lib/config.ts): how many searches the first
- * round plans, how many results and sources each round reads, and the cap of
- * 2 parallel searches per conversation thread (lib/exa.ts).
+ * Per-round source caps and the limit of 2 parallel searches per conversation
+ * thread live in `serverConfig` (lib/config.ts, lib/exa.ts).
  *
  * - low:    no web research (0 rounds); the model answers directly.
- * - medium: up to 2 rounds.
- * - high:   up to 4 rounds.
+ * - medium: up to 2 rounds, 2 initial queries.
+ * - high:   up to 4 rounds, 3 initial queries (adds counterpoint/primary angle).
  */
 export type EffortLevel = "low" | "medium" | "high";
 
 export type EffortConfig = {
+  /** Selected effort tier. */
+  level: EffortLevel;
   /** Max sequential research rounds (0 = answer directly, no search). */
   rounds: number;
+  /** Max search queries planned in Round 1. */
+  initialQueries: number;
   /** Max follow-up search queries per gap check. */
   followUpQueries: number;
 };
 
 const EFFORT_CONFIG: Record<EffortLevel, EffortConfig> = {
-  low: { rounds: 0, followUpQueries: 0 },
-  medium: { rounds: 2, followUpQueries: 2 },
-  high: { rounds: 4, followUpQueries: 2 },
+  low: { level: "low", rounds: 0, initialQueries: 0, followUpQueries: 0 },
+  medium: { level: "medium", rounds: 2, initialQueries: 2, followUpQueries: 2 },
+  high: { level: "high", rounds: 4, initialQueries: 3, followUpQueries: 2 },
 };
 
 export const DEFAULT_EFFORT: EffortLevel = "medium";

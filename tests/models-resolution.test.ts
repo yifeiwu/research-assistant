@@ -4,6 +4,7 @@ import {
   GROQ_MODELS,
   fallbackModelsFor,
   groqReasoningOptions,
+  maxSummaryOutputTokens,
   maxSynthesisOutputTokens,
 } from "@/lib/models";
 
@@ -56,17 +57,25 @@ describe("per-model reasoning options and OTPM synthesis caps", () => {
     expect(maxSynthesisOutputTokens("qwen/qwen3.8-27b", 3_500)).toBe(900);
     expect(maxSynthesisOutputTokens("openai/gpt-oss-120b", 3_500)).toBe(3_500);
     expect(maxSynthesisOutputTokens("openai/gpt-oss-20b", 3_500)).toBe(3_500);
+    expect(maxSummaryOutputTokens("qwen/qwen3.8-27b", 650)).toBe(450);
+    expect(maxSummaryOutputTokens("openai/gpt-oss-20b", 650)).toBe(650);
   });
 
-  it("uses zero reasoning on Qwen auxiliary calls, low effort on GPT-OSS auxiliary calls, and omits options on unknown models", () => {
+  it("uses zero reasoning on Qwen auxiliary calls, low effort on GPT-OSS auxiliary calls, and effort-scaled synthesis reasoning on GPT-OSS", () => {
     expect(groqReasoningOptions("qwen/qwen3.8-27b", "auxiliary")).toEqual({
       groq: { reasoningEffort: "none", reasoningFormat: "hidden" },
     });
     expect(groqReasoningOptions("openai/gpt-oss-20b", "auxiliary")).toEqual({
       groq: { reasoningEffort: "low", reasoningFormat: "parsed" },
     });
-    expect(groqReasoningOptions("qwen/qwen3.8-27b", "synthesis")).toEqual({
+    expect(groqReasoningOptions("qwen/qwen3.8-27b", "synthesis", "high")).toEqual({
       groq: { reasoningFormat: "parsed" },
+    });
+    expect(groqReasoningOptions("openai/gpt-oss-120b", "synthesis", "high")).toEqual({
+      groq: { reasoningFormat: "parsed", reasoningEffort: "medium" },
+    });
+    expect(groqReasoningOptions("openai/gpt-oss-120b", "synthesis", "low")).toEqual({
+      groq: { reasoningFormat: "parsed", reasoningEffort: "low" },
     });
     expect(groqReasoningOptions("custom/non-reasoning", "synthesis")).toBeUndefined();
   });

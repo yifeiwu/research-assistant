@@ -6,6 +6,7 @@ import { logError, logInfo } from "@/lib/logger";
 import type { BudgetDimension, GroqBudget } from "./groq-budget";
 import {
   groqReasoningOptions,
+  maxSummaryOutputTokens,
   maxSynthesisOutputTokens,
   type GroqModelRole,
 } from "@/lib/models";
@@ -297,6 +298,12 @@ export function rewriteGroqRequestBody(
 
   if (groqOpts?.reasoningEffort) {
     parsed.reasoning_effort = groqOpts.reasoningEffort;
+  } else if (
+    stage === "synthesis" &&
+    (parsed.reasoning_effort === "low" || parsed.reasoning_effort === "medium") &&
+    maxSynthesisOutputTokens(targetModel, synthesisDefaultMaxTokens) >= 1_500
+  ) {
+    // Preserve caller-chosen synthesis reasoning effort across high-OTPM GPT-OSS fallbacks.
   } else {
     delete parsed.reasoning_effort;
   }
@@ -305,6 +312,11 @@ export function rewriteGroqRequestBody(
     parsed.max_tokens = maxSynthesisOutputTokens(
       targetModel,
       synthesisDefaultMaxTokens,
+    );
+  } else if (stage === "summary" && typeof parsed.max_tokens === "number") {
+    parsed.max_tokens = Math.min(
+      parsed.max_tokens,
+      maxSummaryOutputTokens(targetModel, serverConfig.summary.batchMaxOutputTokens),
     );
   }
 

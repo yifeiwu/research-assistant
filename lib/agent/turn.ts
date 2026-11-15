@@ -281,19 +281,24 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
       throw new TurnDeferredError("handoff", 0);
     }
 
-    const system = outcome.searched
-      ? buildSynthesisPrompt(outcome.evidenceBlock, outcome.degraded)
-      : buildDirectAnswerPrompt(outcome.degraded, outcome.searchFailed);
     // Bounded per-model output reservation (e.g. 900 on Qwen's 1k OTPM
     // bucket, 3,500 on GPT-OSS).
     const outputTokensFor = (modelId: string) =>
       maxSynthesisOutputTokens(modelId, serverConfig.synthesis.maxOutputTokens);
+    const buildSystemFor = (modelId: string) =>
+      outcome.searched
+        ? buildSynthesisPrompt(outcome.evidenceBlock, outcome.degraded, {
+            effort: input.effort.level,
+            maxOutputTokens: outputTokensFor(modelId),
+          })
+        : buildDirectAnswerPrompt(outcome.degraded, outcome.searchFailed);
+    const initialSystem = buildSystemFor(resolved.selectedModel);
 
     let leased: StageLease;
     try {
       leased = await resolved.stages.synthesis.lease({
         estInputTokens:
-          estimateTokens(system) + estimateTokens(JSON.stringify(input.modelMessages)),
+          estimateTokens(initialSystem) + estimateTokens(JSON.stringify(input.modelMessages)),
         maxOutputTokens: outputTokensFor,
         signal,
       });
@@ -321,6 +326,10 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
       };
     }
     activeModelInfo = `groq ${leased.modelId}`;
+    const system =
+      leased.modelId === resolved.selectedModel
+        ? initialSystem
+        : buildSystemFor(leased.modelId);
 
     // The wait for the model's window may have used up the time the answer
     // was going to have. Research is checkpointed, so hand the turn over.
@@ -339,7 +348,11 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
       model: leased.model,
       system,
       messages: input.modelMessages,
-      providerOptions: groqReasoningOptions(leased.modelId, "synthesis"),
+      providerOptions: groqReasoningOptions(
+        leased.modelId,
+        "synthesis",
+        input.effort.level,
+      ),
       // Waiting and model choice are owned by the scheduler, and surprise
       // 429s by `createResilientGroqFetch`, so AI SDK blind retries are
       // disabled.

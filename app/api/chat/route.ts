@@ -17,7 +17,6 @@ import {
 import {
   startChatStream,
   abortChatStream,
-  isChatId,
 } from "@/lib/agent/chat-stream";
 import {
   discardDetachedTurn,
@@ -78,9 +77,8 @@ export async function POST(req: Request) {
 
   const { model, effort: rawEffort, id: rawChatId } = parsed.data;
   const messages = parsed.data.messages as unknown as UIMessage[];
-  // The run buffer is keyed by chat, so a request without a usable chat id
-  // gets one of its own.
-  const chatId = rawChatId && isChatId(rawChatId) ? rawChatId : crypto.randomUUID();
+  // The run buffer is keyed by chat, so a request without a chat id gets one of its own.
+  const chatId = rawChatId ?? crypto.randomUUID();
 
   const effort = effortConfig(rawEffort);
   if (effort.rounds > 0 && !process.env.EXA_API_KEY?.trim()) {
@@ -117,7 +115,7 @@ export async function POST(req: Request) {
 
   logInfo("request", {
     requestId,
-    model: `groq ${plan.selectedModel}`,
+    model: plan.selectedModel,
     plannerModel: plan.candidates.planner[0],
     summaryModel: plan.candidates.summary[0],
     messageCount: messages.length,

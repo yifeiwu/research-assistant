@@ -176,14 +176,11 @@ describe("condenseSourcesDetailed (batched)", () => {
     expect(out.notes[0]).toContain("4.8 TB/s");
   });
 
-  it("splits high-effort rounds into 2-source micro-batches, retries transient 429s when patientWait is set, and extracts/strips Primary-Refs", async () => {
+  it("splits high-effort rounds into 2-source micro-batches, passes patient lease waits, and extracts/strips Primary-Refs", async () => {
     let call = 0;
     mockGenerate.mockImplementation((async () => {
       call += 1;
       if (call === 1) {
-        throw new Error("Rate limit reached (429): try again in 3s");
-      }
-      if (call === 2) {
         return {
           text: [
             "### Source 1",
@@ -238,8 +235,7 @@ describe("condenseSourcesDetailed (batched)", () => {
       disableCache: true,
     });
 
-    // 2 micro-batches total, with micro-batch 1 retried once after the 429 -> 3 generateText calls.
-    expect(mockGenerate).toHaveBeenCalledTimes(3);
+    expect(mockGenerate).toHaveBeenCalledTimes(2);
     expect(leaseWaits.every((w) => w && w >= 40_000)).toBe(true);
     expect(out.fallbackCount).toBe(0);
     expect(out.notes).toHaveLength(4);

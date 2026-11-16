@@ -7,7 +7,6 @@ import { serverConfig } from "./config";
 import { maxSummaryOutputTokens } from "./models";
 import { normalizeCacheText, requestCache, type RequestCache } from "./cache";
 import { buildThematicReducePrompt } from "./prompts";
-import type { PrimaryReferences } from "./ports";
 import { domainOf, extractUrls, normalizeUrlKey } from "./sources";
 import { estimateTokens } from "./tokens";
 import { generateAuxiliaryText, type StageRunner } from "./agent/stage";
@@ -16,6 +15,11 @@ const PASSTHROUGH_CHAR_LIMIT = serverConfig.summary.passthroughCharLimit;
 const BATCH_INPUT_CHAR_CAP = serverConfig.summary.batchInputCharCap;
 const PER_SOURCE_INPUT_CHAR_CAP = serverConfig.summary.perSourceInputCharCap;
 const FALLBACK_CHAR_CAP = serverConfig.summary.fallbackCharCap;
+
+export type PrimaryReferences = {
+  urls: string[];
+  queries: string[];
+};
 
 /**
  * Strip inline `<think>...</think>` blocks emitted by open-weight reasoning
@@ -66,7 +70,7 @@ export type CondenseOpts = {
   batchSize?: number;
   /** Optional per-source input excerpt cap (e.g. 4,500 chars on 2-source micro-batches). */
   perSourceCharCap?: number;
-  /** Wait patiently for rolling Groq token windows & retry once on rate-limit errors. */
+  /** Wait patiently for rolling Groq token windows in the scheduler. */
   patientWait?: boolean;
   /** Extract cited primary-source URLs and study/filing titles for cross-round citation hopping. */
   extractPrimaryRefs?: boolean;
@@ -92,12 +96,6 @@ const NON_PRIMARY_SOCIAL_HOST_RE =
   /(?:^|\.)(?:twitter\.com|x\.com|facebook\.com|instagram\.com|linkedin\.com|youtube\.com|youtu\.be|tiktok\.com|reddit\.com|pinterest\.com)$/i;
 
 const PRIMARY_REF_LINE_RE = /^\s*-\s*Primary-Ref\s*:\s*(.+)$/gim;
-
-function isRetryableRateError(error: unknown): boolean {
-  if (!error || isAbortError(error)) return false;
-  const msg = error instanceof Error ? error.message : String(error);
-  return /\b429\b|rate[ -]?limit|budget.*exhausted|tokens per minute|try again in/i.test(msg);
-}
 
 function isUsablePrimaryHopUrl(candidateUrl: string, selfKey: string): boolean {
   const key = normalizeUrlKey(candidateUrl);
@@ -316,32 +314,19 @@ export async function condenseSourcesDetailed(
           deep: isDeepMicroBatch,
           extractPrimaryRefs: opts.extractPrimaryRefs,
         });
-        const maxAttempts = opts.patientWait ? 2 : 1;
-        let lastErr: unknown;
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          try {
-            const text = await generateAuxiliaryText({
-              stage: opts.stage,
-              system: SUMMARY_SYSTEM_PROMPT,
-              prompt,
-              maxOutputTokens: summaryTokensFor,
-              timeoutMs: serverConfig.summary.timeoutMs,
-              maxWaitMs: leaseWaitMs,
-            });
-            const notes = parseBatchNotes(text, entries.length);
-            if (notes.every((n) => n === null)) {
-              throw new Error("Summarizer returned no parseable source notes");
-            }
-            return notes;
-          } catch (err) {
-            lastErr = err;
-            if (attempt < maxAttempts && isRetryableRateError(err)) {
-              continue;
-            }
-            throw err;
-          }
+        const text = await generateAuxiliaryText({
+          stage: opts.stage,
+          system: SUMMARY_SYSTEM_PROMPT,
+          prompt,
+          maxOutputTokens: summaryTokensFor,
+          timeoutMs: serverConfig.summary.timeoutMs,
+          maxWaitMs: leaseWaitMs,
+        });
+        const notes = parseBatchNotes(text, entries.length);
+        if (notes.every((n) => n === null)) {
+          throw new Error("Summarizer returned no parseable source notes");
         }
-        throw lastErr;
+        return notes;
       };
 
       try {

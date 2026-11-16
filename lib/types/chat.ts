@@ -2,6 +2,8 @@ import { z } from "zod";
 import type { UIMessage } from "ai";
 import type { EffortLevel } from "@/lib/effort";
 
+export const CHAT_ID_REGEX = /^[\w-]{8,80}$/;
+
 /** A single web source retrieved during deterministic research. */
 export type ResearchSource = {
   url: string;
@@ -20,15 +22,8 @@ export type ResearchStepPhase =
   | "done"
   | "error";
 
-/** Structured evidence-quality signal when part of a research round failed. */
-export type DegradedResearch = {
-  failedQueries: string[];
-  failedContents: boolean;
-  fallbackSources: number;
-  /** Human-readable failures of non-retrieval stages (planning, gap check). */
-  failedStages?: string[];
-  messages: string[];
-};
+/** Human-readable reasons when part of a research round degraded. */
+export type DegradedResearch = string[];
 
 /** Payload carried by a `data-research-step` UI message part. */
 export type ResearchStepData = {
@@ -97,46 +92,26 @@ export type ChatRequestBody = Omit<ChatRequest, "messages">;
 /**
  * Upper bounds on the request payload. These guard against unbounded histories
  * (context blowups / memory pressure) and malformed clients; normal usage stays
- * well under them. `pruneAssistantHistory` already trims prior research payloads, so
- * the character cap mostly bounds pathological inputs.
+ * well under them.
  */
 const MAX_MESSAGES = 200;
 const MAX_TOTAL_MESSAGE_CHARS = 500_000;
 
-/**
- * A single message part. We only assert the discriminating `type` field and
- * keep every other key (`text`, `data`, `url`, etc.) via `looseObject`, since
- * the downstream AI SDK reads those fields directly.
- */
 const messagePartSchema = z.looseObject({
   type: z.string(),
 });
 
-/**
- * Structural validation for a UI message. The shape is intentionally close to
- * the AI SDK's `UIMessage`, but unknown keys are preserved so nothing the SDK
- * relies on is stripped before it runs.
- */
 const uiMessageSchema = z.looseObject({
   role: z.enum(["system", "user", "assistant"]),
   parts: z.array(messagePartSchema),
 });
 
-/**
- * Structural validation for the request body. `messages` must be a non-empty
- * array of well-formed UI messages within the size caps; `effort` is left
- * loose here and coerced downstream by `effortConfig`. Unknown keys (such as
- * a legacy `provider` from an old cached client) are stripped by Zod.
- */
 export const chatRequestSchema = z
   .object({
     messages: z.array(uiMessageSchema).min(1).max(MAX_MESSAGES),
-    // Must match `isChatId` in lib/agent/chat-stream: an id outside this
-    // alphabet can never address a Redis stream, so reject it with a 400
-    // here instead of silently running an unresumable generation.
     id: z
       .string()
-      .regex(/^[\w-]{8,80}$/, "id must be 8-80 word characters or hyphens")
+      .regex(CHAT_ID_REGEX, "id must be 8-80 word characters or hyphens")
       .optional(),
     model: z.string().optional(),
     effort: z.unknown().optional(),

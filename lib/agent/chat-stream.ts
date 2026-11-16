@@ -3,6 +3,7 @@ import { UI_MESSAGE_STREAM_HEADERS } from "ai";
 import { sleepUntilAborted } from "@/lib/errors";
 import { redis } from "@/lib/redis";
 import { logError, logInfo } from "@/lib/logger";
+import { CHAT_ID_REGEX } from "@/lib/types/chat";
 
 /**
  * Distributed SSE stream buffer and cancellation coordinator backed by Upstash
@@ -97,7 +98,7 @@ function stopTurnKey(chatId: string, turnId: string): string {
 }
 
 export function isChatId(value: string): boolean {
-  return /^[\w-]{8,80}$/.test(value);
+  return CHAT_ID_REGEX.test(value);
 }
 
 export function isTurnId(value: unknown): value is string {

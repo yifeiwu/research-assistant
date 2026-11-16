@@ -1,13 +1,10 @@
 /**
  * Turn raw chat errors into something a user can act on.
  *
- * In production React throws minified errors ("Minified React error #185;
- * visit https://react.dev/errors/185 …") and provider SDKs surface long
- * rate-limit strings, so rendering `error.message` verbatim — under a
- * generic "check your API keys" hint — is actively misleading. This maps
- * the failures we actually see to a title, a plain-language detail, and a
- * hint that matches the cause. The raw message is kept in `technical` so
- * the UI can tuck it behind a disclosure for bug reports.
+ * Provider SDKs surface verbose rate-limit strings and generic HTTP failures,
+ * so rendering `error.message` verbatim is misleading. This maps the failures
+ * we actually see to a title, a plain-language detail, and an actionable hint.
+ * The raw message is kept in `technical` for a collapsed disclosure.
  */
 export type ChatErrorInfo = {
   title: string;
@@ -25,31 +22,6 @@ function truncate(text: string): string {
     : text;
 }
 
-/** Known decodings for the minified React errors we can hit in production. */
-const REACT_ERROR_MEANINGS: Record<number, string> = {
-  185:
-    "Maximum update depth exceeded — a component kept triggering state " +
-    "updates while rendering, so React stopped it to prevent an infinite " +
-    "loop. This is a bug in this page, not a problem with the model, the " +
-    "server, or your API keys; the server may well have finished its answer.",
-  418: "The server-rendered page didn't match what React expected on the client (hydration mismatch), so React discarded and re-rendered it.",
-  423: "React tried to update a component tree that was suspended in an unexpected place.",
-  425: "React couldn't update the page because a component suspended while it was still rendering text.",
-};
-
-function describeReactError(code: number, raw: string): ChatErrorInfo {
-  const meaning = REACT_ERROR_MEANINGS[code];
-  return {
-    title: `Client-side rendering error (React #${code})`,
-    detail: meaning ?? `React hit an internal error (#${code}) while updating the page.`,
-    hint:
-      code === 185
-        ? "Retry the message; if it happens again, reload the page. If it keeps happening on this conversation, start a new chat — no need to change models or API keys."
-        : "Retry the message, or reload the page if it persists.",
-    technical: truncate(raw),
-  };
-}
-
 function describeRateLimit(raw: string): ChatErrorInfo | null {
   if (!/rate limit/i.test(raw)) return null;
   const model = /model `([^`]+)`/.exec(raw)?.[1];
@@ -65,8 +37,8 @@ function describeRateLimit(raw: string): ChatErrorInfo | null {
     title: "Model rate limit reached",
     detail: `Groq reports ${bits.join(" ")}. The free-tier per-minute budget is shared across search planning, summarising, and the final answer, so back-to-back questions can exhaust it.`,
     hint: retryIn
-      ? `Wait about ${retryIn} and retry — no need to switch models or change API keys.`
-      : "Wait a few seconds and retry — no need to switch models or change API keys.",
+      ? `Wait about ${retryIn} and retry, or pick a different model below.`
+      : "Wait a few seconds and retry, or pick a different model below.",
     technical: truncate(raw),
   };
 }
@@ -74,14 +46,6 @@ function describeRateLimit(raw: string): ChatErrorInfo | null {
 export function describeChatError(err: unknown): ChatErrorInfo {
   const raw = err instanceof Error ? err.message : String(err ?? "");
   const message = raw.trim();
-
-  // Minified React errors: "Minified React error #185; visit
-  // https://react.dev/errors/185?args[]=…" — decode the number.
-  const reactCode = /Minified React error #(\d+)/.exec(message);
-  if (reactCode) return describeReactError(Number(reactCode[1]), message);
-  if (/Maximum update depth exceeded/i.test(message)) {
-    return describeReactError(185, message);
-  }
 
   if (/sending messages too quickly/i.test(message)) {
     return {
@@ -122,7 +86,7 @@ export function describeChatError(err: unknown): ChatErrorInfo {
     return {
       title: "The request timed out",
       detail: "The model or a search step took longer than its time budget and was stopped.",
-      hint: "Retry the message; a simpler question or lower effort in Settings may finish faster.",
+      hint: "Retry the message; a simpler question or lower Effort in the composer may finish faster.",
       technical: truncate(message),
     };
   }
@@ -131,7 +95,7 @@ export function describeChatError(err: unknown): ChatErrorInfo {
     return {
       title: "API key rejected",
       detail: "The model provider refused the request credentials (missing, invalid, or expired API key).",
-      hint: "Check that the provider API keys are set correctly in Settings / server environment, then retry.",
+      hint: "Check that GROQ_API_KEY is configured correctly in the server environment, then retry.",
       technical: truncate(message),
     };
   }
@@ -140,7 +104,7 @@ export function describeChatError(err: unknown): ChatErrorInfo {
     return {
       title: "Request too large for the model",
       detail: "The assembled prompt (history plus research notes) exceeded the model's per-request token limit.",
-      hint: "Retry, or lower the effort in Settings so less research is gathered; starting a new chat also clears long history.",
+      hint: "Retry, or lower the Effort in the composer so less research is gathered; starting a new chat also clears long history.",
       technical: truncate(message),
     };
   }
@@ -149,7 +113,7 @@ export function describeChatError(err: unknown): ChatErrorInfo {
     return {
       title: "Model not available",
       detail: "The configured model name wasn't found at the provider — it may have been renamed or retired.",
-      hint: "Pick a different model in Settings, or update the configured model, then retry.",
+      hint: "Pick a different model in the composer, then retry.",
       technical: truncate(message),
     };
   }

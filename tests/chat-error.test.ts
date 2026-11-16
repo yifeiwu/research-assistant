@@ -2,36 +2,12 @@ import { describe, expect, it } from "vitest";
 import { describeChatError } from "@/lib/chat-error";
 
 describe("describeChatError", () => {
-  it("decodes minified React error #185 instead of blaming models/API keys", () => {
-    const info = describeChatError(
-      new Error(
-        "Minified React error #185; visit https://react.dev/errors/185 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.",
-      ),
-    );
-    expect(info.title).toContain("React #185");
-    expect(info.detail).toContain("Maximum update depth exceeded");
-    expect(info.detail).toContain("not a problem with the model");
-    expect(info.hint).toContain("reload the page");
-    expect(info.hint).not.toContain("API keys are set");
-    // Raw minified string is kept, but only as collapsed technical detail.
-    expect(info.technical).toContain("Minified React error #185");
-  });
-
-  it("decodes the unminified maximum-update-depth message too", () => {
-    const info = describeChatError(
-      new Error("Maximum update depth exceeded. This can happen when a component calls setState inside useEffect."),
-    );
-    expect(info.title).toContain("React #185");
-  });
-
   it("explains a full or slow research queue as a busy server, not a failure", () => {
-    // The HTTP 429 body when the queue is full...
     const rejected = describeChatError(
       new Error(
         '{"error":"The server is busy with other research requests right now. Please try again in a moment."}',
       ),
     );
-    // ...and the in-stream error when a queued turn waited too long.
     const timedOut = describeChatError(
       new Error(
         "The server is busy with other research requests right now, and this one waited too long in the queue. Please try again in a minute.",
@@ -41,12 +17,6 @@ describe("describeChatError", () => {
       expect(info.title).toBe("The server is busy");
       expect(info.hint).toContain("retry");
     }
-  });
-
-  it("labels unknown React codes generically but descriptively", () => {
-    const info = describeChatError(new Error("Minified React error #999; visit https://react.dev/errors/999"));
-    expect(info.title).toBe("Client-side rendering error (React #999)");
-    expect(info.detail).toContain("#999");
   });
 
   it("parses Groq rate limits with model, window, and retry delay", () => {

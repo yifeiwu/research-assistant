@@ -185,9 +185,8 @@ describe("runResearchPipeline", () => {
     });
     expect(outcome.searched).toBe(true);
     expect(outcome.sources).toHaveLength(1);
-    expect(outcome.degraded?.failedQueries).toEqual(["bad query"]);
-    expect(outcome.degraded?.fallbackSources).toBe(1);
-    expect(outcome.degraded?.messages.join(" ")).toContain("failed");
+    expect(outcome.degraded?.join("; ")).toContain("1 search query failed");
+    expect(outcome.degraded?.join("; ")).toContain("1 source could only be partially read");
     const doneSteps = chunks.filter((c) => c.data?.phase === "done");
     expect(doneSteps.at(-1)?.data?.degraded).toBeTruthy();
   });
@@ -215,7 +214,7 @@ describe("runResearchPipeline", () => {
     });
     expect(outcome.searched).toBe(false);
     expect(outcome.searchFailed).toBe(true);
-    expect(outcome.degraded?.failedQueries).toEqual(["q1"]);
+    expect(outcome.degraded).toEqual(["1 search query failed"]);
   });
 
   it("surfaces planner failure and partial explicit-URL fetches as degraded, executing fetchContents and search sequentially", async () => {
@@ -260,8 +259,8 @@ describe("runResearchPipeline", () => {
     expect(outcome.searched).toBe(true);
     // Zero parallel Exa calls even when explicit URLs and search run in Round 1!
     expect(maxConcurrentExa).toBe(1);
-    expect(outcome.degraded?.failedContents).toBe(true);
-    expect(outcome.degraded?.failedStages?.join(" ")).toContain("query planning failed");
+    expect(outcome.degraded?.join("; ")).toContain("explicit URLs could not be fetched");
+    expect(outcome.degraded?.join("; ")).toContain("query planning failed");
   });
 
   it("reports how many rounds ran and where the time went", async () => {
@@ -328,7 +327,7 @@ describe("runResearchPipeline", () => {
     // 3,000-token budget ≈ 12,000 chars plus headers/markers.
     expect(outcome.evidenceBlock.length).toBeLessThan(13_000);
     expect(outcome.evidenceBlock).toContain("trimmed to fit");
-    expect(outcome.degraded?.messages.join(" ")).toContain("token budget");
+    expect(outcome.degraded?.join(" ")).toContain("token budget");
   });
 
   it("runs sequential single-query rounds until the gap check says DONE", async () => {

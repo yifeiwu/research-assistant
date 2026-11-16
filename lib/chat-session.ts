@@ -50,7 +50,7 @@ function requestUrl(input: RequestInfo | URL): string {
  */
 export function createChatSession(
   chatId: string,
-  opts?: { fetch?: typeof globalThis.fetch },
+  opts?: { fetch?: typeof globalThis.fetch; initialMessages?: UIMessage[] },
 ): ChatSession {
   const doFetch: typeof globalThis.fetch = (input, init) =>
     (opts?.fetch ?? globalThis.fetch)(input, init);
@@ -108,6 +108,7 @@ export function createChatSession(
 
   const chat = new Chat<UIMessage>({
     id: chatId,
+    messages: opts?.initialMessages,
     transport,
     onError: (err) => {
       lastErrorWasNetwork = isNetworkError(err);

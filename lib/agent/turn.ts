@@ -179,7 +179,7 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
   };
 
   let activeWriter: UIMessageStreamWriter<ChatUIMessage> | undefined;
-  let activeModelInfo = "";
+  let activeModelId = "";
   let statusShown = !input.emitStart;
 
   const writeStatus = (data: TurnStatusData) => {
@@ -199,7 +199,7 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
   const resolved = deps.resolveModels({
     model: input.requestedModel,
     onSynthesisFallback: (event) => {
-      activeModelInfo = `groq ${event.to}`;
+      activeModelId = event.to;
       activeWriter?.write({
         type: "data-model-fallback",
         id: `model-fallback-${requestId}`,
@@ -225,7 +225,7 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
     },
   });
   if (isResolutionError(resolved)) return resolved;
-  activeModelInfo = resolved.modelInfo;
+  activeModelId = resolved.selectedModel;
 
   let allowedSources: ResearchSource[] = [];
   let releaseSlot: (() => Promise<void>) | undefined;
@@ -377,7 +377,7 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
         waitedMs: 0,
       };
     }
-    activeModelInfo = `groq ${leased.modelId}`;
+    activeModelId = leased.modelId;
     const system =
       leased.modelId === resolved.selectedModel
         ? initialSystem
@@ -411,10 +411,10 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
       },
       abortSignal: signal,
       onAbort: () => {
-        logInfo("abort", { requestId, model: activeModelInfo });
+        logInfo("abort", { requestId, model: activeModelId });
       },
       onError: ({ error }) => {
-        logError("streamText", error, { requestId, model: activeModelInfo });
+        logError("streamText", error, { requestId, model: activeModelId });
       },
       onFinish: ({ finishReason, usage }) => {
         answer.endedAt = deps.now();
@@ -426,7 +426,7 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
         };
         logInfo("finish", {
           requestId,
-          model: activeModelInfo,
+          model: activeModelId,
           finishReason,
           searched: outcome.searched,
           sources: outcome.totalSources,
@@ -438,7 +438,7 @@ export function startTurn(input: TurnInput): TurnAttempt | ModelResolutionError 
 
   const pipeline = createPipelineStream(execute, {
     requestId,
-    modelInfo: () => activeModelInfo,
+    modelId: () => activeModelId,
     signal,
     getAllowedSources: () => allowedSources,
     emitStart: input.emitStart,

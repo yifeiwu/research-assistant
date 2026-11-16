@@ -7,7 +7,7 @@ describe("verifyCitations", () => {
   it("keeps verified citations untouched (www/trailing-slash variants)", () => {
     const text = "See [A](https://example.com/a) and https://example.com/a.";
     const out = verifyCitations(text, sources);
-    expect(out.verifiedCount).toBeGreaterThanOrEqual(1);
+    expect(out.strippedCount).toBe(0);
     expect(out.text).toContain("[A](https://example.com/a)");
   });
   it("de-links invented markdown citations, keeping the label", () => {
@@ -35,7 +35,6 @@ describe("verifyCitations", () => {
     const out = verifyCitations("See https://example.com/a.", sources);
     expect(out.text).toContain("https://example.com/a");
     expect(out.strippedCount).toBe(0);
-    expect(out.verifiedCount).toBe(1);
   });
   it("keeps parenthesised URLs in markdown links", () => {
     const wiki = [{ url: "https://en.wikipedia.org/wiki/Foo_(bar)" }];

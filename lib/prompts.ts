@@ -28,9 +28,9 @@ export function buildDirectAnswerPrompt(
   searchFailed?: boolean,
 ): string {
   const failureLine = searchFailed
-    ? `\n- Web research was attempted but no sources could be retrieved${degraded ? ` (${degraded.messages.join("; ")})` : ""}. Begin by briefly disclosing that web research failed and this answer is based on your own knowledge only, which may be out of date. Do not answer with false confidence about recent or specific facts.`
-    : degraded
-      ? `\n- Research was partially degraded (${degraded.messages.join("; ")}). Disclose that some evidence could not be retrieved.`
+    ? `\n- Web research was attempted but no sources could be retrieved${degraded?.length ? ` (${degraded.join("; ")})` : ""}. Begin by briefly disclosing that web research failed and this answer is based on your own knowledge only, which may be out of date. Do not answer with false confidence about recent or specific facts.`
+    : degraded?.length
+      ? `\n- Research was partially degraded (${degraded.join("; ")}). Disclose that some evidence could not be retrieved.`
       : "";
   return `${currentDateLine()}
 
@@ -174,8 +174,8 @@ export function buildSynthesisPrompt(
   degraded?: import("./types/chat").DegradedResearch,
   opts?: SynthesisPromptOptions,
 ): string {
-  const degradedLine = degraded
-    ? `\n- Research was partially degraded (${degraded.messages.join("; ")}). Disclose briefly that some evidence could not be retrieved or was trimmed rather than answering with false confidence.`
+  const degradedLine = degraded?.length
+    ? `\n- Research was partially degraded (${degraded.join("; ")}). Disclose briefly that some evidence could not be retrieved or was trimmed rather than answering with false confidence.`
     : "";
 
   const isCompactBudget =

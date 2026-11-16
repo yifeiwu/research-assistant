@@ -29,7 +29,6 @@ export type ResolvedModels = {
    * scheduler could neither grant nor usefully defer.
    */
   mainModel: LanguageModel;
-  modelInfo: string;
   /**
    * How every stage gets its model: lease before each call. Each stage's
    * `primaryModelId` is the model it prefers.
@@ -206,7 +205,6 @@ export function resolveModels(input: {
   return {
     selectedModel,
     mainModel: modelFor("synthesis", selectedModel),
-    modelInfo: `groq ${selectedModel}`,
     stages: {
       synthesis: stageRunner("synthesis"),
       planner: stageRunner("planner"),

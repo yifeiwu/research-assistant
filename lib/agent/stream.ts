@@ -52,7 +52,7 @@ function rootError(error: unknown): unknown {
  */
 function rateLimitMessage(
   error: unknown,
-  modelInfo?: string,
+  modelId?: string,
 ): string | undefined {
   const root = rootError(error);
   const rawMessage =
@@ -63,9 +63,8 @@ function rateLimitMessage(
     /rate limit reached|rate limit exceeded|too many requests/i.test(rawMessage);
   if (!isRateLimit) return undefined;
 
-  const idFromInfo = modelInfo?.replace(/^groq\s+/, "");
   const idFromMessage = rawMessage.match(/model `([^`]+)`/)?.[1];
-  const label = groqModelLabel(idFromInfo ?? idFromMessage);
+  const label = groqModelLabel(modelId ?? idFromMessage);
 
   // Only a duration is taken from the provider's text ("7.66s", "1m30s").
   const retryIn = rawMessage.match(
@@ -77,7 +76,7 @@ function rateLimitMessage(
 
   return (
     `You've hit the rate limit for ${label}.` +
-    `${waitHint} switch to a different model in Settings and send your message again.`
+    `${waitHint} pick a different model below and send your message again.`
   );
 }
 
@@ -99,9 +98,9 @@ function isTimeoutError(error: unknown): boolean {
  */
 function clientErrorMessage(
   error: unknown,
-  ctx: { requestId: string; modelInfo?: string },
+  ctx: { requestId: string; modelId?: string },
 ): string {
-  const rateLimited = rateLimitMessage(error, ctx.modelInfo);
+  const rateLimited = rateLimitMessage(error, ctx.modelId);
   if (rateLimited) return rateLimited;
 
   const root = rootError(error);
@@ -138,11 +137,11 @@ function clientErrorMessage(
 function noAnswerMessage(finishReason: string | undefined): string {
   switch (finishReason) {
     case "length":
-      return "I ran out of output space before I could finish answering. This can happen when a reasoning model spends its whole token budget thinking. Please try again, or switch to a different model in Settings.";
+      return "I ran out of output space before I could finish answering. This can happen when a reasoning model spends its whole token budget thinking. Please try again, or pick a different model below.";
     case "content-filter":
       return "The response was blocked by the model's content filter before an answer could be produced. Try rephrasing your question.";
     default:
-      return "I finished without producing an answer. This can happen intermittently with some models — try sending the message again, or switch models in Settings.";
+      return "I finished without producing an answer. This can happen intermittently with some models — try sending the message again, or pick a different model below.";
   }
 }
 
@@ -163,7 +162,7 @@ export function createPipelineStream(
   run: (writer: UIMessageStreamWriter<ChatUIMessage>) => Promise<StreamResult>,
   ctx: {
     requestId: string;
-    modelInfo: string | (() => string);
+    modelId: string | (() => string);
     signal?: AbortSignal;
     /** Live lookup for this turn's retrieved sources (citation allowlist). */
     getAllowedSources?: () => ResearchSource[];
@@ -183,8 +182,8 @@ export function createPipelineStream(
     onFailed?: () => void;
   },
 ): PipelineStream {
-  const currentModelInfo = () =>
-    typeof ctx.modelInfo === "function" ? ctx.modelInfo() : ctx.modelInfo;
+  const currentModelId = () =>
+    typeof ctx.modelId === "function" ? ctx.modelId() : ctx.modelId;
 
   let deferral: TurnDeferredError | undefined;
   let settle!: (value: TurnDeferredError | undefined) => void;
@@ -216,7 +215,7 @@ export function createPipelineStream(
         return;
       }
       if (isAbortError(error) || ctx.signal?.aborted) {
-        logInfo("abort", { requestId: ctx.requestId, model: currentModelInfo() });
+        logInfo("abort", { requestId: ctx.requestId, model: currentModelId() });
         writer.write({ type: "abort" });
         return;
       }
@@ -231,7 +230,7 @@ export function createPipelineStream(
         onError: (error) =>
           clientErrorMessage(error, {
             requestId: ctx.requestId,
-            modelInfo: currentModelInfo(),
+            modelId: currentModelId(),
           }),
       })
       .getReader();
@@ -395,7 +394,7 @@ export function createPipelineStream(
     if (!sawText) {
       logInfo("empty-answer", {
         requestId: ctx.requestId,
-        modelInfo: currentModelInfo(),
+        model: currentModelId(),
         finishReason,
       });
       const id = crypto.randomUUID();
@@ -430,15 +429,15 @@ export function createPipelineStream(
       }
     },
     onError: (error) => {
-      const info = currentModelInfo();
+      const modelId = currentModelId();
       ctx.onFailed?.();
       logError("stream", error, {
         requestId: ctx.requestId,
-        modelInfo: info,
+        model: modelId,
       });
       return clientErrorMessage(error, {
         requestId: ctx.requestId,
-        modelInfo: info,
+        modelId,
       });
     },
   });

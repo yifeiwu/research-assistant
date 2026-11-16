@@ -38,11 +38,9 @@ export type CooldownEntry = {
 
 /** Groq's rate-limit response headers, parsed. */
 export type GroqRateLimitHeaders = {
-  /** Combined tokens-per-minute limit and what is left of it. */
   limitTokens?: number;
   remainingTokens?: number;
   resetTokensMs?: number;
-  /** Requests-per-day limit and what is left of it. */
   limitRequests?: number;
   remainingRequests?: number;
   resetRequestsMs?: number;
@@ -83,7 +81,6 @@ export function parseGroqDurationMs(raw: string | null | undefined): number | un
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
 
-  // Plain numeric value (e.g. Retry-After: "8" or "8.5") -> seconds.
   if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
     const secs = Number.parseFloat(trimmed);
     return Number.isFinite(secs) && secs > 0 ? Math.ceil(secs * 1_000) : undefined;
@@ -91,8 +88,7 @@ export function parseGroqDurationMs(raw: string | null | undefined): number | un
 
   let totalMs = 0;
   let matched = false;
-  const unitRe = /(\d+(?:\.\d+)?)\s*(ms|h|m|s)/gi;
-  for (const match of trimmed.matchAll(unitRe)) {
+  for (const match of trimmed.matchAll(/(\d+(?:\.\d+)?)\s*(ms|h|m|s)/gi)) {
     const val = Number.parseFloat(match[1]);
     const unit = match[2].toLowerCase();
     if (!Number.isFinite(val) || val < 0) continue;
@@ -113,12 +109,6 @@ function headerNumber(headers: Headers, name: string): number | undefined {
   return Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
-/**
- * Read Groq's `x-ratelimit-*` headers. Per Groq's docs the `-tokens` headers
- * always describe the combined tokens-per-minute (TPM) limit and the
- * `-requests` headers always describe requests per day (RPD); separate
- * input/output per-minute limits (ITPM/OTPM) are not reported in headers.
- */
 function parseGroqRateLimitHeaders(headers: Headers): GroqRateLimitHeaders {
   return {
     limitTokens: headerNumber(headers, "x-ratelimit-limit-tokens"),
@@ -130,7 +120,6 @@ function parseGroqRateLimitHeaders(headers: Headers): GroqRateLimitHeaders {
   };
 }
 
-/** Which per-minute token window a 429 body says was exhausted, if any. */
 function parseExhaustedWindow(bodyText: string): BudgetDimension | undefined {
   const tagged = /\((OTPM|ITPM|TPM)\)/.exec(bodyText)?.[1];
   if (tagged) return tagged.toLowerCase() as BudgetDimension;
@@ -178,8 +167,7 @@ function decodeCooldown(raw: unknown): CooldownEntry | undefined {
   const text = String(raw).trim();
   if (!text) return undefined;
   const daily = text.startsWith("daily:");
-  const numText = daily ? text.slice("daily:".length) : text;
-  const untilMs = Number(numText);
+  const untilMs = Number(daily ? text.slice("daily:".length) : text);
   if (!Number.isFinite(untilMs) || untilMs <= 0) return undefined;
   return { untilMs, daily };
 }
@@ -198,15 +186,11 @@ export async function readCooldowns(
 
   try {
     const pipe = db.pipeline();
-    for (const model of models) {
-      pipe.get(cooldownKey(model));
-    }
+    for (const model of models) pipe.get(cooldownKey(model));
     const results = await pipe.exec();
     models.forEach((model, idx) => {
       const decoded = decodeCooldown(results[idx]);
-      if (decoded && decoded.untilMs > now) {
-        map.set(model, decoded);
-      }
+      if (decoded && decoded.untilMs > now) map.set(model, decoded);
     });
   } catch (error) {
     logError("groq-cooldown-read", error, { models });
@@ -237,9 +221,7 @@ async function writeCooldown(
 
 /**
  * Rewrite a Groq `/chat/completions` JSON request body for `targetModel`,
- * normalizing `reasoning_effort`, `reasoning_format`, and synthesis `max_tokens`
- * so switching between Qwen (`effort: "none"`, 900 OTPM cap) and GPT-OSS
- * (`effort: "low"`, 3,500 cap) never triggers HTTP 400 or OTPM 429s.
+ * normalizing `reasoning_effort`, `reasoning_format`, and synthesis `max_tokens`.
  */
 export function rewriteGroqRequestBody(
   rawBody: string,
@@ -304,7 +286,6 @@ export type ResilientGroqFetchOptions = {
   maxCooldownSeconds?: number;
   synthesisMaxOutputTokens?: number;
   db?: GroqCooldownDb | null;
-  /** Shared token budgets to reconcile against each response's headers. */
   budget?: Pick<GroqBudget, "observe">;
   baseFetch?: GroqFetch;
   now?: () => number;
@@ -323,11 +304,9 @@ function defaultMaxWaitMs(stage: GroqStage): number {
 }
 
 /**
- * Create a `fetch` wrapper for `@ai-sdk/groq` that:
- * 1. Checks Redis per-model cooldowns before firing a request.
- * 2. Sleeps accurately for short `Retry-After` windows on unexpected 429s.
- * 3. Automatically rewrites the payload and falls back to healthy candidate
- *    models on long waits or daily (`RPD`/`TPD`) limits.
+ * Reactive `fetch` wrapper for `@ai-sdk/groq`: reconciles response rate-limit
+ * headers into `GroqBudget`, honors short `Retry-After` pauses on `synthesis`,
+ * and rewrites/switches to healthy fallback models on unexpected 429s.
  */
 export function createResilientGroqFetch(
   opts: ResilientGroqFetchOptions,
@@ -336,6 +315,7 @@ export function createResilientGroqFetch(
     opts.primaryModel,
     ...(opts.fallbackModels ?? []).filter((m) => m && m !== opts.primaryModel),
   ];
+  const isSynthesis = opts.stage === "synthesis";
   const maxWaitMs = opts.maxWaitMs ?? defaultMaxWaitMs(opts.stage);
   const maxCooldownSeconds =
     opts.maxCooldownSeconds ?? serverConfig.groqRateLimit.maxCooldownSeconds;
@@ -343,16 +323,14 @@ export function createResilientGroqFetch(
     opts.synthesisMaxOutputTokens ?? serverConfig.synthesis.maxOutputTokens;
   const baseFetch: GroqFetch = opts.baseFetch ?? globalThis.fetch;
   const nowFn = opts.now ?? Date.now;
-  const wakeBufferMs =
-    opts.stage === "synthesis" ? SYNTHESIS_WAKE_BUFFER_MS : AUXILIARY_WAKE_BUFFER_MS;
+  const wakeBufferMs = isSynthesis ? SYNTHESIS_WAKE_BUFFER_MS : AUXILIARY_WAKE_BUFFER_MS;
   const resolveDb = resolveGroqCooldownDb(opts.db, opts.stage);
 
   return async (input, init) => {
     const rawBody = typeof init?.body === "string" ? init.body : undefined;
-    if (!rawBody) {
-      return baseFetch(input, init);
-    }
+    if (!rawBody) return baseFetch(input, init);
 
+    const signal = init?.signal;
     const cooldowns = await readCooldowns(candidates, nowFn(), resolveDb);
 
     const activeCooldown = (model: string): { remainingMs: number; daily: boolean } | undefined => {
@@ -366,9 +344,9 @@ export function createResilientGroqFetch(
       return { remainingMs, daily: entry.daily };
     };
 
-    let primaryTriggerWaitMs = 0;
+    let primaryTriggerWaitMs = activeCooldown(opts.primaryModel)?.remainingMs ?? 0;
 
-    const record429 = async (model: string, response: Response): Promise<{ waitMs: number; daily: boolean }> => {
+    const record429 = async (model: string, response: Response) => {
       const bodyText = await response.clone().text().catch(() => "");
       const parsed = parseGroqRateLimitResponse(response.headers, bodyText);
       if (model === opts.primaryModel) primaryTriggerWaitMs = parsed.waitMs;
@@ -377,10 +355,7 @@ export function createResilientGroqFetch(
         maxCooldownSeconds * 1_000,
         parsed.daily ? Math.max(parsed.waitMs, 60_000) : parsed.waitMs,
       );
-      const entry: CooldownEntry = {
-        untilMs: currentNow + effectiveMs,
-        daily: parsed.daily,
-      };
+      const entry: CooldownEntry = { untilMs: currentNow + effectiveMs, daily: parsed.daily };
       cooldowns.set(model, entry);
       await writeCooldown(model, entry, currentNow, maxCooldownSeconds, resolveDb);
       const headers = parseGroqRateLimitHeaders(response.headers);
@@ -435,159 +410,70 @@ export function createResilientGroqFetch(
       return response;
     };
 
-    const strategyDeps: StrategyDeps = {
-      candidates,
-      primaryModel: opts.primaryModel,
-      maxWaitMs,
-      wakeBufferMs,
-      signal: init?.signal,
-      sleepImpl: opts.sleep,
-      activeCooldown,
-      record429,
-      setPrimaryWaitMs: (ms) => {
-        primaryTriggerWaitMs = ms;
-      },
-      dispatch,
-    };
+    let lastResponse: Response | undefined;
+    let slept = false;
 
-    return opts.stage === "synthesis"
-      ? runSynthesisStrategy(strategyDeps)
-      : runAuxiliaryStrategy(strategyDeps);
-  };
-}
-
-type StrategyDeps = {
-  candidates: string[];
-  primaryModel: string;
-  maxWaitMs: number;
-  wakeBufferMs: number;
-  signal: AbortSignal | null | undefined;
-  sleepImpl?: (ms: number) => Promise<void>;
-  activeCooldown: (model: string) => { remainingMs: number; daily: boolean } | undefined;
-  record429: (model: string, res: Response) => Promise<{ waitMs: number; daily: boolean }>;
-  setPrimaryWaitMs: (ms: number) => void;
-  dispatch: (model: string) => Promise<Response>;
-};
-
-async function runSynthesisStrategy(deps: StrategyDeps): Promise<Response> {
-  const {
-    candidates,
-    primaryModel,
-    maxWaitMs,
-    wakeBufferMs,
-    signal,
-    sleepImpl,
-    activeCooldown,
-    record429,
-    setPrimaryWaitMs,
-    dispatch,
-  } = deps;
-
-  let lastResponse: Response | undefined;
-
-  // 1. Honor `primaryModel` whenever healthy or within the short reactive-wait budget.
-  const primaryCd = activeCooldown(primaryModel);
-  if (!primaryCd) {
-    const res = await dispatch(primaryModel);
-    if (res.status !== 429) return res;
-    lastResponse = res;
-    const { waitMs, daily } = await record429(primaryModel, res);
-    if (!daily && waitMs <= maxWaitMs) {
-      await abortableSleep(waitMs + wakeBufferMs, signal, sleepImpl);
-      const retryRes = await dispatch(primaryModel);
-      if (retryRes.status !== 429) return retryRes;
-      lastResponse = retryRes;
-      await record429(primaryModel, retryRes);
-    }
-  } else {
-    setPrimaryWaitMs(primaryCd.remainingMs);
-    if (!primaryCd.daily && primaryCd.remainingMs <= maxWaitMs) {
-      await abortableSleep(primaryCd.remainingMs + wakeBufferMs, signal, sleepImpl);
-      const res = await dispatch(primaryModel);
+    // 1. On synthesis, prefer waiting out a short primary cooldown before switching models.
+    const primaryCd = activeCooldown(opts.primaryModel);
+    if (isSynthesis && primaryCd && !primaryCd.daily && primaryCd.remainingMs <= maxWaitMs) {
+      slept = true;
+      await abortableSleep(primaryCd.remainingMs + wakeBufferMs, signal, opts.sleep);
+      const res = await dispatch(opts.primaryModel);
       if (res.status !== 429) return res;
       lastResponse = res;
-      await record429(primaryModel, res);
+      await record429(opts.primaryModel, res);
     }
-  }
 
-  // 2. Try healthy fallback candidates immediately (proactive waiting happens in scheduler).
-  for (const candidate of candidates) {
-    if (candidate === primaryModel || activeCooldown(candidate)) continue;
-    const res = await dispatch(candidate);
-    if (res.status !== 429) return res;
-    lastResponse = res;
-    await record429(candidate, res);
-  }
-
-  // 3. Ensure we always return a concrete HTTP response if every candidate was skipped via Redis cooldowns.
-  if (!lastResponse) {
-    const leastCooled =
-      [...candidates].sort(
-        (a, b) => (activeCooldown(a)?.remainingMs ?? 0) - (activeCooldown(b)?.remainingMs ?? 0),
-      )[0] ?? primaryModel;
-    const res = await dispatch(leastCooled);
-    if (res.status === 429) await record429(leastCooled, res);
-    return res;
-  }
-
-  return lastResponse;
-}
-
-async function runAuxiliaryStrategy(deps: StrategyDeps): Promise<Response> {
-  const {
-    candidates,
-    primaryModel,
-    maxWaitMs,
-    wakeBufferMs,
-    signal,
-    sleepImpl,
-    activeCooldown,
-    record429,
-    setPrimaryWaitMs,
-    dispatch,
-  } = deps;
-
-  const primaryCd = activeCooldown(primaryModel);
-  if (primaryCd) {
-    setPrimaryWaitMs(primaryCd.remainingMs);
-  }
-
-  let lastResponse: Response | undefined;
-
-  // 1. Try every currently healthy candidate in priority order without sleeping.
-  for (const candidate of candidates) {
-    if (activeCooldown(candidate)) continue;
-    const res = await dispatch(candidate);
-    if (res.status !== 429) return res;
-    lastResponse = res;
-    await record429(candidate, res);
-  }
-
-  // 2. All candidates are cooling down: if this auxiliary stage allows a short
-  // wait (e.g. planner <= 3s), sleep once for the candidate that clears soonest.
-  if (maxWaitMs > 0) {
-    const soonest = candidates
-      .map((m) => ({ model: m, cd: activeCooldown(m) }))
-      .filter(
-        (x): x is { model: string; cd: { remainingMs: number; daily: boolean } } =>
-          x.cd != null && !x.cd.daily && x.cd.remainingMs <= maxWaitMs,
-      )
-      .sort((a, b) => a.cd.remainingMs - b.cd.remainingMs)[0];
-
-    if (soonest) {
-      await abortableSleep(soonest.cd.remainingMs + wakeBufferMs, signal, sleepImpl);
-      const res = await dispatch(soonest.model);
+    // 2. Try every currently healthy candidate in priority order.
+    for (const candidate of candidates) {
+      if (activeCooldown(candidate)) continue;
+      const res = await dispatch(candidate);
       if (res.status !== 429) return res;
       lastResponse = res;
-      await record429(soonest.model, res);
-    }
-  }
+      const { waitMs, daily } = await record429(candidate, res);
 
-  // 3. If every candidate was skipped via Redis cooldowns and we never made an
-  // HTTP request (e.g. summaryMaxWaitMs === 0 with all candidates cooled down),
-  // synthesize a fast local 429 Response so fail-fast callers immediately
-  // trigger their fallback without burning another upstream 429 against Groq.
-  if (!lastResponse) {
+      if (isSynthesis && candidate === opts.primaryModel && !slept && !daily && waitMs <= maxWaitMs) {
+        slept = true;
+        await abortableSleep(waitMs + wakeBufferMs, signal, opts.sleep);
+        const retryRes = await dispatch(opts.primaryModel);
+        if (retryRes.status !== 429) return retryRes;
+        lastResponse = retryRes;
+        await record429(opts.primaryModel, retryRes);
+      }
+    }
+
+    // 3. If every candidate was cooling down and a short wait is allowed, sleep once for the soonest.
+    if (!slept && maxWaitMs > 0) {
+      const soonest = candidates
+        .map((m) => ({ model: m, cd: activeCooldown(m) }))
+        .filter(
+          (x): x is { model: string; cd: { remainingMs: number; daily: boolean } } =>
+            x.cd != null && !x.cd.daily && x.cd.remainingMs <= maxWaitMs,
+        )
+        .sort((a, b) => a.cd.remainingMs - b.cd.remainingMs)[0];
+
+      if (soonest) {
+        await abortableSleep(soonest.cd.remainingMs + wakeBufferMs, signal, opts.sleep);
+        const res = await dispatch(soonest.model);
+        if (res.status !== 429) return res;
+        lastResponse = res;
+        await record429(soonest.model, res);
+      }
+    }
+
+    if (lastResponse) return lastResponse;
+
+    // 4. Every candidate was skipped from pre-existing Redis cooldowns.
+    if (isSynthesis) {
+      const leastCooled =
+        [...candidates].sort(
+          (a, b) => (activeCooldown(a)?.remainingMs ?? 0) - (activeCooldown(b)?.remainingMs ?? 0),
+        )[0] ?? opts.primaryModel;
+      const res = await dispatch(leastCooled);
+      if (res.status === 429) await record429(leastCooled, res);
+      return res;
+    }
+
     const soonestMs =
       candidates
         .map((m) => activeCooldown(m)?.remainingMs ?? DEFAULT_429_WAIT_MS)
@@ -596,7 +482,7 @@ async function runAuxiliaryStrategy(deps: StrategyDeps): Promise<Response> {
     return new Response(
       JSON.stringify({
         error: {
-          message: `Rate limit cooldown active for model \`${primaryModel}\`. Please try again in ${retryAfterSec}s.`,
+          message: `Rate limit cooldown active for model \`${opts.primaryModel}\`. Please try again in ${retryAfterSec}s.`,
           type: "tokens",
         },
       }),
@@ -608,7 +494,5 @@ async function runAuxiliaryStrategy(deps: StrategyDeps): Promise<Response> {
         },
       },
     );
-  }
-
-  return lastResponse;
+  };
 }

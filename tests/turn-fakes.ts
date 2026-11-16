@@ -46,7 +46,6 @@ export function fakeTurnDeps(opts?: {
   const resolved: ResolvedModels = {
     selectedModel: SELECTED,
     mainModel: model(SELECTED),
-    modelInfo: `groq ${SELECTED}`,
     stages: {
       synthesis: {
         primaryModelId: SELECTED,

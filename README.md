@@ -11,8 +11,8 @@ cited answer — with live research progress cards and zero reliance on LLM
 function/tool calling.
 
 Groq is the only model provider: pick from a curated list of free-tier Groq
-models (`lib/models.ts`), validated server-side on every request, in the model
-picker or settings menu. Your selection is remembered in the browser.
+models (`lib/models.ts`), validated server-side on every request, in the
+composer's model picker. Your selection is remembered in the browser.
 
 ## How it works
 
@@ -29,11 +29,11 @@ Browser (Chat) ─POST /api/chat─▶ Deterministic Research Pipeline (lib/rese
                                Main model (reduce) ──▶ streamed, citation-verified answer
 ```
 
-The pipeline runs through thin ports (`lib/ports.ts`): a `Planner`,
-`SearchProvider`, and `Condenser` are injected into `lib/research.ts`; the
-final answer is streamed by `lib/agent/turn.ts`. Server tunables (timeouts,
-cache TTLs, concurrency, the shape of a research round) live in
-`lib/config.ts`.
+The research pipeline (`lib/research.ts`) coordinates query planning,
+sequential Exa retrieval (`lib/exa.ts`), and source condensation
+(`lib/pipeline.ts`), and the final answer is streamed by `lib/agent/turn.ts`.
+Server tunables (timeouts, cache TTLs, concurrency, the shape of a research
+round) live in `lib/config.ts`.
 
 Citations are verified at the stream boundary (`lib/citations.ts`): any link
 whose URL was not retrieved this turn is de-linked before it reaches the
@@ -206,8 +206,8 @@ Files:
   invocation to the next.
 - `lib/agent/turn.ts` — one attempt at a turn: research slot, research
   pipeline, then single-pass final answer synthesis.
-- `lib/research.ts` — pipeline orchestration through the ports in
-  `lib/ports.ts`, with live `data-research-step` + `source-url` streaming.
+- `lib/research.ts` — sequential research pipeline orchestration with live
+  `data-research-step` + `source-url` streaming.
 - `lib/exa.ts` — Exa REST adapter (`/search` and `/contents`) with a shared
   requests-per-second cap, timeouts, retry backoff, and Redis request caching
   (`lib/cache.ts`).

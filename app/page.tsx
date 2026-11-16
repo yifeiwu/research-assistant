@@ -1,7 +1,14 @@
 "use client";
 
 import type { UIMessage } from "ai";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { ArrowDown, RotateCw } from "lucide-react";
 import { Message } from "@/components/Message";
 import { Header } from "@/components/Header";
@@ -29,35 +36,54 @@ import { isPending, streamEndEvent, type TurnEvent } from "@/lib/turn-machine";
 import { activeTurnStatus } from "@/lib/turn-status";
 import { withHeldMessage } from "@/lib/turn-view";
 
-export default function Home() {
-  const [chatId, setChatId] = useState(createConversationId);
+const DESKTOP_MEDIA_QUERY = "(min-width: 768px)";
 
-  // The state of every thread's latest turn (lib/turn-machine.ts). Whether a
-  // turn is pending, and whether to reconnect to it, is read from here and
-  // nowhere else.
+function subscribeDesktop(listener: () => void): () => void {
+  const mql = window.matchMedia(DESKTOP_MEDIA_QUERY);
+  mql.addEventListener("change", listener);
+  return () => mql.removeEventListener("change", listener);
+}
+
+function getDesktopSnapshot(): boolean {
+  return window.matchMedia(DESKTOP_MEDIA_QUERY).matches;
+}
+
+function getDesktopServerSnapshot(): boolean {
+  return false;
+}
+
+export default function Home() {
+  const [activeThread, setActiveThread] = useState<{
+    id: string;
+    initialMessages?: UIMessage[];
+  }>(() => ({ id: createConversationId() }));
+  const chatId = activeThread.id;
+
+  // The state of every thread's latest turn (lib/turn-machine.ts).
   const {
     state: turnState,
     dispatch: dispatchTurn,
     getState: getTurnState,
   } = useTurnMachine(chatId);
   const activeTurn = turnState.threads[chatId];
-  // In flight as far as the user is concerned, whether or not the page is
-  // connected to it right now: the answer so far, the clock and Stop all
-  // stay where they are through a reconnect.
   const turnActive = isPending(activeTurn?.phase);
 
   const openThread = useCallback(
-    (id: string) => {
+    (id: string, initialMessages?: UIMessage[]) => {
       dispatchTurn({ type: "ACTIVATE", chatId: id });
-      setChatId(id);
+      setActiveThread({ id, initialMessages });
     },
     [dispatchTurn],
   );
 
-  const session = useMemo(() => createChatSession(chatId), [chatId]);
+  const session = useMemo(
+    () =>
+      createChatSession(activeThread.id, {
+        initialMessages: activeThread.initialMessages,
+      }),
+    [activeThread],
+  );
 
-  // Let go of a thread's stream and any reconnect when it is left, or the
-  // page goes away. Its turn carries on, on the server.
   useEffect(() => {
     return () => {
       session.abortReconnect();
@@ -68,14 +94,18 @@ export default function Home() {
   const { messages, sendMessage, status, error, stop, setMessages } =
     useChatState(session.chat, CHAT_STREAM_THROTTLE_MS);
 
+  const isDesktop = useSyncExternalStore(
+    subscribeDesktop,
+    getDesktopSnapshot,
+    getDesktopServerSnapshot,
+  );
+  const [sidebarOverride, setSidebarOverride] = useState<boolean | null>(null);
+  const sidebarOpen = sidebarOverride ?? isDesktop;
+
   const [input, setInput] = useState("");
-  const [sidebarOpen, setSidebarOpen] = useState(false);
-  // The assistant message taken out of the chat while its turn's stream is
-  // replayed, shown in its place until the replay catches up.
   const [held, setHeld] = useState<{ chatId: string; message: UIMessage } | null>(
     null,
   );
-  // Read out once by screen readers when a turn completes.
   const [announcement, setAnnouncement] = useState("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const wasActiveRef = useRef(false);
@@ -94,7 +124,6 @@ export default function Home() {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(turnId ? { turnId } : {}),
-      // May be sent as the page is closing (a delete becoming final).
       keepalive: true,
     });
   }, []);
@@ -132,7 +161,6 @@ export default function Home() {
     stopServer,
   });
 
-  // The sidebar marks the threads whose turn is pending.
   const listedConversations = useMemo(
     () =>
       conversations.map((conv) => {
@@ -142,12 +170,6 @@ export default function Home() {
     [conversations, turnState.threads],
   );
 
-  /**
-   * Apply a turn event, and write the outcome down when it ends the turn:
-   * the thread's saved copy is no longer pending, and takes `finalMessages`
-   * if there are any. (Given for a turn that had already ended, they are
-   * saved all the same: a stopped turn's stream ends a moment after it.)
-   */
   const applyTurn = useCallback(
     (event: TurnEvent, finalMessages?: UIMessage[]) => {
       const id = "chatId" in event ? event.chatId : null;
@@ -160,8 +182,6 @@ export default function Home() {
     [dispatchTurn, getTurnState, settleConversation],
   );
 
-  // What is on screen: the chat's messages, except that a message being
-  // replayed after a reconnect is shown as it was until the replay catches up.
   const heldMessage = held?.chatId === chatId ? held.message : null;
   const shownMessages = useMemo(
     () => withHeldMessage(messages, heldMessage),
@@ -170,14 +190,10 @@ export default function Home() {
   const holding = shownMessages !== messages;
   const hasMessages = shownMessages.length > 0;
 
-  // What the end of a stream means for the turn is the turn machine's call.
   useEffect(() => {
     return session.onStreamEnd((end) => {
       const event = streamEndEvent(chatId, end);
       if (getTurnState().threads[chatId]?.phase === "stopped") {
-        // The stream of a turn that was stopped, ending a moment later.
-        // What it leaves is saved, unless a replay was cut short behind
-        // what was already showing.
         const final = withHeldMessage(end.messages, heldMessage);
         if (final !== end.messages) setMessages(final);
         applyTurn(event, final);
@@ -225,16 +241,10 @@ export default function Home() {
 
   const lastMessage = shownMessages[shownMessages.length - 1];
   const lastIsAssistant = lastMessage?.role === "assistant";
-  // True while the live turn is queued or waiting on a rate limit; the
-  // message itself shows the reason, so the busy line only says "Waiting…".
   const turnPaused =
     turnActive && lastIsAssistant && activeTurnStatus(lastMessage) !== null;
 
-  // An error is the turn's only if the turn failed. One left over from a
-  // connection that dropped says nothing about a turn that has since been
-  // stopped, or found to have expired.
   const showError = activeTurn?.phase === "failed" && errorInfo !== null;
-  // A settled thread whose latest message never got an answer.
   const showUnanswered =
     isSeeded && !turnActive && !showError && endsUnanswered(shownMessages);
 
@@ -251,12 +261,6 @@ export default function Home() {
     requestBody,
     onBeforeSend: beginTurn,
   });
-
-  // Show the history sidebar by default on wider screens; keep it hidden on
-  // mobile so it doesn't cover the conversation on load.
-  useEffect(() => {
-    if (window.matchMedia("(min-width: 768px)").matches) setSidebarOpen(true);
-  }, []);
 
   // Return focus to the input once a turn is over.
   useEffect(() => {
@@ -282,21 +286,17 @@ export default function Home() {
         open={sidebarOpen}
         onSelect={(id) => {
           selectConversation(id);
-          if (window.matchMedia("(max-width: 767px)").matches) {
-            setSidebarOpen(false);
-          }
+          if (!isDesktop) setSidebarOverride(false);
         }}
         onNewChat={() => {
           newConversation();
           setInput("");
-          if (window.matchMedia("(max-width: 767px)").matches) {
-            setSidebarOpen(false);
-          }
+          if (!isDesktop) setSidebarOverride(false);
         }}
         onDelete={deleteConversation}
         deleted={deleted}
         onUndoDelete={undoDelete}
-        onClose={() => setSidebarOpen(false)}
+        onClose={() => setSidebarOverride(false)}
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
@@ -305,7 +305,9 @@ export default function Home() {
             newConversation();
             setInput("");
           }}
-          onToggleSidebar={() => setSidebarOpen((o) => !o)}
+          onToggleSidebar={() =>
+            setSidebarOverride((prev) => !(prev ?? isDesktop))
+          }
         />
 
         {!hasMessages ? (
@@ -340,10 +342,6 @@ export default function Home() {
                   />
                 ))}
 
-                {/* The one live region for the turn. The answer itself is not
-                    announced as it streams (that would read it out again on
-                    every update): only what the turn is doing, and once when
-                    it completes. The ticking clock is left out of it. */}
                 <div
                   role="status"
                   aria-live="polite"

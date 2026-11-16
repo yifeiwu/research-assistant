@@ -35,7 +35,7 @@ async function runChunks(chunks: unknown[]): Promise<Event[]> {
   } as unknown as StreamResult;
   const { stream } = createPipelineStream(async () => result, {
     requestId: "test1234",
-    modelInfo: "groq test",
+    modelId: "test",
     getAllowedSources: () => [{ url: "https://example.com/a" }],
     emitStart: true,
   });
@@ -120,11 +120,11 @@ describe("createPipelineStream citation verification", () => {
     expect(lastDeltaIdx).toBeLessThan(endIdx);
   });
 
-  it("streams data-model-fallback parts and resolves dynamic modelInfo on error", async () => {
-    let activeModel = "groq openai/gpt-oss-120b";
+  it("streams data-model-fallback parts and resolves dynamic modelId on error", async () => {
+    let activeModel = "openai/gpt-oss-120b";
     const { stream, deferral } = createPipelineStream(
       async (writer) => {
-        activeModel = "groq openai/gpt-oss-20b";
+        activeModel = "openai/gpt-oss-20b";
         writer.write({
           type: "data-model-fallback",
           id: "fb-1",
@@ -139,7 +139,7 @@ describe("createPipelineStream citation verification", () => {
       },
       {
         requestId: "test1234",
-        modelInfo: () => activeModel,
+        modelId: () => activeModel,
         emitStart: true,
       },
     );
@@ -159,7 +159,7 @@ describe("createPipelineStream error messages", () => {
       async () => {
         throw error;
       },
-      { requestId: "req12345", modelInfo: "groq openai/gpt-oss-120b", emitStart: true },
+      { requestId: "req12345", modelId: "openai/gpt-oss-120b", emitStart: true },
     );
     const events = (await readAll(stream)) as Event[];
     return String(events.find((e) => e.type === "error")?.errorText);

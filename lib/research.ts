@@ -4,8 +4,13 @@ import type {
   ModelMessage,
   UIMessageStreamWriter,
 } from "ai";
-import type { EffortConfig } from "./effort";
-import { createExaClient, type ExaDocument } from "./exa";
+import type { EffortConfig, EffortLevel } from "./effort";
+import {
+  createExaClient,
+  type ExaDocument,
+  type ExaSearchOutcome,
+  type ExaSearchRequestOptions,
+} from "./exa";
 import { tokenizeQuery } from "./excerpt";
 import { logDebug, logError, logInfo } from "./logger";
 import {
@@ -13,6 +18,7 @@ import {
   isIrrelevantNote,
   reduceNotesDetailed,
   stripThinking,
+  type CondenseSourcesOutcome,
 } from "./pipeline";
 import {
   buildGapCheckPrompt,
@@ -24,18 +30,66 @@ import { serverConfig } from "./config";
 import { estimateTokens } from "./tokens";
 import { generateAuxiliaryText, type StageRunner } from "./agent/stage";
 import type {
-  Condenser,
-  Planner,
-  PortContext,
-  ResearchDeps,
-  SearchProvider,
-} from "./ports";
-import type {
   ChatUIMessage,
   DegradedResearch,
   ResearchSource,
   ResearchStepData,
 } from "./types/chat";
+
+type StepContext = { signal?: AbortSignal; requestId?: string };
+
+export interface Planner {
+  planQuery(
+    input: { messages: ModelMessage[]; effortLevel?: EffortLevel } & StepContext,
+  ): Promise<{ stopped: boolean; brief?: string; query?: string }>;
+  planFollowUp(
+    input: {
+      query: string;
+      priorQueries: string[];
+      notes: string;
+      effortLevel?: EffortLevel;
+      citedPrimaryQueries?: string[];
+    } & StepContext,
+  ): Promise<{ stopped: boolean; query?: string }>;
+  rerankSources?(
+    input: { query: string; candidates: ExaDocument[]; maxSelect: number } & StepContext,
+  ): Promise<ExaDocument[]>;
+}
+
+export interface SearchProvider {
+  search(
+    query: string,
+    numResults: number,
+    ctx: StepContext & ExaSearchRequestOptions,
+  ): Promise<ExaSearchOutcome>;
+  fetchContents(
+    urls: string[],
+    ctx: StepContext & { maxCharacters?: number },
+  ): Promise<ExaSearchOutcome>;
+}
+
+export interface Condenser {
+  condense(
+    docs: ExaDocument[],
+    input: {
+      query: string;
+      batchSize?: number;
+      perSourceCharCap?: number;
+      patientWait?: boolean;
+      extractPrimaryRefs?: boolean;
+    } & StepContext,
+  ): Promise<CondenseSourcesOutcome>;
+  reduceNotes?(
+    notes: string[],
+    input: { query: string; targetTokenBudget: number; patientWait?: boolean } & StepContext,
+  ): Promise<{ evidenceBlock: string; reduced: boolean }>;
+}
+
+export type ResearchDeps = {
+  planner: Planner;
+  search: SearchProvider;
+  condenser: Condenser;
+};
 
 const MAX_EXPLICIT_URLS = 4;
 const MAX_HOP_URLS_PER_ROUND = 2;
@@ -60,9 +114,7 @@ export type ResearchOutcome = {
   /** Absent when no research was attempted (and on older checkpoints). */
   stats?: ResearchStats;
   searched: boolean;
-  /** True when search was attempted but no sources could be retrieved at all.
-   * Distinct from `searched: false` via NO_SEARCH/low effort, so the caller
-   * can disclose the failure instead of answering as if search was unneeded. */
+  /** True when search was attempted but no sources could be retrieved at all. */
   searchFailed?: boolean;
   evidenceBlock: string;
   totalSources: number;
@@ -211,7 +263,6 @@ function rankBatchCandidates(docs: ExaDocument[], query?: string): ExaDocument[]
   const nowMs = Date.now();
 
   const scored = nonEmpty.map((doc, idx) => {
-    // Base rank decay preserves Exa's ordering unless lexical/data/recency signals strongly favor another hit.
     let score = Math.max(0, 1 - idx * 0.14);
 
     if (terms.length > 0) {
@@ -278,7 +329,6 @@ export function selectDeduplicatedDocs(
     selected.push(doc);
   };
 
-  // Explicit user-supplied or citation-hopped URLs always take priority.
   for (const doc of priorityDocs) {
     if (selected.length >= maxCount) break;
     const key = normalizeUrlKey(doc.url);
@@ -288,7 +338,6 @@ export function selectDeduplicatedDocs(
 
   const ranked = rankBatchCandidates(searchDocs, opts?.query);
 
-  // Pass 1: Substantive pages respecting per-domain diversity cap.
   for (const doc of ranked) {
     if (selected.length >= maxCount) break;
     if (doc.text.trim().length < minSubstantiveChars) continue;
@@ -299,7 +348,6 @@ export function selectDeduplicatedDocs(
     recordDoc(doc, key, domain);
   }
 
-  // Pass 2 (Backfill): Relax domain and minimum-length thresholds for sparse/short results.
   if (selected.length < maxCount) {
     for (const doc of ranked) {
       if (selected.length >= maxCount) break;
@@ -314,11 +362,6 @@ export function selectDeduplicatedDocs(
 
 /**
  * Water-filling fair-share token budgeter across research notes.
- *
- * Unlike sequential front-slicing (which drops later gap-filling rounds when an
- * earlier source produced a long fallback excerpt), short notes keep their full
- * text and donate unused budget to longer notes, while off-topic notes flagged
- * `- Irrelevant to research question.` are shed first when over budget.
  */
 export function budgetNotesFairly(
   notes: string[],
@@ -346,7 +389,6 @@ export function budgetNotesFairly(
     return { text: fullJoined, trimmedCount: 0 };
   }
 
-  // Shed explicitly irrelevant notes first when over budget, provided at least one relevant note exists.
   let active = items;
   let droppedCount = 0;
   const relevantItems = items.filter((it) => !it.irrelevant);
@@ -364,7 +406,6 @@ export function budgetNotesFairly(
   const allocations = new Array<number>(active.length).fill(0);
   const unlocked = new Set<number>(active.map((_, i) => i));
 
-  // Iterative water-filling: lock any note that fits within the current equal share.
   while (unlocked.size > 0) {
     const share = Math.floor(remainingPool / unlocked.size);
     const fitsNow: number[] = [];
@@ -381,7 +422,6 @@ export function budgetNotesFairly(
     }
   }
 
-  // Distribute remaining pool evenly across oversized notes.
   if (unlocked.size > 0) {
     const baseShare = Math.floor(remainingPool / unlocked.size);
     let remainder = remainingPool - baseShare * unlocked.size;
@@ -451,11 +491,6 @@ function toResearchSource(doc: ExaDocument): ResearchSource {
   return { url: doc.url, title: doc.title, publishedDate: doc.publishedDate };
 }
 
-/**
- * Planner adapter backed by plain-text `generateAuxiliaryText` calls. Each call
- * leases its tokens from the shared model budgets first; a denied lease throws
- * and the pipeline degrades gracefully.
- */
 function createTextPlanner(
   stage: StageRunner,
   opts?: { patientWait?: boolean },
@@ -527,47 +562,8 @@ function createTextPlanner(
   };
 }
 
-/** SearchProvider adapter backed by the cached Exa client. */
-function createExaSearchProvider(ctx: PortContext): SearchProvider {
-  const exa = createExaClient({
-    signal: ctx.signal,
-    requestId: ctx.requestId,
-  });
-  return {
-    search: (query, numResults, reqCtx) => exa.searchDetailed(query, numResults, reqCtx),
-    fetchContents: (urls, reqCtx) => exa.fetchDetailed(urls, reqCtx),
-  };
-}
-
-/** Condenser adapter backed by the Groq summary model. */
-function createModelCondenser(stage: StageRunner): Condenser {
-  return {
-    condense: (docs, input) =>
-      condenseSourcesDetailed(docs, {
-        stage,
-        query: input.query,
-        batchSize: input.batchSize,
-        perSourceCharCap: input.perSourceCharCap,
-        patientWait: input.patientWait,
-        extractPrimaryRefs: input.extractPrimaryRefs,
-        signal: input.signal,
-        requestId: input.requestId,
-      }),
-    reduceNotes: (notes, input) =>
-      reduceNotesDetailed(notes, {
-        stage,
-        query: input.query,
-        targetTokenBudget: input.targetTokenBudget,
-        patientWait: input.patientWait,
-        signal: input.signal,
-        requestId: input.requestId,
-      }),
-  };
-}
-
 /**
- * Execute the deterministic multi-stage research pipeline through the thin
- * Planner / SearchProvider / Condenser ports, emitting live
+ * Execute the deterministic multi-stage research pipeline, emitting live
  * `data-research-step` and `source-url` UI stream chunks along the way.
  */
 export async function runResearchPipeline(opts: {
@@ -597,8 +593,21 @@ export async function runResearchPipeline(opts: {
   const planner =
     opts.deps?.planner ??
     createTextPlanner(opts.stages.planner, { patientWait: isDeep });
-  const search = opts.deps?.search ?? createExaSearchProvider({ signal, requestId });
-  const condenser = opts.deps?.condenser ?? createModelCondenser(opts.stages.summary);
+  const search: SearchProvider =
+    opts.deps?.search ??
+    (() => {
+      const exa = createExaClient({ signal, requestId });
+      return {
+        search: exa.searchDetailed,
+        fetchContents: exa.fetchDetailed,
+      };
+    })();
+  const condenser: Condenser = opts.deps?.condenser ?? {
+    condense: (docs, input) =>
+      condenseSourcesDetailed(docs, { stage: opts.stages.summary, ...input }),
+    reduceNotes: (notes, input) =>
+      reduceNotesDetailed(notes, { stage: opts.stages.summary, ...input }),
+  };
 
   const roundResultsPerQuery = isDeep ? deepResultsPerQuery : resultsPerQuery;
   const docMaxChars = isDeep ? serverConfig.exa.deepMaxChars : undefined;
@@ -613,24 +622,23 @@ export async function runResearchPipeline(opts: {
   const allSources: ResearchSource[] = [];
   let totalSources = 0;
 
-  const failedQueries: string[] = [];
+  let failedQueryCount = 0;
   let failedContents = false;
   let fallbackSources = 0;
   const failedStages: string[] = [];
   const currentDegraded = (): DegradedResearch | undefined => {
-    if (failedQueries.length === 0 && !failedContents && fallbackSources === 0 && failedStages.length === 0) return undefined;
-    const messagesOut: string[] = [];
-    if (failedQueries.length > 0) messagesOut.push(`${failedQueries.length} search ${failedQueries.length === 1 ? "query" : "queries"} failed`);
-    if (failedContents) messagesOut.push("one or more explicit URLs could not be fetched");
-    if (fallbackSources > 0) messagesOut.push(`${fallbackSources} ${fallbackSources === 1 ? "source" : "sources"} could only be partially read`);
-    messagesOut.push(...failedStages);
-    return {
-      failedQueries: [...failedQueries],
-      failedContents,
-      fallbackSources,
-      failedStages: [...failedStages],
-      messages: messagesOut,
-    };
+    const reasons: string[] = [];
+    if (failedQueryCount > 0) {
+      reasons.push(`${failedQueryCount} search ${failedQueryCount === 1 ? "query" : "queries"} failed`);
+    }
+    if (failedContents) {
+      reasons.push("one or more explicit URLs could not be fetched");
+    }
+    if (fallbackSources > 0) {
+      reasons.push(`${fallbackSources} ${fallbackSources === 1 ? "source" : "sources"} could only be partially read`);
+    }
+    reasons.push(...failedStages);
+    return reasons.length > 0 ? reasons : undefined;
   };
 
   const stats: ResearchStats = {
@@ -724,8 +732,6 @@ export async function runResearchPipeline(opts: {
     emitStep(roundId, { round, phase: "searching", query: currentQuery, sources: [] });
     stats.rounds = round;
 
-    // On Round 1 fetch explicit user-supplied URLs; on follow-up deep rounds
-    // hop directly to unseen primary study/filing URLs cited inside earlier sources.
     const hopUrlsThisRound: string[] = [];
     if (round > 1 && isDeep) {
       while (
@@ -767,7 +773,7 @@ export async function runResearchPipeline(opts: {
       }
     }
     if (searchOutcome.error) {
-      failedQueries.push(currentQuery);
+      failedQueryCount += 1;
     }
 
     const roundCap = Math.min(sourcesPerRound, maxSources - totalSources);

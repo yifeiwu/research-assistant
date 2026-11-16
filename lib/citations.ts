@@ -23,13 +23,12 @@ function canonicalCitationKey(rawUrl: string): string {
 function verifySegment(
   segment: string,
   allowed: Set<string>,
-  stats: { stripped: number; verified: number },
+  stats: { stripped: number },
 ): string {
   const withoutMarkdown = segment.replace(
     MARKDOWN_LINK_REGEX,
     (match, label: string, url: string) => {
       if (allowed.has(canonicalCitationKey(url))) {
-        stats.verified += 1;
         return match;
       }
       stats.stripped += 1;
@@ -39,8 +38,6 @@ function verifySegment(
   return withoutMarkdown.replace(BARE_URL, (url) => {
     const { url: cleaned, suffix } = splitSentencePunctuation(url);
     if (allowed.has(canonicalCitationKey(cleaned))) {
-      stats.verified += 1;
-      // Keep the sentence punctuation, but not glued to the URL.
       return cleaned + suffix;
     }
     stats.stripped += 1;
@@ -57,16 +54,16 @@ function verifySegment(
 export function verifyCitations(
   text: string,
   sources: ResearchSource[] | string[],
-): { text: string; strippedCount: number; verifiedCount: number } {
+): { text: string; strippedCount: number } {
   const allowed = new Set(
     sources.map((s) => canonicalCitationKey(typeof s === "string" ? s : s.url)),
   );
-  const stats = { stripped: 0, verified: 0 };
+  const stats = { stripped: 0 };
   const segments = text.split(/(```[\s\S]*?(?:```|$)|`[^`\n]*`)/g);
   const out = segments
     .map((segment, i) =>
       i % 2 === 1 ? segment : verifySegment(segment, allowed, stats),
     )
     .join("");
-  return { text: out, strippedCount: stats.stripped, verifiedCount: stats.verified };
+  return { text: out, strippedCount: stats.stripped };
 }

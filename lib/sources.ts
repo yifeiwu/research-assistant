@@ -1,3 +1,5 @@
+import type { ChatMessage } from "./types/chat";
+
 export type CollectedSource = {
   url: string;
   title?: string;
@@ -49,9 +51,7 @@ function isTrackingParam(name: string): boolean {
  * Canonical comparison key for URL deduplication: lowercases/strips `www.`
  * from the host, drops the fragment and trailing path slashes, strips common
  * analytics/tracking parameters, sorts remaining query parameters, and removes
- * sentence punctuation stuck to the end, so `https://www.A.com/x/?utm_source=x#f`
- * and `https://a.com/x` dedupe to the same source. Falls back to a plain string
- * cleanup for unparseable values.
+ * trailing sentence punctuation.
  */
 export function normalizeUrlKey(url: string): string {
   const cleaned = stripTrailingPunctuation(url.trim());
@@ -85,17 +85,17 @@ export function domainOf(url: string): string {
   }
 }
 
-type MessagePart = Record<string, unknown>;
+export type SourceBearingMessage = Pick<
+  ChatMessage,
+  "text" | "sources" | "steps"
+>;
 
 /**
  * Collect deduplicated `{ url, title }` sources from an assistant message.
- *
- * Prefers structured `source-url` and `data-research-step` parts emitted by the
- * deterministic research pipeline, and falls back to markdown links / bare URLs.
+ * Prefers structured `sources` and `steps` from the research pipeline, falling
+ * back to markdown links and bare URLs in `text`.
  */
-export function collectSources(message: {
-  parts: MessagePart[];
-}): CollectedSource[] {
+export function collectSources(message: SourceBearingMessage): CollectedSource[] {
   const byKey = new Map<string, CollectedSource>();
 
   const add = (rawUrl: string, rawTitle?: string) => {
@@ -111,41 +111,20 @@ export function collectSources(message: {
     }
   };
 
-  for (const part of message.parts) {
-    if (part.type === "source-url" && typeof part.url === "string") {
-      add(
-        part.url,
-        typeof part.title === "string" ? part.title : undefined,
-      );
-      continue;
+  for (const s of message.sources ?? []) {
+    add(s.url, s.title);
+  }
+  for (const step of message.steps ?? []) {
+    for (const s of step.sources) {
+      add(s.url, s.title);
     }
-
-    if (
-      part.type === "data-research-step" &&
-      part.data &&
-      typeof part.data === "object"
-    ) {
-      const sources = (part.data as { sources?: unknown }).sources;
-      if (Array.isArray(sources)) {
-        for (const item of sources) {
-          if (item && typeof item === "object") {
-            const s = item as { url?: unknown; title?: unknown };
-            if (typeof s.url === "string") {
-              add(s.url, typeof s.title === "string" ? s.title : undefined);
-            }
-          }
-        }
-      }
-      continue;
+  }
+  if (message.text) {
+    for (const match of message.text.matchAll(MARKDOWN_LINK_REGEX)) {
+      add(match[2], match[1]);
     }
-
-    if (part.type === "text" && typeof part.text === "string") {
-      for (const match of part.text.matchAll(MARKDOWN_LINK_REGEX)) {
-        add(match[2], match[1]);
-      }
-      for (const url of extractUrls(part.text)) {
-        add(url);
-      }
+    for (const url of extractUrls(message.text)) {
+      add(url);
     }
   }
 
@@ -153,21 +132,21 @@ export function collectSources(message: {
 }
 
 /**
- * Split a message's sources into the ones its answer text links to and the
- * rest (read during research, but not cited). Both keep their order.
+ * Split a message's sources into those linked in `message.text` and the rest
+ * read during research. Both preserve their discovery order.
  */
 export function splitSourcesByCitation(
-  message: { parts: MessagePart[] },
+  message: SourceBearingMessage,
   sources: CollectedSource[] = collectSources(message),
 ): { cited: CollectedSource[]; other: CollectedSource[] } {
   const citedKeys = new Set<string>();
-  for (const part of message.parts) {
-    if (part.type !== "text" || typeof part.text !== "string") continue;
-    // Link destinations first: unlike a bare URL, one may contain brackets.
-    for (const match of part.text.matchAll(MARKDOWN_LINK_REGEX)) {
+  if (message.text) {
+    for (const match of message.text.matchAll(MARKDOWN_LINK_REGEX)) {
       citedKeys.add(normalizeUrlKey(match[2]));
     }
-    for (const url of extractUrls(part.text)) citedKeys.add(normalizeUrlKey(url));
+    for (const url of extractUrls(message.text)) {
+      citedKeys.add(normalizeUrlKey(url));
+    }
   }
   const cited: CollectedSource[] = [];
   const other: CollectedSource[] = [];

@@ -47,14 +47,6 @@ function stepPresentation(data: ResearchStepData): {
         running: true,
         failed: false,
       };
-    case "reranking":
-      return {
-        icon: Compass,
-        title: "Selecting highest-authority sources",
-        status: "reranking…",
-        running: true,
-        failed: false,
-      };
     case "reading":
       return {
         icon: FileText,
@@ -70,14 +62,6 @@ function stepPresentation(data: ResearchStepData): {
         icon: Sparkles,
         title: `Evaluating ${pluralize(sCount, "source")} for gaps`,
         status: "checking…",
-        running: true,
-        failed: false,
-      };
-    case "synthesizing":
-      return {
-        icon: Sparkles,
-        title: "Distilling cross-round research brief",
-        status: "distilling…",
         running: true,
         failed: false,
       };
@@ -109,8 +93,6 @@ function stepPresentation(data: ResearchStepData): {
 export function ResearchStep({ data }: { data: ResearchStepData }) {
   const [open, setOpen] = useState(false);
 
-  // When the query planner determines no web search is needed (`NO_SEARCH`),
-  // collapse cleanly once complete so direct answers have no empty card.
   if (
     data.phase === "done" &&
     !data.query &&
@@ -171,15 +153,17 @@ export function ResearchStep({ data }: { data: ResearchStepData }) {
         </span>
       </button>
 
-      {data.degraded && data.degraded.length > 0 && (data.phase === "done" || data.phase === "error") && (
-        <div className="flex items-start gap-1.5 border-t border-border px-3 py-2 text-xs text-amber-300">
-          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
-          <span>
-            Some sources couldn&apos;t be retrieved — the answer may be
-            incomplete. ({data.degraded.join("; ")})
-          </span>
-        </div>
-      )}
+      {data.degraded &&
+        data.degraded.length > 0 &&
+        (data.phase === "done" || data.phase === "error") && (
+          <div className="flex items-start gap-1.5 border-t border-border px-3 py-2 text-xs text-amber-300">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+            <span>
+              Some sources couldn&apos;t be retrieved — the answer may be
+              incomplete. ({data.degraded.join("; ")})
+            </span>
+          </div>
+        )}
 
       {open && hasDetails && (
         <div className="max-h-80 space-y-3 overflow-auto border-t border-border px-3 py-2.5 text-xs text-muted">

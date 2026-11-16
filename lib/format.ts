@@ -1,27 +1,48 @@
-import type { TurnPhase } from "@/lib/turn-machine";
+import type { ResearchStepData, TurnWaitState } from "@/lib/types/chat";
 
-/** Label for the in-flight status indicator: what the turn is doing right now. */
+const STAGE_LABELS: Record<
+  Extract<TurnWaitState, { kind: "rate-limit" }>["stage"],
+  string
+> = {
+  planning: "planning searches",
+  reading: "reading sources",
+  answering: "writing the answer",
+};
+
+/** Label for the in-flight turn status indicator, including queue & budget waits. */
 export function busyLabel(
-  phase: TurnPhase | undefined,
-  idleSeconds: number,
-  opts: {
-    /** Nothing of the response has arrived yet. */
-    nothingYet?: boolean;
-    /** The turn is queued or waiting on a rate limit (the message says why). */
-    paused?: boolean;
-    /** A reconnect is replaying what the page already shows. */
-    replaying?: boolean;
-  } = {},
+  steps: ResearchStepData[],
+  wait?: TurnWaitState,
+  nowMs?: number,
 ): string {
-  if (opts.replaying || phase === "detached" || phase === "resuming") {
-    return "Reconnecting…";
+  if (wait?.kind === "queued") {
+    return wait.position <= 1
+      ? "In queue — you're next…"
+      : `In queue (position ${wait.position})…`;
   }
-  if (phase === "sending" || opts.nothingYet) return "Thinking…";
-  if (opts.paused) return "Waiting…";
-  // Streaming: if no new output has arrived for a few seconds, the model is
-  // likely searching/reading/summarizing. Reassure the user it's still alive.
-  if (idleSeconds >= 4) return "Still working — searching and reading sources…";
-  return "Responding…";
+  if (wait?.kind === "rate-limit") {
+    const secs =
+      nowMs != null ? Math.max(0, Math.ceil((wait.resumeAt - nowMs) / 1_000)) : 0;
+    const stageText = STAGE_LABELS[wait.stage];
+    return secs > 0
+      ? `Waiting for model quota before ${stageText} (${secs}s)…`
+      : `Resuming ${stageText}…`;
+  }
+
+  if (steps.length === 0) return "Thinking…";
+  const last = steps[steps.length - 1];
+  switch (last.phase) {
+    case "planning":
+      return "Planning search…";
+    case "searching":
+      return "Searching the web…";
+    case "reading":
+      return "Reading sources…";
+    case "checking-gaps":
+      return "Checking research gaps…";
+    default:
+      return "Writing answer…";
+  }
 }
 
 /** Format a duration in seconds as `12s` or `1m 05s`. */

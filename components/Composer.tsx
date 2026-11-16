@@ -3,14 +3,12 @@
 import { useEffect, useRef } from "react";
 import { ArrowUp, Square } from "lucide-react";
 import { EffortSelector } from "./EffortSelector";
-import { ModelSelector } from "./ModelSelector";
 import type { AppSettings } from "@/lib/settings";
 
 /**
  * Two-row composer: the textarea sits on top, with a control bar below holding
- * the generation controls (model, effort) on the left and Send/Stop on the
- * right. Send and Stop share the same footprint so the layout doesn't shift
- * mid-stream.
+ * the research effort selector on the left and Send/Stop on the right. Send and
+ * Stop share the same footprint so the layout doesn't shift mid-stream.
  */
 export function Composer({
   input,
@@ -72,7 +70,6 @@ export function Composer({
         />
 
         <div className="flex items-center gap-2">
-          <ModelSelector settings={settings} onChange={onSettingsChange} />
           <EffortSelector
             effort={settings.effort}
             onChange={(effort) => onSettingsChange({ ...settings, effort })}

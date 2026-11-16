@@ -1,28 +1,21 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import type { UIMessage } from "ai";
+import { useEffect, useState } from "react";
 
-export type Heartbeat = { elapsed: number; idle: number };
+export type Heartbeat = {
+  elapsed: number;
+  now: number;
+};
 
-const RESTING: Heartbeat = { elapsed: 0, idle: 0 };
+const RESTING: Heartbeat = { elapsed: 0, now: 0 };
 
 /**
- * While a turn is in flight the server may spend long stretches on research
- * with no visible tokens. Tick a live "still working" clock (total elapsed +
- * time since the last message activity) so the UI never looks frozen or dead.
+ * Live 1-second clock while a durable turn is active, supplying both `elapsed`
+ * seconds and `now` (epoch ms) for rate-limit countdowns without calling
+ * `Date.now()` impurely during React render.
  */
-export function useHeartbeat(
-  active: boolean,
-  messages: UIMessage[],
-  startedAt?: number,
-): Heartbeat {
-  const [heartbeat, setHeartbeat] = useState<Heartbeat>(RESTING);
-  const lastActivityRef = useRef(0);
-
-  useEffect(() => {
-    lastActivityRef.current = Date.now();
-  }, [messages, active]);
+export function useHeartbeat(active: boolean, startedAt?: number): Heartbeat {
+  const [beat, setBeat] = useState<Heartbeat>(RESTING);
 
   useEffect(() => {
     if (!active) return;
@@ -31,10 +24,7 @@ export function useHeartbeat(
       if (document.visibilityState !== "visible") return;
       const now = Date.now();
       const elapsed = Math.max(0, Math.floor((now - start) / 1000));
-      const idle = Math.max(0, Math.floor((now - lastActivityRef.current) / 1000));
-      setHeartbeat((prev) =>
-        prev.elapsed === elapsed && prev.idle === idle ? prev : { elapsed, idle },
-      );
+      setBeat({ elapsed, now });
     };
     const initial = window.setTimeout(tick, 0);
     const id = window.setInterval(tick, 1000);
@@ -44,5 +34,5 @@ export function useHeartbeat(
     };
   }, [active, startedAt]);
 
-  return active ? heartbeat : RESTING;
+  return active ? beat : RESTING;
 }

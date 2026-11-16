@@ -1,13 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  parseJsonEventStream,
-  readUIMessageStream,
-  uiMessageChunkSchema,
-  type UIMessage,
-  type UIMessageChunk,
-} from "ai";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   type Conversation,
   createConversationId,
@@ -16,479 +9,585 @@ import {
   loadConversations,
   saveActiveConversationId,
   saveConversations,
-  withTurnPrompt,
 } from "@/lib/conversations";
+import type { EffortLevel } from "@/lib/effort";
 import { findLastUserMessageId } from "@/lib/messages";
-import { isPending, type ThreadTurn, type TurnEvent } from "@/lib/turn-machine";
+import { fetchWithRetryAfter } from "@/lib/retry-fetch";
+import type {
+  ChatMessage,
+  DurableTurnState,
+  ResearchSource,
+  ResearchStepData,
+  TurnWaitState,
+} from "@/lib/types/chat";
 
-const BG_POLL_INTERVAL_MS = 3_000;
-/** How long a deleted conversation can be brought back. */
-const UNDO_DELETE_MS = 6_000;
+const ACTIVE_POLL_MS = 1_000;
+const BG_POLL_MS = 3_000;
 
-type UndoableDelete = {
-  conversation: Conversation;
-  /** It was the open thread, so undoing reopens it. */
-  wasActive: boolean;
-  /** Set when a turn was generating: stop it once the delete is final. */
-  stop?: { turnId?: string };
-  timer: number;
-};
-
-type UseConversationsArgs = {
-  chatId: string;
-  /** Open a thread with its saved initial messages, if any. */
-  setChatId: (id: string, initialMessages?: UIMessage[]) => void;
-  messages: UIMessage[];
-  setMessages: (messages: UIMessage[]) => void;
-  isBusy: boolean;
-  /** The open thread's turn (lib/turn-machine.ts). */
-  activeTurn: ThreadTurn | undefined;
-  /** A thread's turn as of right now, for code that runs between renders. */
-  getTurn: (id: string) => ThreadTurn | undefined;
-  /** Tell the turn machine what this hook learns about turns. */
-  dispatchTurn: (event: TurnEvent) => void;
-  /** Detach the client fetch/reconnect stream without cancelling server Redis generation. */
-  detach: () => void;
-  /** Explicitly cancel server-side generation for a thread (e.g. on delete). */
-  stopServer: (id: string, turnId?: string) => void;
+type LiveProgress = {
+  steps: ResearchStepData[];
+  sources: ResearchSource[];
+  wait?: TurnWaitState;
 };
 
 export type UseConversations = {
   conversations: Conversation[];
   activeId: string;
+  messages: ChatMessage[];
+  liveProgress: LiveProgress | null;
+  pending: boolean;
+  pendingSince?: number;
+  unansweredReason?: "stopped" | "expired";
+  error: Error | null;
   isSeeded: boolean;
   selectConversation: (id: string) => void;
   newConversation: () => void;
-  /** Removes a conversation; `undoDelete` brings it back while `deleted` is set. */
   deleteConversation: (id: string) => void;
-  deleted: { id: string; title: string } | null;
-  undoDelete: () => void;
-  settleConversation: (id: string, finalMessages?: UIMessage[]) => void;
+  sendMessage: (text: string, effort: EffortLevel) => void;
+  editUserMessage: (messageId: string, newText: string, effort: EffortLevel) => void;
+  regenerateAssistantMessage: (assistantId: string, effort: EffortLevel) => void;
+  retryLastTurn: (effort: EffortLevel) => void;
+  stopGeneration: () => void;
 };
 
-type BackgroundPollResult =
-  | { state: "running" }
-  | { state: "empty" }
-  | { state: "retry" }
-  | { state: "done"; assistantMessage: UIMessage }
-  | { state: "stale"; assistantMessage: UIMessage };
-
-async function pollBackgroundConversation(
-  id: string,
-  signal: AbortSignal,
-): Promise<BackgroundPollResult> {
-  const response = await fetch(`/api/chat/${id}/stream?onlyDone=1`, {
-    method: "GET",
-    signal,
-  });
-
-  if (response.status === 202) return { state: "running" };
-  if (response.status === 204) return { state: "empty" };
-  if (!response.ok || !response.body) return { state: "retry" };
-  const isStale = response.headers.get("x-chat-stream-stale") === "1";
-
-  const chunkStream = parseJsonEventStream({
-    stream: response.body,
-    schema: uiMessageChunkSchema,
-  }).pipeThrough(
-    new TransformStream({
-      transform(part, controller) {
-        if (part.success) {
-          controller.enqueue(part.value as UIMessageChunk);
-        }
-      },
-    }),
-  );
-
-  let assistantMessage: UIMessage | undefined;
-  for await (const msg of readUIMessageStream({ stream: chunkStream })) {
-    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-    assistantMessage = msg;
-  }
-
-  if (!assistantMessage) return { state: "empty" };
-  return isStale
-    ? { state: "stale", assistantMessage }
-    : { state: "done", assistantMessage };
+function stopServerTurn(chatId: string, turnId?: string): void {
+  void fetch(`/api/chat/${chatId}/stop`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(turnId ? { turnId } : {}),
+    keepalive: true,
+  }).catch(() => {});
 }
 
-/**
- * Manages multiple chat threads persisted in localStorage, plus background
- * collection of finished `pending` threads while the user works in another
- * conversation.
- */
-export function useConversations({
-  chatId,
-  setChatId,
-  messages,
-  setMessages,
-  isBusy,
-  activeTurn,
-  getTurn,
-  dispatchTurn,
-  detach,
-  stopServer,
-}: UseConversationsArgs): UseConversations {
+export function useConversations(opts?: {
+  onTurnFinished?: (answered: boolean) => void;
+}): UseConversations {
+  const [activeId, setActiveId] = useState<string>(() => createConversationId());
   const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [restored, setRestored] = useState(false);
+  const [liveByChat, setLiveByChat] = useState<Record<string, LiveProgress>>({});
+  const [errorsByChat, setErrorsByChat] = useState<Record<string, Error>>({});
+  const [isSeeded, setIsSeeded] = useState(false);
 
-  const chatIdRef = useRef(chatId);
+  const activeIdRef = useRef(activeId);
   useEffect(() => {
-    chatIdRef.current = chatId;
-  }, [chatId]);
+    activeIdRef.current = activeId;
+  }, [activeId]);
 
   const conversationsRef = useRef(conversations);
   useEffect(() => {
     conversationsRef.current = conversations;
   }, [conversations]);
 
-  const bgControllersRef = useRef<Map<string, AbortController>>(new Map());
-
-  const setActive = useCallback(
-    (id: string, initialMessages?: UIMessage[]) => {
-      const bgCtrl = bgControllersRef.current.get(id);
-      if (bgCtrl) {
-        bgCtrl.abort();
-        bgControllersRef.current.delete(id);
-      }
-      const seeded =
-        initialMessages ?? conversationsRef.current.find((c) => c.id === id)?.messages;
-      chatIdRef.current = id;
-      setChatId(id, seeded);
-      saveActiveConversationId(id);
-    },
-    [setChatId],
-  );
-
-  // Hydrate saved conversations after initial SSR-matching render.
+  const onFinishedRef = useRef(opts?.onTurnFinished);
   useEffect(() => {
-    let cancelled = false;
-    queueMicrotask(() => {
-      if (cancelled) return;
-      const list = loadConversations();
-      const active = loadActiveConversationId();
+    onFinishedRef.current = opts?.onTurnFinished;
+  }, [opts?.onTurnFinished]);
 
-      conversationsRef.current = list;
-      setConversations(list);
-      dispatchTurn({
-        type: "HYDRATE",
-        pending: list
-          .filter((c) => c.pending)
-          .map((c) => ({ chatId: c.id, since: c.pendingSince })),
-      });
+  // Track chats whose POST /api/chat is still in flight so an early 204 poll
+  // before Redis registration never falsely marks the turn as expired.
+  const startingChatsRef = useRef<Set<string>>(new Set());
+  const inFlightPollsRef = useRef<Map<string, AbortController>>(new Map());
+  const postControllersRef = useRef<Map<string, AbortController>>(new Map());
 
-      const activeConv = active ? list.find((c) => c.id === active) : undefined;
-      if (activeConv) {
-        if (activeConv.id === chatIdRef.current) {
-          setMessages(activeConv.messages);
-        } else {
-          setActive(activeConv.id, activeConv.messages);
-        }
-      } else {
-        saveActiveConversationId(chatIdRef.current);
-      }
-
-      setRestored(true);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [dispatchTurn, setActive, setMessages]);
-
-  // Abort all in-flight background polls on unmount.
-  useEffect(() => {
-    const controllers = bgControllersRef.current;
-    return () => {
-      for (const ctrl of controllers.values()) {
-        ctrl.abort();
-      }
-      controllers.clear();
-    };
-  }, []);
-
-  // Immediately persist user turns as `pending: true` when generation starts so
-  // reloads, tab closes, and thread switches can resume from Upstash Redis.
-  const turnPending = isPending(activeTurn?.phase);
-  useEffect(() => {
-    if (!restored || !isBusy || !turnPending || messages.length === 0) return;
-
-    const id = chatId;
-    const last = messages[messages.length - 1];
-    const promptMessages =
-      last?.role === "assistant" ? messages.slice(0, -1) : messages;
-    if (promptMessages.length === 0) return;
-    const lastPromptId = promptMessages[promptMessages.length - 1]?.id;
-
-    const current = conversationsRef.current.find((c) => c.id === id);
-    if (
-      current?.pending &&
-      current.messages.length === promptMessages.length &&
-      current.messages[current.messages.length - 1]?.id === lastPromptId
-    ) {
-      return;
-    }
-
-    setConversations((prev) => {
-      const updated = withTurnPrompt(prev, id, promptMessages, getTurn(id), Date.now());
-      if (!updated) return prev;
-      const next = saveConversations(updated);
-      conversationsRef.current = next;
-      return next;
-    });
-  }, [chatId, restored, isBusy, turnPending, messages, getTurn]);
-
-  const settleConversation = useCallback(
-    (id: string, finalMessages?: UIMessage[]) => {
+  const persistConversations = useCallback(
+    (updater: (prev: Conversation[]) => Conversation[]) => {
       setConversations((prev) => {
-        const existing = prev.find((c) => c.id === id);
-        const now = Date.now();
-
-        if (finalMessages && finalMessages.length > 0) {
-          const title = existing?.title ?? deriveTitle(finalMessages);
-          const updated: Conversation = existing
-            ? {
-                ...existing,
-                messages: finalMessages,
-                title,
-                pending: false,
-                pendingSince: undefined,
-                updatedAt: now,
-              }
-            : {
-                id,
-                title,
-                messages: finalMessages,
-                pending: false,
-                createdAt: now,
-                updatedAt: now,
-              };
-          const next = saveConversations([
-            updated,
-            ...prev.filter((c) => c.id !== id),
-          ]);
-          conversationsRef.current = next;
-          return next;
-        }
-
-        if (!existing?.pending) return prev;
-        const next = saveConversations(
-          prev.map((c) =>
-            c.id === id ? { ...c, pending: false, pendingSince: undefined } : c,
-          ),
-        );
-        conversationsRef.current = next;
-        return next;
+        const updated = updater(prev);
+        if (updated === prev) return prev;
+        const saved = saveConversations(updated);
+        conversationsRef.current = saved;
+        return saved;
       });
     },
     [],
   );
 
-  const hasBackgroundPending = conversations.some(
-    (c) => c.pending && c.id !== chatId,
-  );
-
+  // Hydrate persisted conversations from localStorage on mount.
   useEffect(() => {
-    if (!restored || !hasBackgroundPending) return;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      const list = loadConversations();
+      const storedActive = loadActiveConversationId();
+      conversationsRef.current = list;
+      setConversations(list);
 
-    const checkPendingBackgroundThreads = () => {
-      if (document.visibilityState !== "visible") return;
-      const pendingBg = conversationsRef.current.filter(
-        (c) => c.pending && c.id !== chatIdRef.current,
-      );
-
-      for (const conv of pendingBg) {
-        if (bgControllersRef.current.has(conv.id)) continue;
-        const ctrl = new AbortController();
-        bgControllersRef.current.set(conv.id, ctrl);
-
-        void pollBackgroundConversation(conv.id, ctrl.signal)
-          .then((res) => {
-            if (ctrl.signal.aborted || chatIdRef.current === conv.id) return;
-            const latest = conversationsRef.current.find(
-              (c) => c.id === conv.id,
-            );
-            if (!latest?.pending) return;
-
-            if (res.state === "done" || res.state === "stale") {
-              const last = latest.messages[latest.messages.length - 1];
-              const base =
-                last?.role === "assistant"
-                  ? latest.messages.slice(0, -1)
-                  : latest.messages;
-              const collected =
-                res.state === "stale"
-                  ? {
-                      ...res.assistantMessage,
-                      parts: [
-                        ...res.assistantMessage.parts,
-                        {
-                          type: "text" as const,
-                          text: "\n\n_This response was interrupted before it finished, so it may be incomplete._",
-                        },
-                      ],
-                    }
-                  : res.assistantMessage;
-              settleConversation(conv.id, [...base, collected]);
-              dispatchTurn({ type: "COLLECTED", chatId: conv.id });
-            } else if (res.state === "empty") {
-              settleConversation(conv.id);
-              dispatchTurn({ type: "RESUME_EMPTY", chatId: conv.id });
-            }
-          })
-          .catch(() => {
-            // Network error or abort; retry on next tick if still pending.
-          })
-          .finally(() => {
-            if (bgControllersRef.current.get(conv.id) === ctrl) {
-              bgControllersRef.current.delete(conv.id);
-            }
-          });
+      const target = storedActive ? list.find((c) => c.id === storedActive) : undefined;
+      if (target) {
+        activeIdRef.current = target.id;
+        setActiveId(target.id);
+      } else {
+        saveActiveConversationId(activeIdRef.current);
       }
-    };
-
-    const initialTimer = window.setTimeout(
-      checkPendingBackgroundThreads,
-      1_000,
-    );
-    const interval = window.setInterval(
-      checkPendingBackgroundThreads,
-      BG_POLL_INTERVAL_MS,
-    );
-    document.addEventListener("visibilitychange", checkPendingBackgroundThreads);
-
+      setIsSeeded(true);
+    });
     return () => {
-      window.clearTimeout(initialTimer);
-      window.clearInterval(interval);
-      document.removeEventListener(
-        "visibilitychange",
-        checkPendingBackgroundThreads,
-      );
+      cancelled = true;
     };
-  }, [restored, hasBackgroundPending, settleConversation, dispatchTurn]);
+  }, []);
 
-  const selectConversation = useCallback(
-    (id: string) => {
-      if (id === chatIdRef.current) return;
-      if (isBusy) detach();
-      setActive(id);
-    },
-    [isBusy, detach, setActive],
-  );
-
-  const newConversation = useCallback(() => {
-    if (isBusy) detach();
-    setActive(createConversationId());
-  }, [isBusy, detach, setActive]);
-
-  const undoableDeleteRef = useRef<UndoableDelete | null>(null);
-  const [deleted, setDeleted] = useState<{ id: string; title: string } | null>(
-    null,
-  );
-
-  const commitDelete = useCallback(() => {
-    const entry = undoableDeleteRef.current;
-    if (!entry) return;
-    window.clearTimeout(entry.timer);
-    undoableDeleteRef.current = null;
-    setDeleted(null);
-    if (entry.stop) stopServer(entry.conversation.id, entry.stop.turnId);
-  }, [stopServer]);
-
+  // Abort all in-flight polls on unmount.
   useEffect(() => {
-    window.addEventListener("pagehide", commitDelete);
+    const polls = inFlightPollsRef.current;
+    const posts = postControllersRef.current;
     return () => {
-      window.removeEventListener("pagehide", commitDelete);
-      commitDelete();
+      for (const ctrl of polls.values()) ctrl.abort();
+      for (const ctrl of posts.values()) ctrl.abort();
+      polls.clear();
+      posts.clear();
     };
-  }, [commitDelete]);
+  }, []);
 
-  const deleteConversation = useCallback(
-    (id: string) => {
-      commitDelete();
-
-      const bgCtrl = bgControllersRef.current.get(id);
-      if (bgCtrl) {
-        bgCtrl.abort();
-        bgControllersRef.current.delete(id);
+  const applyTurnState = useCallback(
+    (chatId: string, state: DurableTurnState | null) => {
+      if (!state) {
+        if (startingChatsRef.current.has(chatId)) return;
+        setLiveByChat((prev) => {
+          if (!(chatId in prev)) return prev;
+          const next = { ...prev };
+          delete next[chatId];
+          return next;
+        });
+        persistConversations((prev) =>
+          prev.map((c) =>
+            c.id === chatId && c.pending
+              ? {
+                  ...c,
+                  pending: false,
+                  pendingSince: undefined,
+                  unansweredReason: "expired",
+                  updatedAt: Date.now(),
+                }
+              : c,
+          ),
+        );
+        return;
       }
 
-      const target = conversationsRef.current.find((c) => c.id === id);
-      const isCurrent = chatIdRef.current === id;
+      if (state.status === "running") {
+        setLiveByChat((prev) => ({
+          ...prev,
+          [chatId]: {
+            steps: state.steps,
+            sources: state.sources,
+            wait: state.wait,
+          },
+        }));
+        return;
+      }
 
-      const generating = (isCurrent && isBusy) || Boolean(target?.pending);
-      const stop = generating
-        ? {
-            turnId: findLastUserMessageId(
-              isCurrent ? messages : (target?.messages ?? []),
-            ),
-          }
-        : undefined;
-
-      setConversations((prev) => {
-        const next = prev.filter((c) => c.id !== id);
-        saveConversations(next);
-        conversationsRef.current = next;
+      // Terminal state: clear live progress for this thread.
+      setLiveByChat((prev) => {
+        if (!(chatId in prev)) return prev;
+        const next = { ...prev };
+        delete next[chatId];
         return next;
       });
 
-      if (isCurrent) {
-        if (isBusy) detach();
-        setActive(createConversationId());
-      }
-      dispatchTurn({ type: "FORGET", chatId: id });
-
-      if (!target) {
-        if (stop) stopServer(id, stop.turnId);
+      if (state.status === "done" && state.message) {
+        const assistantMessage = state.message;
+        setErrorsByChat((prev) => {
+          if (!(chatId in prev)) return prev;
+          const next = { ...prev };
+          delete next[chatId];
+          return next;
+        });
+        persistConversations((prev) =>
+          prev.map((c) => {
+            if (c.id !== chatId || !c.pending) return c;
+            const base =
+              c.messages[c.messages.length - 1]?.role === "assistant"
+                ? c.messages.slice(0, -1)
+                : c.messages;
+            return {
+              ...c,
+              messages: [...base, assistantMessage],
+              pending: false,
+              pendingSince: undefined,
+              unansweredReason: undefined,
+              updatedAt: Date.now(),
+            };
+          }),
+        );
+        if (chatId === activeIdRef.current) {
+          onFinishedRef.current?.(Boolean(assistantMessage.text.trim()));
+        }
         return;
       }
-      undoableDeleteRef.current = {
-        conversation: target,
-        wasActive: isCurrent,
-        stop,
-        timer: window.setTimeout(commitDelete, UNDO_DELETE_MS),
-      };
-      setDeleted({ id, title: target.title });
+
+      if (state.status === "stopped") {
+        persistConversations((prev) =>
+          prev.map((c) =>
+            c.id === chatId && c.pending
+              ? {
+                  ...c,
+                  pending: false,
+                  pendingSince: undefined,
+                  unansweredReason: "stopped",
+                  updatedAt: Date.now(),
+                }
+              : c,
+          ),
+        );
+        return;
+      }
+
+      if (state.status === "error") {
+        setErrorsByChat((prev) => ({
+          ...prev,
+          [chatId]: new Error(state.error ?? "Something went wrong."),
+        }));
+        persistConversations((prev) =>
+          prev.map((c) =>
+            c.id === chatId && c.pending
+              ? {
+                  ...c,
+                  pending: false,
+                  pendingSince: undefined,
+                  updatedAt: Date.now(),
+                }
+              : c,
+          ),
+        );
+      }
     },
-    [isBusy, messages, detach, stopServer, setActive, commitDelete, dispatchTurn],
+    [persistConversations],
   );
 
-  const undoDelete = useCallback(() => {
-    const entry = undoableDeleteRef.current;
-    if (!entry) return;
-    window.clearTimeout(entry.timer);
-    undoableDeleteRef.current = null;
-    setDeleted(null);
+  const pollChat = useCallback(
+    (chatId: string) => {
+      if (inFlightPollsRef.current.has(chatId)) return;
+      const ctrl = new AbortController();
+      inFlightPollsRef.current.set(chatId, ctrl);
 
-    const { conversation } = entry;
-    setConversations((prev) => {
-      const next = saveConversations([
-        conversation,
-        ...prev.filter((c) => c.id !== conversation.id),
-      ]);
-      conversationsRef.current = next;
+      void fetch(`/api/chat/${chatId}`, {
+        method: "GET",
+        signal: ctrl.signal,
+      })
+        .then(async (res) => {
+          if (ctrl.signal.aborted) return;
+          if (res.status === 204) {
+            applyTurnState(chatId, null);
+            return;
+          }
+          if (!res.ok) return;
+          const data = (await res.json()) as DurableTurnState;
+          if (!ctrl.signal.aborted) {
+            applyTurnState(chatId, data);
+          }
+        })
+        .catch(() => {
+          // Transient network blip; next poll will retry automatically.
+        })
+        .finally(() => {
+          if (inFlightPollsRef.current.get(chatId) === ctrl) {
+            inFlightPollsRef.current.delete(chatId);
+          }
+        });
+    },
+    [applyTurnState],
+  );
+
+  const activeConv = useMemo(
+    () => conversations.find((c) => c.id === activeId),
+    [conversations, activeId],
+  );
+  const activePending = Boolean(activeConv?.pending);
+  const hasBgPending = useMemo(
+    () => conversations.some((c) => c.pending && c.id !== activeId),
+    [conversations, activeId],
+  );
+
+  // Poll the open active thread every 1s while pending.
+  useEffect(() => {
+    if (!isSeeded || !activePending) return;
+    const check = () => {
+      if (document.visibilityState === "visible") pollChat(activeId);
+    };
+    check();
+    const timer = window.setInterval(check, ACTIVE_POLL_MS);
+    document.addEventListener("visibilitychange", check);
+    window.addEventListener("online", check);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", check);
+      window.removeEventListener("online", check);
+    };
+  }, [isSeeded, activePending, activeId, pollChat]);
+
+  // Poll pending background threads every 3s so finished answers save automatically.
+  useEffect(() => {
+    if (!isSeeded || !hasBgPending) return;
+    const checkBg = () => {
+      if (document.visibilityState !== "visible") return;
+      for (const conv of conversationsRef.current) {
+        if (conv.pending && conv.id !== activeIdRef.current) {
+          pollChat(conv.id);
+        }
+      }
+    };
+    const initial = window.setTimeout(checkBg, 500);
+    const timer = window.setInterval(checkBg, BG_POLL_MS);
+    document.addEventListener("visibilitychange", checkBg);
+    return () => {
+      window.clearTimeout(initial);
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", checkBg);
+    };
+  }, [isSeeded, hasBgPending, pollChat]);
+
+  const dispatchPrompt = useCallback(
+    (chatId: string, promptMessages: ChatMessage[], effort: EffortLevel) => {
+      const now = Date.now();
+      startingChatsRef.current.add(chatId);
+
+      setErrorsByChat((prev) => {
+        if (!(chatId in prev)) return prev;
+        const next = { ...prev };
+        delete next[chatId];
+        return next;
+      });
+      setLiveByChat((prev) => ({
+        ...prev,
+        [chatId]: { steps: [], sources: [] },
+      }));
+
+      persistConversations((prev) => {
+        const existing = prev.find((c) => c.id === chatId);
+        const updated: Conversation = {
+          id: chatId,
+          title: existing?.title ?? deriveTitle(promptMessages),
+          messages: promptMessages,
+          pending: true,
+          pendingSince: now,
+          unansweredReason: undefined,
+          createdAt: existing?.createdAt ?? now,
+          updatedAt: now,
+        };
+        return [updated, ...prev.filter((c) => c.id !== chatId)];
+      });
+
+      postControllersRef.current.get(chatId)?.abort();
+      const postCtrl = new AbortController();
+      postControllersRef.current.set(chatId, postCtrl);
+
+      void fetchWithRetryAfter(
+        globalThis.fetch,
+        "/api/chat",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ id: chatId, messages: promptMessages, effort }),
+          signal: postCtrl.signal,
+        },
+      )
+        .then(async (res) => {
+          startingChatsRef.current.delete(chatId);
+          if (postCtrl.signal.aborted) return;
+          if (!res.ok) {
+            const payload = (await res.json().catch(() => null)) as {
+              error?: string;
+            } | null;
+            throw new Error(
+              payload?.error ?? `Request failed with HTTP ${res.status}.`,
+            );
+          }
+          const initial = (await res.json()) as DurableTurnState;
+          applyTurnState(chatId, initial);
+        })
+        .catch((err) => {
+          startingChatsRef.current.delete(chatId);
+          if (postCtrl.signal.aborted) return;
+          setLiveByChat((prev) => {
+            const next = { ...prev };
+            delete next[chatId];
+            return next;
+          });
+          setErrorsByChat((prev) => ({
+            ...prev,
+            [chatId]: err instanceof Error ? err : new Error(String(err)),
+          }));
+          persistConversations((prev) =>
+            prev.map((c) =>
+              c.id === chatId
+                ? { ...c, pending: false, pendingSince: undefined, updatedAt: Date.now() }
+                : c,
+            ),
+          );
+        })
+        .finally(() => {
+          if (postControllersRef.current.get(chatId) === postCtrl) {
+            postControllersRef.current.delete(chatId);
+          }
+        });
+    },
+    [persistConversations, applyTurnState],
+  );
+
+  const sendMessage = useCallback(
+    (text: string, effort: EffortLevel) => {
+      const trimmed = text.trim();
+      const id = activeIdRef.current;
+      const current = conversationsRef.current.find((c) => c.id === id);
+      if (!trimmed || current?.pending) return;
+
+      const userMsg: ChatMessage = {
+        id: createConversationId(),
+        role: "user",
+        text: trimmed,
+      };
+      dispatchPrompt(id, [...(current?.messages ?? []), userMsg], effort);
+    },
+    [dispatchPrompt],
+  );
+
+  const editUserMessage = useCallback(
+    (messageId: string, newText: string, effort: EffortLevel) => {
+      const trimmed = newText.trim();
+      const id = activeIdRef.current;
+      const current = conversationsRef.current.find((c) => c.id === id);
+      if (!trimmed || !current || current.pending) return;
+      const idx = current.messages.findIndex((m) => m.id === messageId);
+      if (idx === -1) return;
+
+      const userMsg: ChatMessage = {
+        id: createConversationId(),
+        role: "user",
+        text: trimmed,
+      };
+      dispatchPrompt(id, [...current.messages.slice(0, idx), userMsg], effort);
+    },
+    [dispatchPrompt],
+  );
+
+  const regenerateAssistantMessage = useCallback(
+    (assistantId: string, effort: EffortLevel) => {
+      const id = activeIdRef.current;
+      const current = conversationsRef.current.find((c) => c.id === id);
+      if (!current || current.pending) return;
+      const idx = current.messages.findIndex((m) => m.id === assistantId);
+      if (idx === -1) return;
+      for (let i = idx - 1; i >= 0; i--) {
+        if (current.messages[i].role === "user") {
+          dispatchPrompt(id, current.messages.slice(0, i + 1), effort);
+          return;
+        }
+      }
+    },
+    [dispatchPrompt],
+  );
+
+  const retryLastTurn = useCallback(
+    (effort: EffortLevel) => {
+      const id = activeIdRef.current;
+      const current = conversationsRef.current.find((c) => c.id === id);
+      if (!current || current.pending) return;
+      for (let i = current.messages.length - 1; i >= 0; i--) {
+        if (current.messages[i].role === "user") {
+          dispatchPrompt(id, current.messages.slice(0, i + 1), effort);
+          return;
+        }
+      }
+    },
+    [dispatchPrompt],
+  );
+
+  const stopGeneration = useCallback(() => {
+    const id = activeIdRef.current;
+    const current = conversationsRef.current.find((c) => c.id === id);
+    startingChatsRef.current.delete(id);
+    postControllersRef.current.get(id)?.abort();
+    inFlightPollsRef.current.get(id)?.abort();
+
+    stopServerTurn(id, findLastUserMessageId(current?.messages ?? []));
+
+    setLiveByChat((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
       return next;
     });
-    dispatchTurn({
-      type: "RESTORE",
-      chatId: conversation.id,
-      pending: Boolean(conversation.pending),
-      since: conversation.pendingSince,
-    });
-    if (entry.wasActive && chatIdRef.current !== conversation.id) {
-      if (isBusy) detach();
-      setActive(conversation.id, conversation.messages);
-    }
-  }, [isBusy, detach, setActive, dispatchTurn]);
+    persistConversations((prev) =>
+      prev.map((c) =>
+        c.id === id && c.pending
+          ? {
+              ...c,
+              pending: false,
+              pendingSince: undefined,
+              unansweredReason: "stopped",
+              updatedAt: Date.now(),
+            }
+          : c,
+      ),
+    );
+  }, [persistConversations]);
+
+  const selectConversation = useCallback((id: string) => {
+    if (id === activeIdRef.current) return;
+    activeIdRef.current = id;
+    setActiveId(id);
+    saveActiveConversationId(id);
+  }, []);
+
+  const newConversation = useCallback(() => {
+    const nextId = createConversationId();
+    activeIdRef.current = nextId;
+    setActiveId(nextId);
+    saveActiveConversationId(nextId);
+  }, []);
+
+  const deleteConversation = useCallback(
+    (id: string) => {
+      const target = conversationsRef.current.find((c) => c.id === id);
+      startingChatsRef.current.delete(id);
+      postControllersRef.current.get(id)?.abort();
+      inFlightPollsRef.current.get(id)?.abort();
+
+      if (target?.pending) {
+        stopServerTurn(id, findLastUserMessageId(target.messages));
+      }
+
+      setLiveByChat((prev) => {
+        if (!(id in prev)) return prev;
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      setErrorsByChat((prev) => {
+        if (!(id in prev)) return prev;
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      persistConversations((prev) => prev.filter((c) => c.id !== id));
+
+      if (activeIdRef.current === id) {
+        const nextId = createConversationId();
+        activeIdRef.current = nextId;
+        setActiveId(nextId);
+        saveActiveConversationId(nextId);
+      }
+    },
+    [persistConversations],
+  );
 
   return {
     conversations,
-    activeId: chatId,
-    isSeeded: restored,
+    activeId,
+    messages: activeConv?.messages ?? [],
+    liveProgress: activePending ? (liveByChat[activeId] ?? { steps: [], sources: [] }) : null,
+    pending: activePending,
+    pendingSince: activeConv?.pendingSince,
+    unansweredReason: activeConv?.unansweredReason,
+    error: errorsByChat[activeId] ?? null,
+    isSeeded,
     selectConversation,
     newConversation,
     deleteConversation,
-    deleted,
-    undoDelete,
-    settleConversation,
+    sendMessage,
+    editUserMessage,
+    regenerateAssistantMessage,
+    retryLastTurn,
+    stopGeneration,
   };
 }

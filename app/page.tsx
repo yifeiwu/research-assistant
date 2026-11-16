@@ -1,40 +1,26 @@
 "use client";
 
-import type { UIMessage } from "ai";
 import {
-  useCallback,
   useEffect,
-  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
 } from "react";
 import { ArrowDown, RotateCw } from "lucide-react";
 import { Message } from "@/components/Message";
+import { ResearchStep } from "@/components/ResearchStep";
 import { Header } from "@/components/Header";
 import { Composer } from "@/components/Composer";
 import { EmptyState } from "@/components/EmptyState";
 import { ConversationSidebar } from "@/components/ConversationSidebar";
 import { UnansweredNotice } from "@/components/UnansweredNotice";
-import { useChatState } from "@/lib/hooks/useChatState";
 import { useConversations } from "@/lib/hooks/useConversations";
 import { useChatSettings } from "@/lib/hooks/useChatSettings";
 import { useScrollAnchor } from "@/lib/hooks/useScrollAnchor";
 import { useHeartbeat } from "@/lib/hooks/useHeartbeat";
-import { useChatActions } from "@/lib/hooks/useChatActions";
-import { useReconnect } from "@/lib/hooks/useReconnect";
-import { useTurnMachine } from "@/lib/hooks/useTurnMachine";
-import { createChatSession } from "@/lib/chat-session";
 import { busyLabel, formatDuration } from "@/lib/format";
-import { endsUnanswered, findLastUserMessageId } from "@/lib/messages";
-import {
-  CHAT_STREAM_THROTTLE_MS,
-  createConversationId,
-} from "@/lib/conversations";
+import { endsUnanswered } from "@/lib/messages";
 import { describeChatError } from "@/lib/chat-error";
-import { isPending, streamEndEvent, type TurnEvent } from "@/lib/turn-machine";
-import { activeTurnStatus } from "@/lib/turn-status";
-import { withHeldMessage } from "@/lib/turn-view";
 
 const DESKTOP_MEDIA_QUERY = "(min-width: 768px)";
 
@@ -53,47 +39,6 @@ function getDesktopServerSnapshot(): boolean {
 }
 
 export default function Home() {
-  const [activeThread, setActiveThread] = useState<{
-    id: string;
-    initialMessages?: UIMessage[];
-  }>(() => ({ id: createConversationId() }));
-  const chatId = activeThread.id;
-
-  // The state of every thread's latest turn (lib/turn-machine.ts).
-  const {
-    state: turnState,
-    dispatch: dispatchTurn,
-    getState: getTurnState,
-  } = useTurnMachine(chatId);
-  const activeTurn = turnState.threads[chatId];
-  const turnActive = isPending(activeTurn?.phase);
-
-  const openThread = useCallback(
-    (id: string, initialMessages?: UIMessage[]) => {
-      dispatchTurn({ type: "ACTIVATE", chatId: id });
-      setActiveThread({ id, initialMessages });
-    },
-    [dispatchTurn],
-  );
-
-  const session = useMemo(
-    () =>
-      createChatSession(activeThread.id, {
-        initialMessages: activeThread.initialMessages,
-      }),
-    [activeThread],
-  );
-
-  useEffect(() => {
-    return () => {
-      session.abortReconnect();
-      void session.chat.stop();
-    };
-  }, [session]);
-
-  const { messages, sendMessage, status, error, stop, setMessages } =
-    useChatState(session.chat, CHAT_STREAM_THROTTLE_MS);
-
   const isDesktop = useSyncExternalStore(
     subscribeDesktop,
     getDesktopSnapshot,
@@ -103,185 +48,69 @@ export default function Home() {
   const sidebarOpen = sidebarOverride ?? isDesktop;
 
   const [input, setInput] = useState("");
-  const [held, setHeld] = useState<{ chatId: string; message: UIMessage } | null>(
-    null,
-  );
   const [announcement, setAnnouncement] = useState("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const wasActiveRef = useRef(false);
+  const wasPendingRef = useRef(false);
 
-  const isBusy = status === "submitted" || status === "streaming";
-  const errorInfo = error ? describeChatError(error) : null;
-
-  useEffect(() => {
-    if (status === "streaming") dispatchTurn({ type: "STREAMING", chatId });
-  }, [status, chatId, dispatchTurn]);
-
-  const { settings, updateSettings, requestBody } = useChatSettings();
-
-  const stopServer = useCallback((id: string, turnId?: string) => {
-    void fetch(`/api/chat/${id}/stop`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(turnId ? { turnId } : {}),
-      keepalive: true,
-    });
-  }, []);
-
-  const getTurn = useCallback(
-    (id: string) => getTurnState().threads[id],
-    [getTurnState],
-  );
-
-  const detachStream = useCallback(() => {
-    session.abortReconnect();
-    void stop();
-  }, [session, stop]);
+  const { settings, updateSettings } = useChatSettings();
 
   const {
     conversations,
     activeId,
+    messages,
+    liveProgress,
+    pending,
+    pendingSince,
+    unansweredReason,
+    error,
     isSeeded,
     selectConversation,
     newConversation,
     deleteConversation,
-    deleted,
-    undoDelete,
-    settleConversation,
-  } = useConversations({
-    chatId,
-    setChatId: openThread,
-    messages,
-    setMessages,
-    isBusy,
-    activeTurn,
-    getTurn,
-    dispatchTurn,
-    detach: detachStream,
-    stopServer,
-  });
-
-  const listedConversations = useMemo(
-    () =>
-      conversations.map((conv) => {
-        const pending = isPending(turnState.threads[conv.id]?.phase);
-        return Boolean(conv.pending) === pending ? conv : { ...conv, pending };
-      }),
-    [conversations, turnState.threads],
-  );
-
-  const applyTurn = useCallback(
-    (event: TurnEvent, finalMessages?: UIMessage[]) => {
-      const id = "chatId" in event ? event.chatId : null;
-      const wasPending =
-        id !== null && isPending(getTurnState().threads[id]?.phase);
-      const next = dispatchTurn(event);
-      if (id === null || isPending(next.threads[id]?.phase)) return;
-      if (wasPending || finalMessages) settleConversation(id, finalMessages);
-    },
-    [dispatchTurn, getTurnState, settleConversation],
-  );
-
-  const heldMessage = held?.chatId === chatId ? held.message : null;
-  const shownMessages = useMemo(
-    () => withHeldMessage(messages, heldMessage),
-    [messages, heldMessage],
-  );
-  const holding = shownMessages !== messages;
-  const hasMessages = shownMessages.length > 0;
-
-  useEffect(() => {
-    return session.onStreamEnd((end) => {
-      const event = streamEndEvent(chatId, end);
-      if (getTurnState().threads[chatId]?.phase === "stopped") {
-        const final = withHeldMessage(end.messages, heldMessage);
-        if (final !== end.messages) setMessages(final);
-        applyTurn(event, final);
-        return;
-      }
-      applyTurn(event, event.type === "FINISHED" ? end.messages : undefined);
-      if (event.type === "FINISHED") {
-        setAnnouncement(
-          endsUnanswered(end.messages)
-            ? "The response ended without an answer."
-            : "Answer ready.",
-        );
-      }
-    });
-  }, [session, chatId, applyTurn, getTurnState, heldMessage, setMessages]);
-
-  const stopGeneration = useCallback(() => {
-    const finalMessages = withHeldMessage(session.chat.messages, heldMessage);
-    stopServer(chatId, findLastUserMessageId(finalMessages));
-    session.abortReconnect();
-    void stop();
-    applyTurn({ type: "STOP", chatId }, finalMessages);
-    setAnnouncement("Stopped.");
-  }, [chatId, session, heldMessage, stop, stopServer, applyTurn]);
-
-  const holdMessage = useCallback((id: string, message: UIMessage | null) => {
-    setHeld(message ? { chatId: id, message } : null);
-  }, []);
-
-  useReconnect({
-    session,
-    chatId,
-    turn: activeTurn,
-    isSeeded,
-    applyTurn,
-    onHold: holdMessage,
-  });
-
-  const { scrollRef, atBottom, handleScroll, scrollToBottom } = useScrollAnchor(
-    shownMessages,
-    turnActive,
-  );
-
-  const heartbeat = useHeartbeat(turnActive, messages, activeTurn?.since);
-
-  const lastMessage = shownMessages[shownMessages.length - 1];
-  const lastIsAssistant = lastMessage?.role === "assistant";
-  const turnPaused =
-    turnActive && lastIsAssistant && activeTurnStatus(lastMessage) !== null;
-
-  const showError = activeTurn?.phase === "failed" && errorInfo !== null;
-  const showUnanswered =
-    isSeeded && !turnActive && !showError && endsUnanswered(shownMessages);
-
-  const beginTurn = useCallback(() => {
-    dispatchTurn({ type: "SEND", chatId, at: Date.now() });
-    setAnnouncement("");
-  }, [chatId, dispatchTurn]);
-
-  const { handleEditUser, handleRegenerate, handleRetry } = useChatActions({
-    messages,
-    setMessages,
     sendMessage,
-    isBusy: isBusy || turnActive,
-    requestBody,
-    onBeforeSend: beginTurn,
+    editUserMessage,
+    regenerateAssistantMessage,
+    retryLastTurn,
+    stopGeneration,
+  } = useConversations({
+    onTurnFinished: (answered) => {
+      setAnnouncement(
+        answered ? "Answer ready." : "The response ended without an answer.",
+      );
+    },
   });
 
-  // Return focus to the input once a turn is over.
+  const heartbeat = useHeartbeat(pending, pendingSince);
+  const { scrollRef, atBottom, handleScroll, scrollToBottom } = useScrollAnchor(
+    messages,
+    pending,
+  );
+
   useEffect(() => {
-    if (wasActiveRef.current && !turnActive && hasMessages) {
+    if (wasPendingRef.current && !pending && messages.length > 0) {
       inputRef.current?.focus();
     }
-    wasActiveRef.current = turnActive;
-  }, [turnActive, hasMessages]);
+    wasPendingRef.current = pending;
+  }, [pending, messages.length]);
+
+  const hasMessages = messages.length > 0 || pending;
+  const errorInfo = error ? describeChatError(error) : null;
+  const showError = !pending && errorInfo !== null;
+  const showUnanswered =
+    isSeeded && !pending && !showError && endsUnanswered(messages);
 
   function submit(text: string) {
     const trimmed = text.trim();
-    if (!trimmed || isBusy || turnActive) return;
-    beginTurn();
-    void sendMessage({ text: trimmed }, { body: requestBody() });
+    if (!trimmed || pending) return;
+    setAnnouncement("");
+    sendMessage(trimmed, settings.effort);
     setInput("");
   }
 
   return (
     <div className="flex h-dvh bg-background">
       <ConversationSidebar
-        conversations={listedConversations}
+        conversations={conversations}
         activeId={activeId}
         open={sidebarOpen}
         onSelect={(id) => {
@@ -294,8 +123,6 @@ export default function Home() {
           if (!isDesktop) setSidebarOverride(false);
         }}
         onDelete={deleteConversation}
-        deleted={deleted}
-        onUndoDelete={undoDelete}
         onClose={() => setSidebarOverride(false)}
       />
 
@@ -316,7 +143,7 @@ export default function Home() {
             setInput={setInput}
             onSubmit={() => submit(input)}
             onExample={submit}
-            disabled={isBusy}
+            disabled={pending}
             settings={settings}
             onSettingsChange={updateSettings}
           />
@@ -328,41 +155,47 @@ export default function Home() {
               className="relative flex-1 overflow-y-auto"
             >
               <div className="mx-auto flex max-w-3xl flex-col gap-5 px-4 py-6">
-                {shownMessages.map((message, i) => (
+                {messages.map((message) => (
                   <Message
                     key={message.id}
                     message={message}
-                    streaming={
-                      turnActive &&
-                      i === shownMessages.length - 1 &&
-                      message.role === "assistant"
+                    onEdit={(id, next) =>
+                      editUserMessage(id, next, settings.effort)
                     }
-                    onEdit={handleEditUser}
-                    onRegenerate={handleRegenerate}
+                    onRegenerate={(id) =>
+                      regenerateAssistantMessage(id, settings.effort)
+                    }
                   />
                 ))}
+
+                {pending && liveProgress && liveProgress.steps.length > 0 && (
+                  <div className="w-full">
+                    {liveProgress.steps.map((step) => (
+                      <ResearchStep key={step.round} data={step} />
+                    ))}
+                  </div>
+                )}
 
                 <div
                   role="status"
                   aria-live="polite"
                   className={
-                    turnActive
+                    pending
                       ? "flex items-center gap-2 text-sm text-muted"
                       : "sr-only"
                   }
                 >
-                  {turnActive ? (
+                  {pending ? (
                     <>
                       <span className="loading-dot text-accent" aria-hidden>
                         ●
                       </span>
                       <span>
-                        {busyLabel(activeTurn?.phase, heartbeat.idle, {
-                          nothingYet:
-                            !lastIsAssistant || lastMessage.parts.length === 0,
-                          paused: turnPaused,
-                          replaying: holding,
-                        })}
+                        {busyLabel(
+                          liveProgress?.steps ?? [],
+                          liveProgress?.wait,
+                          heartbeat.now,
+                        )}
                       </span>
                       <span
                         className="text-xs text-muted/70 tabular-nums"
@@ -378,13 +211,8 @@ export default function Home() {
 
                 {showUnanswered && (
                   <UnansweredNotice
-                    reason={
-                      activeTurn?.phase === "stopped" ||
-                      activeTurn?.phase === "expired"
-                        ? activeTurn.phase
-                        : undefined
-                    }
-                    onRetry={handleRetry}
+                    reason={unansweredReason}
+                    onRetry={() => retryLastTurn(settings.effort)}
                   />
                 )}
 
@@ -397,8 +225,8 @@ export default function Home() {
                       <div className="font-medium">{errorInfo.title}</div>
                       <button
                         type="button"
-                        onClick={handleRetry}
-                        disabled={isBusy}
+                        onClick={() => retryLastTurn(settings.effort)}
+                        disabled={pending}
                         className="flex shrink-0 items-center gap-1.5 rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-200 transition hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                         aria-label="Retry sending the message"
                       >
@@ -444,9 +272,12 @@ export default function Home() {
                   input={input}
                   setInput={setInput}
                   onSubmit={() => submit(input)}
-                  onStop={stopGeneration}
+                  onStop={() => {
+                    stopGeneration();
+                    setAnnouncement("Stopped.");
+                  }}
                   disabled={false}
-                  busy={turnActive}
+                  busy={pending}
                   settings={settings}
                   onSettingsChange={updateSettings}
                 />

@@ -1,9 +1,11 @@
-import { stopChatStream, isChatId, isTurnId } from "@/lib/agent/chat-stream";
+import {
+  isChatId,
+  isTurnId,
+  stopDurableTurn,
+} from "@/lib/agent/turn-store";
 
 /**
- * Cancel generation for this chat across serverless instances via Upstash Redis.
- * Client disconnect is *not* a stop; only this endpoint (the Stop button or
- * thread deletion) should abort server-side generation.
+ * Cancel an active turn for `chatId` across serverless instances via Upstash Redis.
  */
 export async function POST(
   req: Request,
@@ -24,6 +26,6 @@ export async function POST(
     // Empty body is valid.
   }
 
-  await stopChatStream(id, turnId);
+  await stopDurableTurn(id, turnId);
   return Response.json({ ok: true });
 }

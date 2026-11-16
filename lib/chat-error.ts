@@ -27,9 +27,9 @@ function describeRateLimit(raw: string): ChatErrorInfo | null {
   const model = /model `([^`]+)`/.exec(raw)?.[1];
   const window = /\((OTPM|ITPM|TPM|RPM|RPD)\)/.exec(raw)?.[1];
   const limit = /Limit ([\d,]+)/.exec(raw)?.[1];
-  const retryIn = /try again in ([\d.]+s)/i.exec(raw)?.[1];
+  const retryIn = /try again in (?:about )?((?:\d[\d.]*(?:ms|[hms]))+)/i.exec(raw)?.[1];
   const bits = [
-    model ? `the model \`${model}\`` : "the model",
+    model ? `the model \`${model}\`` : "the model pool",
     window ? `hit its ${window} per-minute limit` : "hit its per-minute rate limit",
     limit ? `(limit ${limit})` : null,
   ].filter(Boolean);
@@ -37,8 +37,8 @@ function describeRateLimit(raw: string): ChatErrorInfo | null {
     title: "Model rate limit reached",
     detail: `Groq reports ${bits.join(" ")}. The free-tier per-minute budget is shared across search planning, summarising, and the final answer, so back-to-back questions can exhaust it.`,
     hint: retryIn
-      ? `Wait about ${retryIn} and retry, or pick a different model below.`
-      : "Wait a few seconds and retry, or pick a different model below.",
+      ? `Wait about ${retryIn} and retry.`
+      : "Wait a few seconds and retry.",
     technical: truncate(raw),
   };
 }
@@ -56,13 +56,12 @@ export function describeChatError(err: unknown): ChatErrorInfo {
     };
   }
 
-  // The research queue was full, or this turn waited in it too long.
-  if (/server is busy with other research requests/i.test(message)) {
+  if (/server is busy with other requests/i.test(message)) {
     return {
       title: "The server is busy",
       detail:
-        "Only a few research requests run at once so they don't exhaust the shared model quota together. The queue was full, or this request waited in it too long.",
-      hint: "Wait a minute, then retry.",
+        "Only a few requests run at once so they don't exhaust the shared model quota together. The queue was full, or this request waited in it too long.",
+      hint: "Wait a moment, then retry.",
       technical: truncate(message),
     };
   }
@@ -109,11 +108,11 @@ export function describeChatError(err: unknown): ChatErrorInfo {
     };
   }
 
-  if (/\b404\b|model.*not found|decommissioned|does not exist/i.test(message)) {
+  if (/\b404\b|model.*not (?:found|available)|decommissioned|does not exist/i.test(message)) {
     return {
       title: "Model not available",
-      detail: "The configured model name wasn't found at the provider — it may have been renamed or retired.",
-      hint: "Pick a different model in the composer, then retry.",
+      detail: "A configured model name wasn't found at the provider — it may have been renamed or retired.",
+      hint: "Check the server's model pool configuration, then retry.",
       technical: truncate(message),
     };
   }

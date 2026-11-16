@@ -4,11 +4,9 @@
  * Every model call in the app receives plain text and outputs plain text — no
  * native function/tool calling or JSON-schema mode is required.
  */
+import type { EffortLevel } from "./effort";
+import type { DegradedResearch } from "./types/chat";
 
-/**
- * A current-date line prepended to every system prompt so models without a
- * real-time clock reason accurately about "today", "latest", or "this year".
- */
 function currentDateLine(): string {
   const today = new Intl.DateTimeFormat("en-US", {
     weekday: "long",
@@ -20,11 +18,12 @@ function currentDateLine(): string {
   return `Today's date is ${today} (UTC).`;
 }
 
-/** Prompt used when no web search runs (`low` effort or `NO_SEARCH`), and as
- * the fallback when search was attempted but retrieved nothing — in which
- * case `searchFailed`/`degraded` force an explicit disclosure. */
+/**
+ * Prompt used when no web search runs (`low` effort or `NO_SEARCH`), and as
+ * the fallback when search was attempted but retrieved nothing.
+ */
 export function buildDirectAnswerPrompt(
-  degraded?: import("./types/chat").DegradedResearch,
+  degraded?: DegradedResearch,
   searchFailed?: boolean,
 ): string {
   const failureLine = searchFailed
@@ -45,17 +44,9 @@ Guidelines:
 
 /**
  * Stage 1 prompt: turns the conversation into a self-contained `BRIEF:` line
- * plus ONE focused initial web search query, or `NO_SEARCH` when external
- * lookup is clearly unnecessary. Subsequent angles are explored sequentially
- * in follow-up rounds informed by what earlier rounds actually find.
+ * plus ONE focused initial web search query, or `NO_SEARCH`.
  */
-export function buildQueryPlanPrompt(
-  effortLevel?: import("./effort").EffortLevel,
-): string {
-  const operatorGuidance =
-    effortLevel === "high"
-      ? `\n- Optional precision operators: prefix the query line with \`RECENT: \` (or \`RECENT[90d]: \`) when strict recency matters, or \`EXACT: \` when matching an exact identifier, filing/statute code, CVE, or verbatim paper/benchmark title.`
-      : "";
+export function buildQueryPlanPrompt(): string {
   return `${currentDateLine()}
 
 You plan the initial web search query for a sequential, multi-round analytical research assistant.
@@ -68,21 +59,18 @@ NO_SEARCH
 - Otherwise:
   1. On the FIRST line, output \`BRIEF: <concise self-contained research question>\` (1 sentence, under 35 words) resolving all pronouns ("it", "they", "that"), named entities, timeframe, and comparison/analytical criteria from prior conversation turns.
   2. On the SECOND line, output ONE high-signal initial web search query targeting the core primary empirical data, official documentation, filings, or authoritative overview (later rounds will sequentially search missing mechanisms, benchmarks, or counterpoints based on what Round 1 retrieves).
-- Make the search query self-contained and include the current year when freshness matters.${operatorGuidance}
+- Make the search query self-contained and include the current year when freshness matters.
 - Output ONLY the \`BRIEF:\` line followed by the single raw search query. No numbering, no bullets, no quotes, no commentary, no JSON.`;
 }
 
 /**
  * Gap-check prompt: inspects gathered research notes across rounds and either
- * finishes (`DONE`) or emits ONE targeted follow-up search query to fill the
- * highest-priority empirical, primary-source, contradiction, or counterpoint gap.
+ * finishes (`DONE`) or emits ONE targeted follow-up search query.
  */
-export function buildGapCheckPrompt(
-  effortLevel?: import("./effort").EffortLevel,
-): string {
+export function buildGapCheckPrompt(effortLevel?: EffortLevel): string {
   const depthGuidance =
     effortLevel === "high"
-      ? "\n- Because high-effort deep research is requested, do NOT output DONE until independent benchmarks/primary sources AND meaningful counterarguments, limitations, or failure modes have been checked. If secondary articles cited a specific primary study, filing, or benchmark not yet retrieved, prioritize searching for that primary source directly (you may prefix with `EXACT: ` or `RECENT: ` when helpful)."
+      ? "\n- Because high-effort deep research is requested, do NOT output DONE until independent benchmarks/primary sources AND meaningful counterarguments, limitations, or failure modes have been checked."
       : "";
   return `${currentDateLine()}
 
@@ -102,76 +90,18 @@ DONE
 - Output ONLY "DONE" or the single raw search query. No numbering, no bullets, no quotes, no commentary.`;
 }
 
-/**
- * Candidate reranker prompt: selects the highest-authority, least-redundant
- * sources from a wider Exa search pool before spending condensation tokens.
- */
-export function buildRerankPrompt(maxSelect: number): string {
-  return `${currentDateLine()}
-
-You select the ${maxSelect} highest-value web sources to read in full for a research question.
-
-Selection priorities:
-1. Primary authority: Prefer peer-reviewed studies, official documentation, regulatory filings, and original benchmark reports over secondary news rewrites, SEO listicles, or promotional vendor blogs.
-2. Empirical density & directness: Prefer candidates whose snippet/highlights directly contain quantitative data, methodology details, or direct answers to the research question.
-3. Complementary coverage: Avoid selecting multiple syndicated copies or rewrites of the exact same announcement; pick diverse domains covering distinct facets or counterpoints.
-
-Output format rules (STRICT):
-- Output ONLY up to ${maxSelect} 1-based candidate numbers in priority order, separated by spaces or commas (e.g. \`2, 5, 1, 7\`). No prose, no bullets, no explanation.`;
-}
-
-/**
- * Thematic Reduce prompt: losslessly compresses a cluster of condensed source
- * notes into a dense analytical sub-brief when multi-round gathering exceeds
- * the single-call synthesis context window.
- */
-export function buildThematicReducePrompt(): string {
-  return `${currentDateLine()}
-
-You distill a cluster of multi-round research notes into a lossless, citation-preserved analytical sub-brief.
-
-Rules (STRICT):
-- Preserve EVERY concrete number, percentage, unit, sample size/workload condition, date, causal mechanism, and methodological caveat relevant to the research question.
-- Preserve \`[Fact]\` vs \`[Claim]\` epistemic tags and source rigor profiles (\`peer-reviewed\`, \`official-docs\`, \`news\`, \`vendor\`, \`blog/forum\`).
-- Every bullet MUST retain exact inline markdown source attribution \`[Source Title](exact_URL)\` using ONLY the exact URLs given in the input notes. Never drop or alter a URL that supports a retained fact.
-- Eliminate cross-source repetition by merging duplicate background facts into a single triangulated bullet citing all corroborating \`[Title](URL)\` links, and explicitly juxtapose conflicting numbers or claims side by side.
-- Omit sources marked \`Irrelevant to research question\`.
-- Output compact markdown sub-headings and dense bullet points only. No intro or conclusion filler.`;
-}
-
-/**
- * Pre-synthesis Analytical Blueprint & Entailment Critic prompt: audits the
- * gathered evidence against every constraint of the user's question before the
- * final streamed synthesis begins.
- */
-export function buildAnalyticalBlueprintPrompt(): string {
-  return `${currentDateLine()}
-
-You are a senior research verification editor creating a compact analytical blueprint and entailment audit before the final report is written.
-
-Inspect the user's question and the gathered research notes, then output a tight, structured plain-text blueprint (< 350 words) with four short sections:
-1. SUB-QUESTIONS & CONSTRAINTS: Checklist of every entity, timeframe, comparison axis, or constraint the final answer must cover.
-2. THESIS & ENTAILED HEADLINE METRICS: Direct bottom-line conclusion plus key verified metrics paired with the exact URL from the notes that entails each figure (note \`[Fact]\` vs \`[Claim]\`).
-3. BASELINE & CONTRADICTION AUDIT: Flag any apples-to-oranges differences across sources (differing years, cohorts, units, workloads, or vendor vs. independent framing) so the writer normalizes or caveats them accurately.
-4. UNRESOLVED GAPS: Specific claims or dimensions NOT proven by the notes that the writer must explicitly bound rather than extrapolate.
-
-Output concise bullet points only. Never invent figures or URLs.`;
-}
-
 export type SynthesisPromptOptions = {
-  effort?: import("./effort").EffortLevel;
+  effort?: EffortLevel;
   maxOutputTokens?: number;
-  analyticalBlueprint?: string;
 };
 
 /**
- * Stage 4 (reduce) prompt: synthesizes the pre-fetched, condensed research
- * notes into a grounded, cross-source analytical answer scaled to effort and
- * output-token headroom.
+ * Final synthesis prompt: synthesizes condensed research notes into a grounded,
+ * cross-source analytical answer scaled to effort and output-token headroom.
  */
 export function buildSynthesisPrompt(
   evidenceBlock: string,
-  degraded?: import("./types/chat").DegradedResearch,
+  degraded?: DegradedResearch,
   opts?: SynthesisPromptOptions,
 ): string {
   const degradedLine = degraded?.length
@@ -192,13 +122,6 @@ export function buildSynthesisPrompt(
       : `Depth & Structure (Balanced Analysis):
 - Open with a clear bottom-line answer, then organize supporting analysis thematically using concise markdown headings, bullet points, or compact comparison tables where they sharpen clarity, ending with key trade-offs or caveats.`;
 
-  const blueprintBlock = opts?.analyticalBlueprint?.trim()
-    ? `\n=== VERIFIED ANALYTICAL BLUEPRINT & ENTAILMENT AUDIT ===
-Use this pre-verified audit to ensure every sub-question is answered, incompatible baselines are normalized/caveated, and every number is attributed only to the source URL that entails it (do not copy these internal section labels verbatim):
-${opts.analyticalBlueprint.trim()}
-=== END ANALYTICAL BLUEPRINT ===\n`
-    : "";
-
   return `${currentDateLine()}
 
 You are a rigorous web research analyst.
@@ -214,7 +137,7 @@ Analytical Standards:
 - Do not end with a "Sources" or "References" list: the interface already lists every source below your answer, with the ones you linked first.${degradedLine}
 
 ${depthSection}
-${blueprintBlock}
+
 === RESEARCH NOTES ===
 ${evidenceBlock}
 === END RESEARCH NOTES ===`;

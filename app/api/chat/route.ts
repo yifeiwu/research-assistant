@@ -1,51 +1,38 @@
-import { convertToModelMessages, UI_MESSAGE_STREAM_HEADERS, type UIMessage } from "ai";
 import { after } from "next/server";
+import { serverConfig } from "@/lib/config";
 import { effortConfig } from "@/lib/effort";
-import { chatRequestSchema } from "@/lib/types/chat";
+import { isAbortError } from "@/lib/errors";
+import {
+  chatRequestSchema,
+  type ResearchSource,
+  type ResearchStepData,
+} from "@/lib/types/chat";
 import {
   findLastUserMessageId,
   latestUserText,
-  pruneAssistantHistory,
+  toModelMessages,
 } from "@/lib/messages";
-import { logInfo, logError } from "@/lib/logger";
+import { logError, logInfo } from "@/lib/logger";
 import { isResolutionError, planModels } from "@/lib/agent/models";
+import { sharedRequestQueue } from "@/lib/agent/queue";
+import { clientErrorMessage, executeTurn } from "@/lib/agent/turn";
+import {
+  finishDurableTurn,
+  isTurnCancelled,
+  startDurableTurn,
+  updateDurableTurnProgress,
+  updateDurableTurnWait,
+  watchDurableTurn,
+} from "@/lib/agent/turn-store";
 import { checkChatRateLimit, getClientIp } from "@/lib/rate-limit";
-import {
-  sharedAdmissionQueue,
-  type AdmissionTicket,
-} from "@/lib/agent/admission";
-import {
-  startChatStream,
-  abortChatStream,
-} from "@/lib/agent/chat-stream";
-import {
-  discardDetachedTurn,
-  saveDetachedTurn,
-  tailDetachedTurn,
-} from "@/lib/agent/detached";
 
-// The response relays the turn's output from Redis, and the turn itself runs
-// in this invocation after (and regardless of) the response, both for at
-// most this long. A turn that needs longer is continued by a later request;
-// see lib/agent/detached.ts. `detached.invocationLimitMs` in lib/config.ts
-// has to say the same (tests/config.test.ts checks).
 export const maxDuration = 300;
 
-/** How soon a client should retry after the research queue was full. */
 const QUEUE_FULL_RETRY_AFTER_SECONDS = 15;
-
-/** What a turn that was stopped before it produced anything streams back. */
-function stoppedResponse(): Response {
-  return new Response(
-    'data: {"type":"start"}\n\ndata: {"type":"abort"}\n\ndata: [DONE]\n\n',
-    { headers: UI_MESSAGE_STREAM_HEADERS },
-  );
-}
 
 export async function POST(req: Request) {
   const startedAt = Date.now();
 
-  // Per-IP Redis rate limit before any expensive work (model/Exa calls).
   const rateLimit = await checkChatRateLimit(getClientIp(req.headers));
   if (!rateLimit.allowed) {
     return Response.json(
@@ -75,12 +62,10 @@ export async function POST(req: Request) {
     );
   }
 
-  const { model, effort: rawEffort, id: rawChatId } = parsed.data;
-  const messages = parsed.data.messages as unknown as UIMessage[];
-  // The run buffer is keyed by chat, so a request without a chat id gets one of its own.
+  const { messages, effort: rawEffort, id: rawChatId } = parsed.data;
   const chatId = rawChatId ?? crypto.randomUUID();
-
   const effort = effortConfig(rawEffort);
+
   if (effort.rounds > 0 && !process.env.EXA_API_KEY?.trim()) {
     return Response.json(
       { error: "EXA_API_KEY is not set on the server." },
@@ -88,125 +73,155 @@ export async function POST(req: Request) {
     );
   }
 
-  const requestId = crypto.randomUUID().slice(0, 8);
-
-  // Only to reject a misconfigured server up front and to log the choice;
-  // each attempt builds the models it actually uses.
-  const plan = planModels({ model });
+  const plan = planModels();
   if (isResolutionError(plan)) {
     return Response.json({ error: plan.error }, { status: plan.status });
   }
 
-  const query = latestUserText(messages);
-  const turnId = findLastUserMessageId(messages);
-  const history = pruneAssistantHistory(messages);
-
-  // Check the messages convert BEFORE registering the Redis stream, so a
-  // malformed payload fails cleanly with 400 instead of in an attempt.
-  try {
-    await convertToModelMessages(history);
-  } catch (error) {
-    logError("convert-messages", error, { requestId, chatId });
+  const queue = sharedRequestQueue();
+  if (await queue.isFull()) {
     return Response.json(
-      { error: "Could not process conversation messages." },
-      { status: 400 },
+      {
+        error:
+          "The server is busy with other requests right now. Please try again in a moment.",
+      },
+      {
+        status: 429,
+        headers: { "Retry-After": String(QUEUE_FULL_RETRY_AFTER_SECONDS) },
+      },
     );
   }
 
+  const requestId = crypto.randomUUID().slice(0, 8);
+  const query = latestUserText(messages);
+  const turnId = findLastUserMessageId(messages);
+  const modelMessages = toModelMessages(messages);
+
   logInfo("request", {
     requestId,
-    model: plan.selectedModel,
-    plannerModel: plan.candidates.planner[0],
-    summaryModel: plan.candidates.summary[0],
+    chatId,
+    reasoningPool: plan.pools.reasoning,
+    summarizerPool: plan.pools.summarizer,
     messageCount: messages.length,
     query: query.slice(0, 200),
     effort: effort.level,
     rounds: effort.rounds,
   });
 
-  // Research turns take a place in the shared FIFO queue. Join it before any
-  // stream exists so a full queue is a plain 429 the client can retry.
-  const queue = sharedAdmissionQueue();
-  let ticket: AdmissionTicket | undefined;
-  if (queue.enabled && effort.rounds > 0 && query.trim()) {
-    ticket = {
-      id: `${requestId}-${crypto.randomUUID().slice(0, 8)}`,
-      enqueuedAt: startedAt,
-    };
-    const initial = await queue.poll(ticket);
-    if (initial.state === "full") {
-      logInfo("admission-full", { requestId, queueLength: initial.queueLength });
-      return Response.json(
-        {
-          error:
-            "The server is busy with other research requests right now. Please try again in a moment.",
-        },
-        {
-          status: 429,
-          headers: { "Retry-After": String(QUEUE_FULL_RETRY_AFTER_SECONDS) },
-        },
-      );
-    }
-  }
-  const leaveQueue = async () => {
-    if (ticket) await queue.cancel(ticket);
-  };
-
-  let run: Awaited<ReturnType<typeof startChatStream>>;
+  let started: Awaited<ReturnType<typeof startDurableTurn>>;
   try {
-    run = await startChatStream(chatId, turnId);
+    started = await startDurableTurn(chatId, turnId);
   } catch (error) {
-    logError("stream-start", error, { requestId, chatId });
-    await leaveQueue();
+    logError("turn-start", error, { requestId, chatId });
     return Response.json(
       {
         error:
-          "Couldn't initialize the chat stream store. Check that Upstash Redis environment variables are set.",
+          "Couldn't initialize the turn store. Check that Upstash Redis environment variables are set.",
       },
       { status: 500 },
     );
   }
-  const { runId } = run;
 
-  // Stop was pressed before this request got here: the run is already over.
-  if (run.preStopped) {
-    await leaveQueue();
-    return stoppedResponse();
+  if (started.preStopped) {
+    return Response.json(started.state, { status: 200 });
   }
 
-  // Save the turn, then serve this request from the run's stream buffer
-  // while the turn runs behind it.
-  try {
-    await saveDetachedTurn({
-      runId,
-      chatId,
-      requestId,
-      model,
-      effort: rawEffort,
-      messages: history,
-      query,
-      ticket,
-      createdAt: startedAt,
-    });
-    const tail = await tailDetachedTurn({
-      chatId,
-      runId,
-      origin: "start",
-      startedAt,
-      signal: req.signal,
-      keepAlive: after,
-    });
-    // Nothing to tail means the run ended (stopped) before producing output.
-    return tail ?? stoppedResponse();
-  } catch (error) {
-    logError("turn-start", error, { requestId, chatId, runId });
-    // Make sure no later request runs it after this one has reported failure.
-    await discardDetachedTurn(runId);
-    await abortChatStream(chatId, runId);
-    await leaveQueue();
-    return Response.json(
-      { error: "Couldn't start your request. Please try again in a moment." },
-      { status: 503 },
-    );
-  }
+  const { runId } = started.state;
+  const deadlineAt =
+    startedAt +
+    serverConfig.turn.invocationLimitMs -
+    serverConfig.turn.finishMarginMs;
+
+  after(async () => {
+    const abortController = new AbortController();
+    const stopWatching = watchDurableTurn(chatId, runId, abortController);
+    let releaseQueue: (() => Promise<void>) | undefined;
+    let latestSteps: ResearchStepData[] = [];
+    let latestSources: ResearchSource[] = [];
+
+    try {
+      releaseQueue = await queue.acquire(runId, {
+        signal: abortController.signal,
+        deadlineAt,
+        onPosition: (pos) =>
+          updateDurableTurnWait(
+            runId,
+            pos != null ? { kind: "queued", position: pos } : null,
+          ),
+      });
+
+      const outcome = await executeTurn({
+        requestId,
+        query,
+        effort,
+        modelMessages,
+        signal: abortController.signal,
+        deadlineAt,
+        onProgress: async (progress) => {
+          latestSteps = progress.steps;
+          latestSources = progress.sources;
+          if (await isTurnCancelled(chatId, runId)) {
+            abortController.abort();
+            return;
+          }
+          await updateDurableTurnProgress(runId, progress);
+        },
+        onWait: (wait) => updateDurableTurnWait(runId, wait),
+      });
+
+      if (isResolutionError(outcome)) {
+        await finishDurableTurn(
+          chatId,
+          runId,
+          {
+            status: "error",
+            error: outcome.error,
+            steps: latestSteps,
+            sources: latestSources,
+          },
+          { turnId },
+        );
+        return;
+      }
+
+      await finishDurableTurn(
+        chatId,
+        runId,
+        {
+          status: "done",
+          message: outcome.message,
+          steps: outcome.steps,
+          sources: outcome.sources,
+        },
+        { turnId },
+      );
+    } catch (error) {
+      if (isAbortError(error) || abortController.signal.aborted) {
+        await finishDurableTurn(
+          chatId,
+          runId,
+          { status: "stopped", steps: latestSteps, sources: latestSources },
+          { turnId },
+        );
+        return;
+      }
+      logError("turn-execute", error, { requestId, chatId, runId });
+      await finishDurableTurn(
+        chatId,
+        runId,
+        {
+          status: "error",
+          error: clientErrorMessage(error, requestId),
+          steps: latestSteps,
+          sources: latestSources,
+        },
+        { turnId },
+      );
+    } finally {
+      stopWatching();
+      await releaseQueue?.();
+    }
+  });
+
+  return Response.json(started.state, { status: 202 });
 }

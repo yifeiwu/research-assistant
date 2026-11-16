@@ -2,21 +2,14 @@ import { describe, expect, it } from "vitest";
 import { describeChatError } from "@/lib/chat-error";
 
 describe("describeChatError", () => {
-  it("explains a full or slow research queue as a busy server, not a failure", () => {
-    const rejected = describeChatError(
+  it("explains a full or slow request queue as a busy server", () => {
+    const info = describeChatError(
       new Error(
-        '{"error":"The server is busy with other research requests right now. Please try again in a moment."}',
+        "The server is busy with other requests right now, and this request waited too long in the queue. Please try again in a moment.",
       ),
     );
-    const timedOut = describeChatError(
-      new Error(
-        "The server is busy with other research requests right now, and this one waited too long in the queue. Please try again in a minute.",
-      ),
-    );
-    for (const info of [rejected, timedOut]) {
-      expect(info.title).toBe("The server is busy");
-      expect(info.hint).toContain("retry");
-    }
+    expect(info.title).toBe("The server is busy");
+    expect(info.hint).toContain("retry");
   });
 
   it("parses Groq rate limits with model, window, and retry delay", () => {

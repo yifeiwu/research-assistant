@@ -1,6 +1,4 @@
 import { z } from "zod";
-import type { UIMessage } from "ai";
-import type { EffortLevel } from "@/lib/effort";
 
 export const CHAT_ID_REGEX = /^[\w-]{8,80}$/;
 
@@ -15,17 +13,15 @@ export type ResearchSource = {
 export type ResearchStepPhase =
   | "planning"
   | "searching"
-  | "reranking"
   | "reading"
   | "checking-gaps"
-  | "synthesizing"
   | "done"
   | "error";
 
 /** Human-readable reasons when part of a research round degraded. */
 export type DegradedResearch = string[];
 
-/** Payload carried by a `data-research-step` UI message part. */
+/** State of a single deterministic research round. */
 export type ResearchStepData = {
   round: number;
   phase: ResearchStepPhase;
@@ -36,84 +32,55 @@ export type ResearchStepData = {
   degraded?: DegradedResearch;
 };
 
-/** Payload carried by a `data-model-fallback` UI message part when synthesis auto-switches models. */
-export type ModelFallbackData = {
-  fromModel: string;
-  toModel: string;
-  fromLabel: string;
-  toLabel: string;
+/** Plain JSON chat message persisted in Redis and localStorage. */
+export type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  reasoning?: string;
+  steps?: ResearchStepData[];
+  sources?: ResearchSource[];
 };
 
-/**
- * Payload carried by the `data-turn-status` UI message part: why a turn is
- * not making visible progress right now. One part per turn, replaced in
- * place; `clear` means the turn is running again.
- */
-export type TurnStatusData =
-  /** Waiting for a free research slot; `position` is 1-based. */
-  | { state: "queued"; position: number }
-  /** Waiting for a model's per-minute rate-limit window. `resumeAt` is epoch ms. */
+/** Why an active turn is currently waiting before its next step. */
+export type TurnWaitState =
+  | { kind: "queued"; position: number }
   | {
-      state: "waiting";
+      kind: "rate-limit";
       stage: "planning" | "reading" | "answering";
-      modelLabel: string;
       resumeAt: number;
-    }
-  | { state: "clear" };
+    };
 
-/** Custom AI SDK v6 data parts emitted by `/api/chat`. */
-export type ChatDataParts = {
-  "research-step": ResearchStepData;
-  "model-fallback": ModelFallbackData;
-  "turn-status": TurnStatusData;
+/** Durable server-side state of a chat turn stored in Upstash Redis. */
+export type DurableTurnState = {
+  runId: string;
+  chatId: string;
+  turnId?: string;
+  status: "running" | "done" | "stopped" | "error";
+  steps: ResearchStepData[];
+  sources: ResearchSource[];
+  wait?: TurnWaitState;
+  message?: ChatMessage;
+  error?: string;
+  updatedAt: number;
 };
 
-/** Application UIMessage type with typed research-step data parts. */
-export type ChatUIMessage = UIMessage<unknown, ChatDataParts>;
-
-/**
- * The `/api/chat` request contract, shared between the client (which builds the
- * body) and the server route (which validates and consumes it).
- */
-export type ChatRequest = {
-  messages: UIMessage[];
-  /** Conversation id; used to resume a generation after the client disconnects. */
-  id?: string;
-  model?: string;
-  effort?: EffortLevel;
-};
-
-/**
- * The part of {@link ChatRequest} the client contributes as the extra request
- * body; `messages` is supplied by the `useChat` transport itself.
- */
-export type ChatRequestBody = Omit<ChatRequest, "messages">;
-
-/**
- * Upper bounds on the request payload. These guard against unbounded histories
- * (context blowups / memory pressure) and malformed clients; normal usage stays
- * well under them.
- */
 const MAX_MESSAGES = 200;
 const MAX_TOTAL_MESSAGE_CHARS = 500_000;
 
-const messagePartSchema = z.looseObject({
-  type: z.string(),
-});
-
-const uiMessageSchema = z.looseObject({
-  role: z.enum(["system", "user", "assistant"]),
-  parts: z.array(messagePartSchema),
+const chatMessageSchema = z.object({
+  id: z.string().min(1).max(120),
+  role: z.enum(["user", "assistant"]),
+  text: z.string(),
 });
 
 export const chatRequestSchema = z
   .object({
-    messages: z.array(uiMessageSchema).min(1).max(MAX_MESSAGES),
+    messages: z.array(chatMessageSchema).min(1).max(MAX_MESSAGES),
     id: z
       .string()
       .regex(CHAT_ID_REGEX, "id must be 8-80 word characters or hyphens")
       .optional(),
-    model: z.string().optional(),
     effort: z.unknown().optional(),
   })
   .refine(

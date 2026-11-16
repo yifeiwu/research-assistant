@@ -119,19 +119,8 @@ body {
   animation: pulse-dot 1.2s ease-in-out infinite;
 }
 
-@keyframes blink-caret {
-  0%, 45% { opacity: 1; }
-  50%, 95% { opacity: 0; }
-  100% { opacity: 1; }
-}
-.stream-caret {
-  border-radius: 1px;
-  animation: blink-caret 1s step-end infinite;
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .loading-dot,
-  .stream-caret {
+  .loading-dot {
     animation: none;
   }
 }

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { UIMessage } from "ai";
+import type { ChatMessage } from "@/lib/types/chat";
 
 export type ScrollAnchor = {
   scrollRef: React.RefObject<HTMLDivElement | null>;
@@ -11,20 +11,16 @@ export type ScrollAnchor = {
 };
 
 /**
- * Keep the message list pinned to the bottom while new content streams in, but
- * only when the user is already near the bottom, so scrolling up to read earlier
- * messages isn't interrupted.
+ * Keep the message list pinned to the bottom as progress updates arrive, unless
+ * the user has scrolled up to inspect earlier turns.
  */
 export function useScrollAnchor(
-  messages: UIMessage[],
+  messages: ChatMessage[],
   isBusy: boolean,
 ): ScrollAnchor {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
 
-  // Only auto-scroll when the user is already near the bottom. During streaming
-  // we jump instantly instead of animating: a smooth scroll fires on every
-  // token and the overlapping animations cause visible jank.
   useEffect(() => {
     if (!atBottom) return;
     scrollRef.current?.scrollTo({

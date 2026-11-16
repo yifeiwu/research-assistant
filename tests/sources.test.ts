@@ -25,32 +25,26 @@ describe("normalizeUrlKey", () => {
   });
 });
 
-describe("collectSources", () => {
+describe("collectSources & splitSourcesByCitation", () => {
   it("dedupes www/fragment variants of the same source", () => {
     const message = {
-      parts: [
-        { type: "source-url", url: "https://www.a.com/x/", title: "A" },
-        { type: "source-url", url: "https://a.com/x#section" },
+      text: "",
+      sources: [
+        { url: "https://www.a.com/x/", title: "A" },
+        { url: "https://a.com/x#section" },
       ],
     };
     expect(collectSources(message)).toHaveLength(1);
   });
-});
-
-describe("splitSourcesByCitation", () => {
-  const read = (url: string, title: string) => ({ type: "source-url", url, title });
 
   it("puts the sources the answer links to first, and keeps the rest as also read", () => {
     const message = {
-      parts: [
-        read("https://a.com/one", "One"),
-        read("https://b.com/two", "Two"),
-        read("https://en.wikipedia.org/wiki/Foo_(bar)", "Foo"),
-        read("https://d.com/four", "Four"),
-        {
-          type: "text",
-          text: "As [Two](https://www.b.com/two/) says, and [Foo](https://en.wikipedia.org/wiki/Foo_(bar)). See https://d.com/four.",
-        },
+      text: "As [Two](https://www.b.com/two/) says, and [Foo](https://en.wikipedia.org/wiki/Foo_(bar)). See https://d.com/four.",
+      sources: [
+        { url: "https://a.com/one", title: "One" },
+        { url: "https://b.com/two", title: "Two" },
+        { url: "https://en.wikipedia.org/wiki/Foo_(bar)", title: "Foo" },
+        { url: "https://d.com/four", title: "Four" },
       ],
     };
     const { cited, other } = splitSourcesByCitation(message);
@@ -60,7 +54,8 @@ describe("splitSourcesByCitation", () => {
 
   it("cites nothing for an answer without links", () => {
     const message = {
-      parts: [read("https://a.com/one", "One"), { type: "text", text: "No links here." }],
+      text: "No links here.",
+      sources: [{ url: "https://a.com/one", title: "One" }],
     };
     const { cited, other } = splitSourcesByCitation(message);
     expect(cited).toEqual([]);
@@ -70,14 +65,14 @@ describe("splitSourcesByCitation", () => {
 
 describe("chatRequestSchema id validation", () => {
   const base = {
-    messages: [{ role: "user", parts: [{ type: "text", text: "hi" }] }],
+    messages: [{ id: "u1", role: "user" as const, text: "hi" }],
   };
   it("accepts a uuid chat id", () => {
     expect(
       chatRequestSchema.safeParse({ ...base, id: "123e4567-e89b-12d3-a456-426614174000" }).success,
     ).toBe(true);
   });
-  it("rejects ids that can never address a Redis stream", () => {
+  it("rejects ids that can never address a Redis key", () => {
     expect(chatRequestSchema.safeParse({ ...base, id: "bad id!!" }).success).toBe(false);
     expect(chatRequestSchema.safeParse({ ...base, id: "../etc/passwd" }).success).toBe(false);
   });

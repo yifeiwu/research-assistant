@@ -3,13 +3,7 @@
 import { useState } from "react";
 import { Brain, ChevronDown } from "lucide-react";
 
-export function Reasoning({
-  text,
-  streaming,
-}: {
-  text: string;
-  streaming: boolean;
-}) {
+export function Reasoning({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="my-2 rounded-xl border border-border bg-surface-2/40 text-sm">
@@ -20,10 +14,7 @@ export function Reasoning({
         aria-expanded={open}
       >
         <Brain className="h-4 w-4" aria-hidden />
-        <span className="font-medium">
-          {streaming ? "Thinking…" : "Reasoning"}
-        </span>
-        {streaming && <span className="loading-dot text-accent">●</span>}
+        <span className="font-medium">Reasoning</span>
         <ChevronDown
           className={
             "ml-auto h-4 w-4 transition-transform " + (open ? "rotate-180" : "")

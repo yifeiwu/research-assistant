@@ -1,12 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 import {
   DEFAULT_SETTINGS,
   sanitizeSettings,
   type AppSettings,
 } from "@/lib/settings";
-import type { ChatRequestBody } from "@/lib/types/chat";
 
 const SETTINGS_STORAGE_KEY = "web-seek-settings";
 
@@ -46,20 +45,15 @@ function subscribeSettings(listener: () => void): () => void {
 export type ChatSettings = {
   settings: AppSettings;
   updateSettings: (next: AppSettings) => void;
-  requestBody: () => ChatRequestBody;
 };
 
-/** Owns Groq model/effort settings and their localStorage persistence. */
+/** Owns research effort settings and their localStorage persistence. */
 export function useChatSettings(): ChatSettings {
   const settings = useSyncExternalStore(
     subscribeSettings,
     readSettingsSnapshot,
     getServerSnapshot,
   );
-  const settingsRef = useRef(settings);
-  useEffect(() => {
-    settingsRef.current = settings;
-  }, [settings]);
 
   const updateSettings = useCallback((next: AppSettings) => {
     const cleaned = sanitizeSettings(next);
@@ -74,10 +68,5 @@ export function useChatSettings(): ChatSettings {
     for (const listener of listeners) listener();
   }, []);
 
-  const requestBody = useCallback((): ChatRequestBody => {
-    const s = settingsRef.current;
-    return { model: s.model, effort: s.effort };
-  }, []);
-
-  return { settings, updateSettings, requestBody };
+  return { settings, updateSettings };
 }

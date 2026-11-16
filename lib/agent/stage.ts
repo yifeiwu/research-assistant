@@ -4,55 +4,28 @@ import {
   type LanguageModel,
   type ModelMessage,
 } from "ai";
+import { createAbortError } from "@/lib/errors";
 import { groqReasoningOptions } from "@/lib/models";
 import { estimateTokens } from "@/lib/tokens";
 
-/** The model a stage was cleared to call, after any wait for its window. */
 export type StageLease = {
   model: LanguageModel;
   modelId: string;
-  waitedMs: number;
 };
 
 export type StageLeaseRequest = {
-  estInputTokens: number;
-  /** Output reservation, which may differ per model (e.g. Qwen's OTPM cap). */
-  maxOutputTokens: number | ((modelId: string) => number);
-  /** Optional override for how long the scheduler may wait for a token window. */
-  maxWaitMs?: number;
+  estInputTokens?: number | ((modelId: string) => number);
+  maxOutputTokens?: number | ((modelId: string) => number);
   signal?: AbortSignal;
 };
 
 /**
- * A pipeline stage's handle on the shared model budgets, and the only way the
- * pipeline gets a model: call `lease` right before a model call to reserve
- * its tokens. It resolves once the call may go
- * ahead (possibly on a fallback model) and throws `BudgetDeniedError` when
- * the wait would not fit, so the caller can degrade or defer.
+ * A pipeline stage's handle on its fungible model pool: reserves per-minute
+ * tokens and waits patiently if the pool's rolling window is full.
  */
 export type StageRunner = {
-  primaryModelId: string;
-  lease(req: StageLeaseRequest): Promise<StageLease>;
+  lease(req?: StageLeaseRequest): Promise<StageLease>;
 };
-
-/** No candidate model's rate-limit window frees up within the allowed wait. */
-export class BudgetDeniedError extends Error {
-  /** Shortest wait among the candidates; `Infinity` if none will clear. */
-  readonly waitMs: number;
-  constructor(stage: string, waitMs: number) {
-    super(
-      Number.isFinite(waitMs)
-        ? `Rate limit budget for the ${stage} stage is exhausted; next window in ~${Math.ceil(waitMs / 1_000)}s.`
-        : `Rate limit budget for the ${stage} stage is exhausted.`,
-    );
-    this.name = "BudgetDeniedError";
-    this.waitMs = waitMs;
-  }
-}
-
-export function isBudgetDenied(error: unknown): error is BudgetDeniedError {
-  return error instanceof BudgetDeniedError;
-}
 
 /**
  * Lease tokens from `stage` and execute a non-retried auxiliary `generateText`
@@ -61,21 +34,34 @@ export function isBudgetDenied(error: unknown): error is BudgetDeniedError {
 export async function generateAuxiliaryText(req: {
   stage: StageRunner;
   system: string;
-  prompt?: string;
+  prompt?: string | ((modelId: string) => string);
   messages?: ModelMessage[];
   maxOutputTokens: number | ((modelId: string) => number);
   timeoutMs: number;
-  maxWaitMs?: number;
   signal?: AbortSignal;
   generateTextImpl?: typeof generateText;
 }): Promise<string> {
-  const inputPayload = req.prompt ?? JSON.stringify(req.messages ?? []);
+  if (req.signal?.aborted) throw createAbortError();
+
+  const sysTokens = estimateTokens(req.system);
+  const msgTokens = req.messages
+    ? estimateTokens(JSON.stringify(req.messages))
+    : 0;
+  const promptArg = req.prompt;
+  const estInputTokens =
+    typeof promptArg === "function"
+      ? (modelId: string) => sysTokens + estimateTokens(promptArg(modelId))
+      : sysTokens + (req.messages ? msgTokens : estimateTokens(promptArg ?? ""));
+
   const leased = await req.stage.lease({
-    estInputTokens: estimateTokens(req.system) + estimateTokens(inputPayload),
+    estInputTokens,
     maxOutputTokens: req.maxOutputTokens,
-    maxWaitMs: req.maxWaitMs,
     signal: req.signal,
   });
+  const resolvedPrompt =
+    typeof promptArg === "function"
+      ? promptArg(leased.modelId)
+      : (promptArg ?? "");
   const maxOut =
     typeof req.maxOutputTokens === "function"
       ? req.maxOutputTokens(leased.modelId)
@@ -84,7 +70,7 @@ export async function generateAuxiliaryText(req: {
   const { text } = await run({
     model: leased.model,
     system: req.system,
-    ...(req.messages ? { messages: req.messages } : { prompt: req.prompt ?? "" }),
+    ...(req.messages ? { messages: req.messages } : { prompt: resolvedPrompt }),
     maxOutputTokens: maxOut,
     providerOptions: groqReasoningOptions(leased.modelId, "auxiliary"),
     ...(req.signal ? { abortSignal: req.signal } : {}),

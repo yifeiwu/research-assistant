@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
-import { MessageSquarePlus, Trash2, Undo2, X } from "lucide-react";
+import { MessageSquarePlus, Trash2, X } from "lucide-react";
 import type { Conversation } from "@/lib/conversations";
 
 /** Below this width the sidebar is a drawer over the conversation. */
@@ -11,25 +11,19 @@ export function ConversationSidebar({
   conversations,
   activeId,
   open,
-  deleted,
   onSelect,
   onNewChat,
   onDelete,
-  onUndoDelete,
   onClose,
 }: {
   conversations: Conversation[];
   activeId: string | null;
   open: boolean;
-  /** The conversation just deleted, while that can still be undone. */
-  deleted: { id: string; title: string } | null;
   onSelect: (id: string) => void;
   onNewChat: () => void;
   onDelete: (id: string) => void;
-  onUndoDelete: () => void;
   onClose: () => void;
 }) {
-  // As a drawer, Escape closes it. On wider screens it is part of the page.
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (e: KeyboardEvent) => {
@@ -43,7 +37,6 @@ export function ConversationSidebar({
 
   return (
     <>
-      {/* Mobile backdrop */}
       {open && (
         <div
           className="fixed inset-0 z-20 bg-black/50 md:hidden"
@@ -56,9 +49,7 @@ export function ConversationSidebar({
         className={
           "z-30 flex h-full w-72 shrink-0 flex-col border-r border-border bg-surface transition-transform duration-200 " +
           "max-md:fixed max-md:inset-y-0 max-md:left-0 " +
-          (open
-            ? "translate-x-0"
-            : "max-md:-translate-x-full md:hidden")
+          (open ? "translate-x-0" : "max-md:-translate-x-full md:hidden")
         }
         aria-label="Conversation history"
         inert={!open}
@@ -102,9 +93,7 @@ export function ConversationSidebar({
                     <div
                       className={
                         "group flex items-center gap-1 rounded-lg pr-1 transition " +
-                        (active
-                          ? "bg-accent/10"
-                          : "hover:bg-surface-2")
+                        (active ? "bg-accent/10" : "hover:bg-surface-2")
                       }
                     >
                       <button
@@ -143,24 +132,6 @@ export function ConversationSidebar({
             </ul>
           )}
         </nav>
-
-        <div role="status" aria-live="polite" className="px-2">
-          {deleted && (
-            <div className="mb-2 flex items-center gap-2 rounded-lg border border-border bg-surface-2 py-1.5 pr-1.5 pl-3 text-xs text-muted">
-              <span className="min-w-0 flex-1 truncate" title={deleted.title}>
-                Deleted &ldquo;{deleted.title}&rdquo;
-              </span>
-              <button
-                type="button"
-                onClick={onUndoDelete}
-                className="flex shrink-0 items-center gap-1 rounded-md border border-border bg-surface px-2 py-1 font-medium text-foreground transition hover:border-accent"
-              >
-                <Undo2 className="h-3.5 w-3.5" aria-hidden />
-                Undo
-              </button>
-            </div>
-          )}
-        </div>
 
         <div className="border-t border-border px-3 py-2.5 pb-[calc(0.625rem+env(safe-area-inset-bottom))]">
           <p className="text-[11px] text-muted/70">powered by Groq + Exa</p>

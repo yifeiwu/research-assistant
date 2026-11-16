@@ -7,6 +7,7 @@ import { logError, logInfo } from "@/lib/logger";
 import type { BudgetDimension, GroqBudget } from "./groq-budget";
 import {
   groqReasoningOptions,
+  maxSummaryBatchInputChars,
   maxSummaryOutputTokens,
   maxSynthesisOutputTokens,
   type GroqModelRole,
@@ -25,30 +26,15 @@ export type GroqCooldownDb = {
   };
 };
 
-export type GroqFallbackEvent = {
-  from: string;
-  to: string;
-  retryAfterMs: number;
-};
-
 export type CooldownEntry = {
   untilMs: number;
+  /** True for daily quotas (`RPD` / `TPD`) or retired/decommissioned models (`retired:`). */
   daily: boolean;
-};
-
-/** Groq's rate-limit response headers, parsed. */
-export type GroqRateLimitHeaders = {
-  limitTokens?: number;
-  remainingTokens?: number;
-  resetTokensMs?: number;
-  limitRequests?: number;
-  remainingRequests?: number;
-  resetRequestsMs?: number;
+  retired?: boolean;
 };
 
 const COOLDOWN_KEY_PREFIX = "ratelimit:groq:cooldown:";
-const SYNTHESIS_WAKE_BUFFER_MS = 200;
-const AUXILIARY_WAKE_BUFFER_MS = 150;
+const WAKE_BUFFER_MS = 150;
 const DEFAULT_429_WAIT_MS = 5_000;
 
 function cooldownKey(modelId: string): string {
@@ -109,14 +95,13 @@ function headerNumber(headers: Headers, name: string): number | undefined {
   return Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
-function parseGroqRateLimitHeaders(headers: Headers): GroqRateLimitHeaders {
+function parseGroqRateLimitHeaders(headers: Headers): {
+  limitTokens?: number;
+  remainingTokens?: number;
+} {
   return {
     limitTokens: headerNumber(headers, "x-ratelimit-limit-tokens"),
     remainingTokens: headerNumber(headers, "x-ratelimit-remaining-tokens"),
-    resetTokensMs: parseGroqDurationMs(headers.get("x-ratelimit-reset-tokens")),
-    limitRequests: headerNumber(headers, "x-ratelimit-limit-requests"),
-    remainingRequests: headerNumber(headers, "x-ratelimit-remaining-requests"),
-    resetRequestsMs: parseGroqDurationMs(headers.get("x-ratelimit-reset-requests")),
   };
 }
 
@@ -158,7 +143,38 @@ export function parseGroqRateLimitResponse(
   return { waitMs: Math.max(100, waitMs), daily };
 }
 
+/**
+ * Detect when Groq rejects a model because it has been decommissioned,
+ * deprecated, not found (HTTP 404), or blocked/unavailable on the free tier.
+ */
+export function isModelRetiredResponse(status: number, bodyText: string): boolean {
+  if (status === 404) return true;
+  if (status !== 400 && status !== 403 && status !== 410 && status !== 422) {
+    return false;
+  }
+  return (
+    /model_decommissioned|model_not_found|model_not_active|model_permission/i.test(bodyText) ||
+    /\b(?:decommissioned|deprecated|no longer supported|shut ?down)\b/i.test(bodyText) ||
+    /model\b[^.\n]{0,80}\b(?:does not exist|not found|not available|do not have access)/i.test(
+      bodyText,
+    )
+  );
+}
+
+/**
+ * Detect when a small-context model (e.g. 4k-token `allam-2-7b`) rejects a
+ * payload for exceeding its context length so a larger-context peer can serve it.
+ */
+function isContextOverflowResponse(status: number, bodyText: string): boolean {
+  if (status === 413) return true;
+  if (status !== 400) return false;
+  return /context_length_exceeded|maximum context length|please reduce the length of the messages|request too large/i.test(
+    bodyText,
+  );
+}
+
 function encodeCooldown(entry: CooldownEntry): string {
+  if (entry.retired) return `retired:${entry.untilMs}`;
   return entry.daily ? `daily:${entry.untilMs}` : String(entry.untilMs);
 }
 
@@ -166,6 +182,11 @@ function decodeCooldown(raw: unknown): CooldownEntry | undefined {
   if (raw == null) return undefined;
   const text = String(raw).trim();
   if (!text) return undefined;
+  if (text.startsWith("retired:")) {
+    const untilMs = Number(text.slice("retired:".length));
+    if (!Number.isFinite(untilMs) || untilMs <= 0) return undefined;
+    return { untilMs, daily: true, retired: true };
+  }
   const daily = text.startsWith("daily:");
   const untilMs = Number(daily ? text.slice("daily:".length) : text);
   if (!Number.isFinite(untilMs) || untilMs <= 0) return undefined;
@@ -202,7 +223,7 @@ async function writeCooldown(
   model: string,
   entry: CooldownEntry,
   now: number,
-  maxCooldownSeconds: number,
+  maxTtlSeconds: number,
   resolveDb: () => GroqCooldownDb | undefined,
 ): Promise<void> {
   const db = resolveDb();
@@ -210,7 +231,7 @@ async function writeCooldown(
 
   const ttlSeconds = Math.max(
     1,
-    Math.min(maxCooldownSeconds, Math.ceil((entry.untilMs - now) / 1_000)),
+    Math.min(maxTtlSeconds, Math.ceil((entry.untilMs - now) / 1_000)),
   );
   try {
     await db.set(cooldownKey(model), encodeCooldown(entry), { ex: ttlSeconds });
@@ -220,8 +241,54 @@ async function writeCooldown(
 }
 
 /**
+ * Trim `<source N>...</source N>` blocks inside a batched summarizer prompt
+ * when failing over from a large-context model onto a small-context peer.
+ */
+function trimSummaryPromptMessages(
+  messages: unknown,
+  targetModel: string,
+): unknown {
+  const maxBatchChars = maxSummaryBatchInputChars(
+    targetModel,
+    serverConfig.summary.batchInputCharCap,
+  );
+  if (
+    maxBatchChars >= serverConfig.summary.batchInputCharCap ||
+    !Array.isArray(messages)
+  ) {
+    return messages;
+  }
+
+  return messages.map((msg) => {
+    if (!msg || typeof msg !== "object") return msg;
+    const record = msg as Record<string, unknown>;
+    if (record.role !== "user" || typeof record.content !== "string") return msg;
+    const content = record.content;
+    const sourceBlocks = [...content.matchAll(/<source \d+>[\s\S]*?<\/source \d+>/g)];
+    if (sourceBlocks.length === 0) {
+      return content.length > maxBatchChars
+        ? { ...record, content: content.slice(0, maxBatchChars) }
+        : msg;
+    }
+    const perSourceBodyCap = Math.max(
+      600,
+      Math.floor((maxBatchChars - 800) / sourceBlocks.length),
+    );
+    const trimmed = content.replace(
+      /(Content:\n"""\n)([\s\S]*?)(\n"""\n<\/source \d+>)/g,
+      (_full, prefix: string, body: string, suffix: string) =>
+        body.length > perSourceBodyCap
+          ? `${prefix}${body.slice(0, perSourceBodyCap)}${suffix}`
+          : _full,
+    );
+    return { ...record, content: trimmed };
+  });
+}
+
+/**
  * Rewrite a Groq `/chat/completions` JSON request body for `targetModel`,
- * normalizing `reasoning_effort`, `reasoning_format`, and synthesis `max_tokens`.
+ * normalizing `max_completion_tokens`, `reasoning_effort`, `reasoning_format`,
+ * and small-context summary batch sizes.
  */
 export function rewriteGroqRequestBody(
   rawBody: string,
@@ -240,38 +307,61 @@ export function rewriteGroqRequestBody(
   }
 
   const role: GroqModelRole = stage === "synthesis" ? "synthesis" : "auxiliary";
-  const groqOpts = groqReasoningOptions(targetModel, role)?.groq;
+  const groqOpts = groqReasoningOptions(targetModel, role);
 
   parsed.model = targetModel;
 
-  if (groqOpts?.reasoningFormat) {
-    parsed.reasoning_format = groqOpts.reasoningFormat;
-  } else {
+  if (!groqOpts) {
     delete parsed.reasoning_format;
-  }
-
-  if (groqOpts?.reasoningEffort) {
-    parsed.reasoning_effort = groqOpts.reasoningEffort;
-  } else if (
-    stage === "synthesis" &&
-    (parsed.reasoning_effort === "low" || parsed.reasoning_effort === "medium") &&
-    maxSynthesisOutputTokens(targetModel, synthesisDefaultMaxTokens) >= 1_500
-  ) {
-    // Preserve caller-chosen synthesis reasoning effort across high-OTPM GPT-OSS fallbacks.
-  } else {
     delete parsed.reasoning_effort;
+  } else {
+    if (groqOpts.groq.reasoningFormat) {
+      parsed.reasoning_format = groqOpts.groq.reasoningFormat;
+    } else {
+      delete parsed.reasoning_format;
+    }
+
+    if (groqOpts.groq.reasoningEffort) {
+      if (
+        stage === "synthesis" &&
+        (parsed.reasoning_effort === "low" || parsed.reasoning_effort === "medium") &&
+        maxSynthesisOutputTokens(targetModel, synthesisDefaultMaxTokens) >= 1_500
+      ) {
+        // Preserve caller-chosen synthesis reasoning effort across high-OTPM GPT-OSS peers.
+      } else {
+        parsed.reasoning_effort = groqOpts.groq.reasoningEffort;
+      }
+    } else {
+      delete parsed.reasoning_effort;
+    }
   }
 
-  if (stage === "synthesis" && typeof parsed.max_tokens === "number") {
-    parsed.max_tokens = maxSynthesisOutputTokens(
-      targetModel,
-      synthesisDefaultMaxTokens,
-    );
-  } else if (stage === "summary" && typeof parsed.max_tokens === "number") {
-    parsed.max_tokens = Math.min(
-      parsed.max_tokens,
-      maxSummaryOutputTokens(targetModel, serverConfig.summary.batchMaxOutputTokens),
-    );
+  const rawTokenCap =
+    typeof parsed.max_completion_tokens === "number"
+      ? parsed.max_completion_tokens
+      : typeof parsed.max_tokens === "number"
+        ? parsed.max_tokens
+        : undefined;
+
+  if (rawTokenCap !== undefined) {
+    delete parsed.max_tokens;
+    if (stage === "synthesis") {
+      parsed.max_completion_tokens = maxSynthesisOutputTokens(
+        targetModel,
+        synthesisDefaultMaxTokens,
+      );
+    } else if (stage === "summary") {
+      parsed.max_completion_tokens = Math.min(
+        rawTokenCap,
+        maxSummaryOutputTokens(targetModel, serverConfig.summary.batchMaxOutputTokens),
+      );
+    } else {
+      parsed.max_completion_tokens = rawTokenCap;
+    }
+  }
+
+  if (stage === "summary") {
+    parsed.messages = trimSummaryPromptMessages(parsed.messages, targetModel);
   }
 
   return JSON.stringify(parsed);
@@ -281,12 +371,13 @@ export type ResilientGroqFetchOptions = {
   stage: GroqStage;
   primaryModel: string;
   fallbackModels?: string[];
-  onFallback?: (event: GroqFallbackEvent) => void;
   maxWaitMs?: number;
   maxCooldownSeconds?: number;
+  retiredModelTtlSeconds?: number;
   synthesisMaxOutputTokens?: number;
   db?: GroqCooldownDb | null;
   budget?: Pick<GroqBudget, "observe">;
+  onWait?: (stage: GroqStage, resumeAt: number | null) => void | Promise<void>;
   baseFetch?: GroqFetch;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -304,9 +395,10 @@ function defaultMaxWaitMs(stage: GroqStage): number {
 }
 
 /**
- * Reactive `fetch` wrapper for `@ai-sdk/groq`: reconciles response rate-limit
- * headers into `GroqBudget`, honors short `Retry-After` pauses on `synthesis`,
- * and rewrites/switches to healthy fallback models on unexpected 429s.
+ * Reactive `fetch` wrapper for `@ai-sdk/groq`: reconciles live rate-limit
+ * headers into `GroqBudget`, immediately switches across fungible pool peers on
+ * 429s/retirements/context overflows, and waits out rolling per-minute windows
+ * when every candidate is cooling down.
  */
 export function createResilientGroqFetch(
   opts: ResilientGroqFetchOptions,
@@ -319,11 +411,12 @@ export function createResilientGroqFetch(
   const maxWaitMs = opts.maxWaitMs ?? defaultMaxWaitMs(opts.stage);
   const maxCooldownSeconds =
     opts.maxCooldownSeconds ?? serverConfig.groqRateLimit.maxCooldownSeconds;
+  const retiredTtlSeconds =
+    opts.retiredModelTtlSeconds ?? serverConfig.groqRateLimit.retiredModelTtlSeconds;
   const synthesisMaxTokens =
     opts.synthesisMaxOutputTokens ?? serverConfig.synthesis.maxOutputTokens;
   const baseFetch: GroqFetch = opts.baseFetch ?? globalThis.fetch;
   const nowFn = opts.now ?? Date.now;
-  const wakeBufferMs = isSynthesis ? SYNTHESIS_WAKE_BUFFER_MS : AUXILIARY_WAKE_BUFFER_MS;
   const resolveDb = resolveGroqCooldownDb(opts.db, opts.stage);
 
   return async (input, init) => {
@@ -333,7 +426,9 @@ export function createResilientGroqFetch(
     const signal = init?.signal;
     const cooldowns = await readCooldowns(candidates, nowFn(), resolveDb);
 
-    const activeCooldown = (model: string): { remainingMs: number; daily: boolean } | undefined => {
+    const activeCooldown = (
+      model: string,
+    ): { remainingMs: number; daily: boolean; retired?: boolean } | undefined => {
       const entry = cooldowns.get(model);
       if (!entry) return undefined;
       const remainingMs = entry.untilMs - nowFn();
@@ -341,7 +436,7 @@ export function createResilientGroqFetch(
         cooldowns.delete(model);
         return undefined;
       }
-      return { remainingMs, daily: entry.daily };
+      return { remainingMs, daily: entry.daily, retired: entry.retired };
     };
 
     let primaryTriggerWaitMs = activeCooldown(opts.primaryModel)?.remainingMs ?? 0;
@@ -370,38 +465,88 @@ export function createResilientGroqFetch(
         waitMs: parsed.waitMs,
         daily: parsed.daily,
       });
-      return parsed;
     };
 
-    const dispatch = async (model: string): Promise<Response> => {
-      const body =
-        model === opts.primaryModel
-          ? rawBody
-          : rewriteGroqRequestBody(rawBody, model, opts.stage, synthesisMaxTokens);
-      const response = await baseFetch(input, { ...init, body });
-      const rate = parseGroqRateLimitHeaders(response.headers);
-      if (rate.limitTokens != null || rate.remainingTokens != null) {
-        logInfo("groq-rate-headers", {
+    const recordRetired = async (model: string, status: number, bodyText: string) => {
+      const currentNow = nowFn();
+      const entry: CooldownEntry = {
+        untilMs: currentNow + retiredTtlSeconds * 1_000,
+        daily: true,
+        retired: true,
+      };
+      cooldowns.set(model, entry);
+      await writeCooldown(model, entry, currentNow, retiredTtlSeconds, resolveDb);
+      logInfo("groq-model-retired", {
+        stage: opts.stage,
+        model,
+        status,
+        detail: bodyText.slice(0, 200),
+      });
+    };
+
+    const shouldFailoverResponse = async (
+      model: string,
+      response: Response,
+      hasRemainingPeers: boolean,
+    ): Promise<boolean> => {
+      if (response.status === 429) {
+        await record429(model, response);
+        return true;
+      }
+      if (response.ok) return false;
+
+      if (response.status >= 500 && hasRemainingPeers) {
+        logInfo("groq-upstream-5xx-switch", {
           stage: opts.stage,
           model,
           status: response.status,
-          ...rate,
         });
-        if (response.status !== 429) {
-          void opts.budget?.observe(model, {
-            limitTokens: rate.limitTokens,
-            remainingTokens: rate.remainingTokens,
+        return true;
+      }
+
+      if (
+        response.status === 400 ||
+        response.status === 403 ||
+        response.status === 404 ||
+        response.status === 410 ||
+        response.status === 413 ||
+        response.status === 422
+      ) {
+        const bodyText = await response.clone().text().catch(() => "");
+        if (isModelRetiredResponse(response.status, bodyText)) {
+          await recordRetired(model, response.status, bodyText);
+          return true;
+        }
+        if (hasRemainingPeers && isContextOverflowResponse(response.status, bodyText)) {
+          logInfo("groq-context-overflow-switch", {
+            stage: opts.stage,
+            model,
+            status: response.status,
           });
+          return true;
         }
       }
-      if (response.status !== 429 && model !== opts.primaryModel && response.ok) {
-        logInfo("groq-fallback", {
+
+      return false;
+    };
+
+    const dispatch = async (model: string): Promise<Response> => {
+      const body = rewriteGroqRequestBody(
+        rawBody,
+        model,
+        opts.stage,
+        synthesisMaxTokens,
+      );
+      const response = await baseFetch(input, { ...init, body });
+      if (response.status !== 429) {
+        const rate = parseGroqRateLimitHeaders(response.headers);
+        if (rate.limitTokens != null || rate.remainingTokens != null) {
+          void opts.budget?.observe(model, rate);
+        }
+      }
+      if (response.ok && model !== opts.primaryModel) {
+        logInfo("groq-pool-switch", {
           stage: opts.stage,
-          from: opts.primaryModel,
-          to: model,
-          retryAfterMs: primaryTriggerWaitMs,
-        });
-        opts.onFallback?.({
           from: opts.primaryModel,
           to: model,
           retryAfterMs: primaryTriggerWaitMs,
@@ -411,74 +556,95 @@ export function createResilientGroqFetch(
     };
 
     let lastResponse: Response | undefined;
-    let slept = false;
+    const healthyCandidates = candidates.filter((c) => !activeCooldown(c));
 
-    // 1. On synthesis, prefer waiting out a short primary cooldown before switching models.
-    const primaryCd = activeCooldown(opts.primaryModel);
-    if (isSynthesis && primaryCd && !primaryCd.daily && primaryCd.remainingMs <= maxWaitMs) {
-      slept = true;
-      await abortableSleep(primaryCd.remainingMs + wakeBufferMs, signal, opts.sleep);
-      const res = await dispatch(opts.primaryModel);
-      if (res.status !== 429) return res;
-      lastResponse = res;
-      await record429(opts.primaryModel, res);
-    }
-
-    // 2. Try every currently healthy candidate in priority order.
-    for (const candidate of candidates) {
+    // 1. Try every currently healthy candidate in pool + fallback order without sleeping.
+    for (let i = 0; i < healthyCandidates.length; i++) {
+      const candidate = healthyCandidates[i];
       if (activeCooldown(candidate)) continue;
       const res = await dispatch(candidate);
-      if (res.status !== 429) return res;
-      lastResponse = res;
-      const { waitMs, daily } = await record429(candidate, res);
-
-      if (isSynthesis && candidate === opts.primaryModel && !slept && !daily && waitMs <= maxWaitMs) {
-        slept = true;
-        await abortableSleep(waitMs + wakeBufferMs, signal, opts.sleep);
-        const retryRes = await dispatch(opts.primaryModel);
-        if (retryRes.status !== 429) return retryRes;
-        lastResponse = retryRes;
-        await record429(opts.primaryModel, retryRes);
+      const hasRemainingPeers = i + 1 < healthyCandidates.length;
+      if (!(await shouldFailoverResponse(candidate, res, hasRemainingPeers))) {
+        return res;
       }
+      lastResponse = res;
     }
 
-    // 3. If every candidate was cooling down and a short wait is allowed, sleep once for the soonest.
-    if (!slept && maxWaitMs > 0) {
-      const soonest = candidates
-        .map((m) => ({ model: m, cd: activeCooldown(m) }))
-        .filter(
-          (x): x is { model: string; cd: { remainingMs: number; daily: boolean } } =>
-            x.cd != null && !x.cd.daily && x.cd.remainingMs <= maxWaitMs,
-        )
-        .sort((a, b) => a.cd.remainingMs - b.cd.remainingMs)[0];
+    // 2. If every candidate is cooling down (not retired/daily), wait out the soonest
+    //    rolling window up to `maxWaitMs` (up to 2 wake attempts in case another call beat us).
+    if (maxWaitMs > 0) {
+      const waitDeadline = nowFn() + maxWaitMs;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const currentNow = nowFn();
+        const remainingBudget = waitDeadline - currentNow;
+        if (remainingBudget <= 0) break;
 
-      if (soonest) {
-        await abortableSleep(soonest.cd.remainingMs + wakeBufferMs, signal, opts.sleep);
+        const soonest = candidates
+          .map((m) => ({ model: m, cd: activeCooldown(m) }))
+          .filter(
+            (x): x is { model: string; cd: { remainingMs: number; daily: boolean } } =>
+              x.cd != null && !x.cd.daily && x.cd.remainingMs <= remainingBudget,
+          )
+          .sort((a, b) => a.cd.remainingMs - b.cd.remainingMs)[0];
+
+        if (!soonest) break;
+
+        try {
+          await opts.onWait?.(opts.stage, currentNow + soonest.cd.remainingMs);
+        } catch {
+          // ignore
+        }
+        try {
+          await abortableSleep(soonest.cd.remainingMs + WAKE_BUFFER_MS, signal, opts.sleep);
+        } finally {
+          try {
+            await opts.onWait?.(opts.stage, null);
+          } catch {
+            // ignore
+          }
+        }
         const res = await dispatch(soonest.model);
-        if (res.status !== 429) return res;
+        if (!(await shouldFailoverResponse(soonest.model, res, false))) {
+          return res;
+        }
         lastResponse = res;
-        await record429(soonest.model, res);
       }
     }
 
     if (lastResponse) return lastResponse;
 
-    // 4. Every candidate was skipped from pre-existing Redis cooldowns.
+    // 3. Every candidate was skipped from pre-existing Redis cooldowns beyond `maxWaitMs`.
     if (isSynthesis) {
+      const nonRetired = candidates.filter((c) => !activeCooldown(c)?.retired);
+      const poolToRank = nonRetired.length > 0 ? nonRetired : candidates;
       const leastCooled =
-        [...candidates].sort(
+        [...poolToRank].sort(
           (a, b) => (activeCooldown(a)?.remainingMs ?? 0) - (activeCooldown(b)?.remainingMs ?? 0),
         )[0] ?? opts.primaryModel;
       const res = await dispatch(leastCooled);
-      if (res.status === 429) await record429(leastCooled, res);
+      await shouldFailoverResponse(leastCooled, res, false);
       return res;
     }
 
-    const soonestMs =
-      candidates
-        .map((m) => activeCooldown(m)?.remainingMs ?? DEFAULT_429_WAIT_MS)
-        .sort((a, b) => a - b)[0] ?? DEFAULT_429_WAIT_MS;
-    const retryAfterSec = Math.max(1, Math.ceil(soonestMs / 1_000));
+    const activeWaits = candidates
+      .map((m) => activeCooldown(m))
+      .filter((cd): cd is NonNullable<typeof cd> => cd != null && !cd.retired)
+      .map((cd) => cd.remainingMs)
+      .sort((a, b) => a - b);
+
+    if (activeWaits.length === 0) {
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: `All configured models in the ${opts.stage} pool have been retired or decommissioned at the provider.`,
+            type: "invalid_request_error",
+          },
+        }),
+        { status: 404, headers: { "content-type": "application/json" } },
+      );
+    }
+
+    const retryAfterSec = Math.max(1, Math.ceil(activeWaits[0] / 1_000));
     return new Response(
       JSON.stringify({
         error: {

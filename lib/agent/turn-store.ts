@@ -191,17 +191,40 @@ export async function finishDurableTurn(
   return withRunLock(runId, async () => {
     const existing = decodeStoredJson<DurableTurnState>(await db.get(runKey(runId)));
 
-    // Never overwrite an explicit user Stop with a late completion/error.
-    if (existing?.status === "stopped" && completion.status !== "stopped") {
-      return existing;
+    const resolvedTurnId = existing?.turnId ?? (isTurnId(opts?.turnId) ? opts?.turnId : undefined);
+    const [runStopped, turnStopped] = await Promise.all([
+      db.get<string>(stopRunKey(runId)),
+      resolvedTurnId
+        ? db.get<string>(stopTurnKey(existing?.chatId ?? chatId, resolvedTurnId))
+        : Promise.resolve(null),
+    ]);
+    const wasStopped =
+      existing?.status === "stopped" ||
+      String(runStopped ?? "") === "1" ||
+      String(turnStopped ?? "") === "1";
+
+    // Never overwrite an explicit user Stop/supersede with a late completion/error.
+    if (wasStopped && completion.status !== "stopped") {
+      if (existing?.status === "stopped") return existing;
+      const stoppedState: DurableTurnState = {
+        runId,
+        chatId: existing?.chatId ?? chatId,
+        ...(resolvedTurnId ? { turnId: resolvedTurnId } : {}),
+        status: "stopped",
+        steps: existing?.steps ?? completion.steps,
+        sources: existing?.sources ?? completion.sources,
+        updatedAt: now,
+      };
+      await db.set(runKey(runId), JSON.stringify(stoppedState), {
+        ex: serverConfig.turn.ttlSeconds,
+      });
+      return stoppedState;
     }
 
     const base = {
       runId,
       chatId: existing?.chatId ?? chatId,
-      ...(existing?.turnId ?? opts?.turnId
-        ? { turnId: existing?.turnId ?? opts?.turnId }
-        : {}),
+      ...(resolvedTurnId ? { turnId: resolvedTurnId } : {}),
       steps: completion.steps,
       sources: completion.sources,
       updatedAt: now,
@@ -242,7 +265,7 @@ export async function stopDurableTurn(
 
   return withRunLock(runId, async () => {
     const existing = decodeStoredJson<DurableTurnState>(await db.get(runKey(runId)));
-    if (validTurnId && existing?.turnId && existing.turnId !== validTurnId) {
+    if (validTurnId && existing && existing.turnId !== validTurnId) {
       return true;
     }
 
@@ -264,13 +287,20 @@ export async function isTurnCancelled(
   chatId: string,
   runId: string,
   db: TurnStoreDb = defaultDb(),
+  turnId?: string,
 ): Promise<boolean> {
   try {
-    const [stopped, active] = await Promise.all([
+    const validTurnId = isTurnId(turnId) ? turnId : undefined;
+    const [stopped, active, turnStopped] = await Promise.all([
       db.get<string>(stopRunKey(runId)),
       db.get<string>(activeKey(chatId)),
+      validTurnId ? db.get<string>(stopTurnKey(chatId, validTurnId)) : Promise.resolve(null),
     ]);
-    return String(stopped ?? "") === "1" || Boolean(active && active !== runId);
+    return (
+      String(stopped ?? "") === "1" ||
+      String(turnStopped ?? "") === "1" ||
+      Boolean(active && active !== runId)
+    );
   } catch (error) {
     logError("turn-cancel-check", error, { chatId, runId });
     return false;
@@ -286,7 +316,7 @@ export function watchDurableTurn(
   chatId: string,
   runId: string,
   controller: AbortController,
-  opts?: { db?: TurnStoreDb; intervalMs?: number; now?: () => number },
+  opts?: { db?: TurnStoreDb; intervalMs?: number; now?: () => number; turnId?: string },
 ): () => void {
   const db = opts?.db ?? defaultDb();
   const nowFn = opts?.now ?? Date.now;
@@ -298,7 +328,7 @@ export function watchDurableTurn(
     busy = true;
     void (async () => {
       try {
-        if (await isTurnCancelled(chatId, runId, db)) {
+        if (await isTurnCancelled(chatId, runId, db, opts?.turnId)) {
           controller.abort();
           return;
         }

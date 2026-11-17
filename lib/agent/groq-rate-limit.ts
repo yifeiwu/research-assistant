@@ -6,12 +6,14 @@ import { serverConfig } from "@/lib/config";
 import { logError, logInfo } from "@/lib/logger";
 import type { BudgetDimension, GroqBudget } from "./groq-budget";
 import {
+  fitSynthesisOutputTokens,
   groqReasoningOptions,
   maxSummaryBatchInputChars,
   maxSummaryOutputTokens,
   maxSynthesisOutputTokens,
   type GroqModelRole,
 } from "@/lib/models";
+import { estimateTokens } from "@/lib/tokens";
 
 type GroqFetch = NonNullable<GroqProviderSettings["fetch"]>;
 
@@ -346,14 +348,28 @@ export function rewriteGroqRequestBody(
   if (rawTokenCap !== undefined) {
     delete parsed.max_tokens;
     if (stage === "synthesis") {
-      parsed.max_completion_tokens = maxSynthesisOutputTokens(
+      const modelMax = maxSynthesisOutputTokens(
         targetModel,
         synthesisDefaultMaxTokens,
       );
+      const estInputTokens = Array.isArray(parsed.messages)
+        ? estimateTokens(JSON.stringify(parsed.messages))
+        : 0;
+      const fittedMax = fitSynthesisOutputTokens(
+        targetModel,
+        estInputTokens,
+        synthesisDefaultMaxTokens,
+      );
+      // Preserve caller's tighter cap on high-OTPM models while still clamping
+      // against `targetModel`'s 8K TPM ceiling when failing over across models.
+      parsed.max_completion_tokens =
+        rawTokenCap > 900 && modelMax > 900
+          ? Math.min(rawTokenCap, fittedMax)
+          : fittedMax;
     } else if (stage === "summary") {
-      parsed.max_completion_tokens = Math.min(
-        rawTokenCap,
-        maxSummaryOutputTokens(targetModel, serverConfig.summary.batchMaxOutputTokens),
+      parsed.max_completion_tokens = maxSummaryOutputTokens(
+        targetModel,
+        serverConfig.summary.batchMaxOutputTokens,
       );
     } else {
       parsed.max_completion_tokens = rawTokenCap;

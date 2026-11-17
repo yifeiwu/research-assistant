@@ -84,6 +84,8 @@ export default function Home() {
   const { scrollRef, atBottom, handleScroll, scrollToBottom } = useScrollAnchor(
     messages,
     pending,
+    liveProgress?.steps.length ?? 0,
+    activeId,
   );
 
   useEffect(() => {
@@ -105,6 +107,7 @@ export default function Home() {
     setAnnouncement("");
     sendMessage(trimmed, settings.effort);
     setInput("");
+    scrollToBottom();
   }
 
   return (
@@ -159,12 +162,16 @@ export default function Home() {
                   <Message
                     key={message.id}
                     message={message}
-                    onEdit={(id, next) =>
-                      editUserMessage(id, next, settings.effort)
-                    }
-                    onRegenerate={(id) =>
-                      regenerateAssistantMessage(id, settings.effort)
-                    }
+                    onEdit={(id, next) => {
+                      setAnnouncement("");
+                      editUserMessage(id, next, settings.effort);
+                      scrollToBottom();
+                    }}
+                    onRegenerate={(id) => {
+                      setAnnouncement("");
+                      regenerateAssistantMessage(id, settings.effort);
+                      scrollToBottom();
+                    }}
                   />
                 ))}
 
@@ -212,7 +219,11 @@ export default function Home() {
                 {showUnanswered && (
                   <UnansweredNotice
                     reason={unansweredReason}
-                    onRetry={() => retryLastTurn(settings.effort)}
+                    onRetry={() => {
+                      setAnnouncement("");
+                      retryLastTurn(settings.effort);
+                      scrollToBottom();
+                    }}
                   />
                 )}
 
@@ -225,7 +236,11 @@ export default function Home() {
                       <div className="font-medium">{errorInfo.title}</div>
                       <button
                         type="button"
-                        onClick={() => retryLastTurn(settings.effort)}
+                        onClick={() => {
+                          setAnnouncement("");
+                          retryLastTurn(settings.effort);
+                          scrollToBottom();
+                        }}
                         disabled={pending}
                         className="flex shrink-0 items-center gap-1.5 rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-200 transition hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                         aria-label="Retry sending the message"

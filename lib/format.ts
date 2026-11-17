@@ -22,11 +22,13 @@ export function busyLabel(
   }
   if (wait?.kind === "rate-limit") {
     const secs =
-      nowMs != null ? Math.max(0, Math.ceil((wait.resumeAt - nowMs) / 1_000)) : 0;
+      nowMs != null && nowMs > 0
+        ? Math.max(0, Math.ceil((wait.resumeAt - nowMs) / 1_000))
+        : 0;
     const stageText = STAGE_LABELS[wait.stage];
     return secs > 0
       ? `Waiting for model quota before ${stageText} (${secs}s)…`
-      : `Resuming ${stageText}…`;
+      : `Waiting for model quota before ${stageText}…`;
   }
 
   if (steps.length === 0) return "Thinking…";

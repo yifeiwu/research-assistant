@@ -17,13 +17,14 @@ const PER_SOURCE_INPUT_CHAR_CAP = serverConfig.summary.perSourceInputCharCap;
 const FALLBACK_CHAR_CAP = serverConfig.summary.fallbackCharCap;
 
 /**
- * Strip inline `<think>...</think>` blocks emitted by open-weight reasoning
- * models on OpenAI-compatible endpoints that don't separate reasoning fields.
+ * Strip leading `<think>...</think>` preamble blocks emitted by open-weight
+ * reasoning models on OpenAI-compatible endpoints without eating literal
+ * `<think>` mentions inside user-visible prose or code blocks.
  */
 export function stripThinking(text: string): string {
   return text
-    .replace(/<think>[\s\S]*?<\/think>/gi, "")
-    .replace(/<think>[\s\S]*$/gi, "")
+    .replace(/^\s*(?:<think>[\s\S]*?<\/think>\s*)+/i, "")
+    .replace(/^\s*<think>[\s\S]*$/i, "")
     .trim();
 }
 
@@ -195,7 +196,7 @@ export async function condenseSourcesDetailed(
         usedFallback: true,
       });
 
-      const runBatchCall = async (): Promise<(string | null)[]> => {
+      const runBatchCall = async (batchSignal: AbortSignal): Promise<(string | null)[]> => {
         const promptForModel = (modelId: string) => {
           const modelBatchCap = maxSummaryBatchInputChars(
             modelId,
@@ -220,6 +221,7 @@ export async function condenseSourcesDetailed(
           prompt: promptForModel,
           maxOutputTokens: summaryTokensFor,
           timeoutMs: serverConfig.summary.timeoutMs,
+          signal: batchSignal,
         });
         const notes = parseBatchNotes(text, entries.length);
         if (notes.every((n) => n === null)) {

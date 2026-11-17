@@ -133,6 +133,18 @@ describe("rewriteGroqRequestBody", () => {
     );
     expect(backToGpt.model).toBe("openai/gpt-oss-20b");
     expect(backToGpt.max_completion_tokens).toBe(4_000);
+
+    // Multi-turn failover from Qwen (900) to GPT-OSS with ~5,000 input tokens clamps below 8,000 TPM!
+    const heavyQwen = JSON.stringify({
+      model: "qwen/qwen3.8-27b",
+      max_completion_tokens: 900,
+      messages: [{ role: "system", content: "x".repeat(20_000) }],
+    });
+    const clampedGpt = JSON.parse(
+      rewriteGroqRequestBody(heavyQwen, "openai/gpt-oss-120b", "synthesis", 4_000),
+    );
+    expect(clampedGpt.max_completion_tokens).toBeLessThanOrEqual(2_500);
+    expect(clampedGpt.max_completion_tokens).toBeGreaterThanOrEqual(256);
   });
 
   it("rewrites auxiliary reasoning fields and trims summary source excerpts when switching onto 4k-context allam-2-7b", () => {
@@ -210,7 +222,7 @@ describe("createResilientGroqFetch", () => {
       "openai/gpt-oss-120b",
       "qwen/qwen3.8-27b",
     ]);
-    expect(seenBodies[0].max_completion_tokens).toBe(4_000);
+    expect(seenBodies[0].max_completion_tokens).toBe(3_500);
     expect(seenBodies[1].max_completion_tokens).toBe(900);
 
     seenBodies.length = 0;

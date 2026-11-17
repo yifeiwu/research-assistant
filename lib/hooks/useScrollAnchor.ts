@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "@/lib/types/chat";
 
 export type ScrollAnchor = {
@@ -11,23 +11,37 @@ export type ScrollAnchor = {
 };
 
 /**
- * Keep the message list pinned to the bottom as progress updates arrive, unless
- * the user has scrolled up to inspect earlier turns.
+ * Keep the message list pinned to the bottom as messages and live research
+ * steps arrive, unless the user has scrolled up to inspect earlier turns.
  */
 export function useScrollAnchor(
   messages: ChatMessage[],
   isBusy: boolean,
+  liveStepCount: number = 0,
+  activeId?: string,
 ): ScrollAnchor {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
+  const prevActiveIdRef = useRef(activeId);
 
   useEffect(() => {
+    if (prevActiveIdRef.current !== activeId) {
+      prevActiveIdRef.current = activeId;
+      queueMicrotask(() => {
+        setAtBottom(true);
+        scrollRef.current?.scrollTo({
+          top: scrollRef.current.scrollHeight,
+          behavior: "auto",
+        });
+      });
+      return;
+    }
     if (!atBottom) return;
     scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
       behavior: isBusy ? "auto" : "smooth",
     });
-  }, [messages, atBottom, isBusy]);
+  }, [activeId, messages, liveStepCount, atBottom, isBusy]);
 
   function handleScroll() {
     const el = scrollRef.current;
@@ -36,13 +50,15 @@ export function useScrollAnchor(
     setAtBottom(distanceFromBottom < 80);
   }
 
-  function scrollToBottom() {
-    scrollRef.current?.scrollTo({
-      top: scrollRef.current.scrollHeight,
-      behavior: "smooth",
-    });
+  const scrollToBottom = useCallback(() => {
     setAtBottom(true);
-  }
+    requestAnimationFrame(() => {
+      scrollRef.current?.scrollTo({
+        top: scrollRef.current.scrollHeight,
+        behavior: "smooth",
+      });
+    });
+  }, []);
 
   return { scrollRef, atBottom, handleScroll, scrollToBottom };
 }

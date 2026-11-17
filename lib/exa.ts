@@ -162,6 +162,10 @@ async function postExa(
   throw lastError instanceof Error ? lastError : new Error("Exa request failed");
 }
 
+const MAX_EXA_URL_CHARS = 2_048;
+const MAX_EXA_TITLE_CHARS = 500;
+const MAX_EXA_DATE_CHARS = 100;
+
 function parseExaResults(rawList: RawExaResult[]): ExaDocument[] {
   const docs: ExaDocument[] = [];
   for (const item of rawList) {
@@ -172,15 +176,17 @@ function parseExaResults(rawList: RawExaResult[]): ExaDocument[] {
         : typeof item.id === "string" && item.id.startsWith("http")
           ? item.id.trim()
           : "";
-    if (!url) continue;
+    if (!url || url.length > MAX_EXA_URL_CHARS || !/^https?:\/\//i.test(url)) {
+      continue;
+    }
 
     const title =
       typeof item.title === "string" && item.title.trim()
-        ? item.title.trim()
+        ? item.title.trim().slice(0, MAX_EXA_TITLE_CHARS)
         : undefined;
     const publishedDate =
       typeof item.publishedDate === "string" && item.publishedDate.trim()
-        ? item.publishedDate.trim()
+        ? item.publishedDate.trim().slice(0, MAX_EXA_DATE_CHARS)
         : undefined;
     const text = typeof item.text === "string" ? item.text.trim() : "";
     const highlights = Array.isArray(item.highlights)
@@ -317,11 +323,12 @@ export function createExaClient(opts: {
           ...(highlightsQuery ? { hq: normalizeCacheText(highlightsQuery) } : {}),
         },
         serverConfig.cache.searchTtlSeconds,
-        () =>
+        (loaderSignal) =>
           searchExa(cleanQuery, {
             numResults,
             maxCharacters: maxChars,
             highlightsQuery,
+            signal: loaderSignal,
             requestId: opts.requestId,
           }),
         { bypass: opts.disableCache, requestId: opts.requestId, signal: opts.signal },
@@ -349,10 +356,11 @@ export function createExaClient(opts: {
           ...(highlightsQuery ? { hq: normalizeCacheText(highlightsQuery) } : {}),
         },
         serverConfig.cache.contentsTtlSeconds,
-        () =>
+        (loaderSignal) =>
           fetchExaContents(urls, {
             maxCharacters: maxChars,
             highlightsQuery,
+            signal: loaderSignal,
             requestId: opts.requestId,
           }),
         { bypass: opts.disableCache, requestId: opts.requestId, signal: opts.signal },

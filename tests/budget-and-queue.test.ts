@@ -275,5 +275,13 @@ describe("busyLabel wait formatting", () => {
         10_000,
       ),
     ).toBe("Waiting for model quota before writing the answer (15s)…");
+    // Resting heartbeat (`nowMs = 0`) never flashes a billion-second epoch countdown!
+    expect(
+      busyLabel(
+        [],
+        { kind: "rate-limit", stage: "answering", resumeAt: 1_794_890_000_000 },
+        0,
+      ),
+    ).toBe("Waiting for model quota before writing the answer…");
   });
 });

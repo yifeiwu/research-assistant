@@ -28,7 +28,7 @@ function stepPresentation(data: ResearchStepData): {
   failed: boolean;
 } {
   const isFollowUp = data.round > 1;
-  const sCount = data.sources.length;
+  const sCount = (data.sources ?? []).length;
 
   switch (data.phase) {
     case "planning":
@@ -73,7 +73,8 @@ function stepPresentation(data: ResearchStepData): {
         running: false,
         failed: true,
       };
-    case "done": {
+    case "done":
+    default: {
       const prefix = isFollowUp ? "Follow-up research" : "Researched";
       const title =
         sCount > 0
@@ -92,11 +93,12 @@ function stepPresentation(data: ResearchStepData): {
 
 export function ResearchStep({ data }: { data: ResearchStepData }) {
   const [open, setOpen] = useState(false);
+  const sources = (data.sources ?? []).filter((s) => /^https?:\/\//i.test(s.url));
 
   if (
     data.phase === "done" &&
     !data.query &&
-    data.sources.length === 0 &&
+    sources.length === 0 &&
     !data.notes
   ) {
     return null;
@@ -105,7 +107,7 @@ export function ResearchStep({ data }: { data: ResearchStepData }) {
   const { icon: Icon, title, status, running, failed } = stepPresentation(data);
   const hasDetails =
     Boolean(data.query) ||
-    data.sources.length > 0 ||
+    sources.length > 0 ||
     Boolean(data.notes) ||
     Boolean(data.error);
 
@@ -186,13 +188,13 @@ export function ResearchStep({ data }: { data: ResearchStepData }) {
             </div>
           )}
 
-          {data.sources.length > 0 && (
+          {sources.length > 0 && (
             <div>
               <div className="mb-1.5 text-[11px] font-medium tracking-wide text-muted/80 uppercase">
                 Sources read
               </div>
               <div className="flex flex-wrap gap-1.5">
-                {data.sources.map((src) => {
+                {sources.map((src) => {
                   const domain = domainOf(src.url);
                   return (
                     <a

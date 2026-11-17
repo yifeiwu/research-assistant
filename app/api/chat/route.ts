@@ -8,6 +8,7 @@ import {
   type ResearchStepData,
 } from "@/lib/types/chat";
 import {
+  collectPriorSources,
   findLastUserMessageId,
   latestUserText,
   toModelMessages,
@@ -95,7 +96,11 @@ export async function POST(req: Request) {
   const requestId = crypto.randomUUID().slice(0, 8);
   const query = latestUserText(messages);
   const turnId = findLastUserMessageId(messages);
-  const modelMessages = toModelMessages(messages);
+  const modelMessages = toModelMessages(
+    messages,
+    serverConfig.synthesis.historyTokenBudget,
+  );
+  const priorSources = collectPriorSources(messages);
 
   logInfo("request", {
     requestId,
@@ -134,7 +139,7 @@ export async function POST(req: Request) {
 
   after(async () => {
     const abortController = new AbortController();
-    const stopWatching = watchDurableTurn(chatId, runId, abortController);
+    const stopWatching = watchDurableTurn(chatId, runId, abortController, { turnId });
     let releaseQueue: (() => Promise<void>) | undefined;
     let latestSteps: ResearchStepData[] = [];
     let latestSources: ResearchSource[] = [];
@@ -155,12 +160,13 @@ export async function POST(req: Request) {
         query,
         effort,
         modelMessages,
+        priorSources,
         signal: abortController.signal,
         deadlineAt,
         onProgress: async (progress) => {
           latestSteps = progress.steps;
           latestSources = progress.sources;
-          if (await isTurnCancelled(chatId, runId)) {
+          if (await isTurnCancelled(chatId, runId, undefined, turnId)) {
             abortController.abort();
             return;
           }

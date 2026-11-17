@@ -80,8 +80,12 @@ export function createGroqBudget(opts?: {
     const prev = keyLocks.get(key) ?? Promise.resolve();
     const next = prev.then(fn, fn);
     const settled = next.then(
-      () => undefined,
-      () => undefined,
+      () => {
+        if (keyLocks.get(key) === settled) keyLocks.delete(key);
+      },
+      () => {
+        if (keyLocks.get(key) === settled) keyLocks.delete(key);
+      },
     );
     keyLocks.set(key, settled);
     return next;

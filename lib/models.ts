@@ -48,6 +48,8 @@ export type GroqModelRole = "synthesis" | "auxiliary";
 
 const DEFAULT_SYNTHESIS_MAX_TOKENS = 4_000;
 const DEFAULT_SUMMARY_MAX_TOKENS = 650;
+const TPM_SAFETY_MARGIN = 500;
+const HARD_MIN_SYNTHESIS_TOKENS = 256;
 
 /**
  * Curated free-tier Groq text-generation models partitioned into two fungible
@@ -170,6 +172,24 @@ export function maxSynthesisOutputTokens(
 ): number {
   const cap = findModel(id)?.maxSynthesisTokens;
   return cap != null ? Math.min(cap, defaultMax) : defaultMax;
+}
+
+/**
+ * Compute synthesis `maxOutputTokens` for `id` that also fits alongside
+ * `estInputTokens` inside the model's per-request/per-minute `tpm` ceiling
+ * (preventing HTTP 413s on multi-turn follow-up conversations).
+ */
+export function fitSynthesisOutputTokens(
+  id: string | undefined | null,
+  estInputTokens: number,
+  defaultMax: number = DEFAULT_SYNTHESIS_MAX_TOKENS,
+): number {
+  const modelMax = maxSynthesisOutputTokens(id, defaultMax);
+  const tpm = groqModelLimits(id)?.tpm;
+  if (!tpm || estInputTokens <= 0) return modelMax;
+  const available = tpm - TPM_SAFETY_MARGIN - Math.ceil(estInputTokens);
+  const floor = Math.min(modelMax, HARD_MIN_SYNTHESIS_TOKENS);
+  return Math.max(floor, Math.min(modelMax, available));
 }
 
 /** Safe `maxOutputTokens` reservation for batched source condensation on `id`. */

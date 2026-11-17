@@ -33,34 +33,33 @@ export function buildDirectAnswerPrompt(
       : "";
   return `${currentDateLine()}
 
-You are a knowledgeable assistant.
+You are a knowledgeable research assistant.
 
-Answer the user's question directly and concisely using your own knowledge.
+Answer the user's latest message directly and concisely using the conversation context above and your own knowledge.
 
 Guidelines:
-- Be concise and well-structured. Use markdown (headings, lists) where it helps readability.
-- If the question depends on recent events, live prices, or specifics you're not confident about, say so honestly rather than guessing.${failureLine}`;
+- Be concise and well-structured. Use markdown (headings, lists, tables) where it helps readability.
+- When referencing facts, figures, or URLs already established in earlier turns of the conversation, preserve their exact inline markdown citations \`[Source Name](https://...)\` rather than inventing new URLs.
+- If the question depends on recent events, live prices, or specifics not in the conversation that you're not confident about, say so honestly rather than guessing.${failureLine}`;
 }
 
 /**
- * Stage 1 prompt: turns the conversation into a self-contained `BRIEF:` line
- * plus ONE focused initial web search query, or `NO_SEARCH`.
+ * Stage 1 prompt: turns a conversation transcript + latest user message into a
+ * self-contained `BRIEF:` line plus ONE focused initial web search query, or `NO_SEARCH`.
  */
 export function buildQueryPlanPrompt(): string {
   return `${currentDateLine()}
 
-You plan the initial web search query for a sequential, multi-round analytical research assistant.
+You are a search query planner (NOT the answer writer). Never answer the user's question.
 
-Given the conversation so far, decide whether answering the user's latest message benefits from web search.
+Given the optional prior conversation context and the user's latest message, decide whether answering the latest message benefits from web search.
 
 Output format rules (STRICT):
-- If the latest message is purely a greeting, small talk, pure math/logic, or a self-contained rewrite/formatting of text already in the conversation, output ONLY the single token:
-NO_SEARCH
-- Otherwise:
-  1. On the FIRST line, output \`BRIEF: <concise self-contained research question>\` (1 sentence, under 35 words) resolving all pronouns ("it", "they", "that"), named entities, timeframe, and comparison/analytical criteria from prior conversation turns.
-  2. On the SECOND line, output ONE high-signal initial web search query targeting the core primary empirical data, official documentation, filings, or authoritative overview (later rounds will sequentially search missing mechanisms, benchmarks, or counterpoints based on what Round 1 retrieves).
-- Make the search query self-contained and include the current year when freshness matters.
-- Output ONLY the \`BRIEF:\` line followed by the single raw search query. No numbering, no bullets, no quotes, no commentary, no JSON.`;
+- Output ONLY \`NO_SEARCH\` if the latest message is purely a greeting, small talk, pure math/coding/logic, or strictly asks to reformat/summarize text already present in the prior conversation without needing any additional, deeper, or updated facts.
+- Otherwise (including follow-up questions that ask about a new entity, comparison dimension, deeper mechanism, verification, or updated data):
+  1. FIRST line: \`BRIEF: <concise self-contained research question>\` (1 sentence, under 35 words) explicitly naming every entity, comparison baseline, timeframe, and constraint resolved from prior turns (NEVER leave unresolved pronouns like "it", "they", "them", "that", or "those").
+  2. SECOND line: ONE raw, self-contained web search query targeting the core primary evidence for the latest message (include explicit entity names and current year when freshness matters).
+- Output ONLY those 2 lines (or \`NO_SEARCH\`). No markdown headings, no bullets, no quotes, no explanation.`;
 }
 
 /**

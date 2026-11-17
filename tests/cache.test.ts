@@ -91,4 +91,31 @@ describe("request cache", () => {
     await expect(second).resolves.toBe(42);
     expect(loader).toHaveBeenCalledTimes(1);
   });
+  it("aborts the underlying loader immediately when all attached waiters abort", async () => {
+    const cache = createRequestCache(fakeStore());
+    let loaderSignalAborted = false;
+    const loader = vi.fn(
+      (signal: AbortSignal) =>
+        new Promise<number>((_, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => {
+              loaderSignalAborted = true;
+              const err = new Error("Aborted");
+              err.name = "AbortError";
+              reject(err);
+            },
+            { once: true },
+          );
+        }),
+    );
+    const ctrl = new AbortController();
+    const pending = cache.wrap("notes-batch", { q: "cancel-me" }, 60, loader, {
+      signal: ctrl.signal,
+    });
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(loaderSignalAborted).toBe(true);
+  });
 });

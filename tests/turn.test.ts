@@ -128,6 +128,66 @@ describe("executeTurn", () => {
     expect(out.message.text).toContain("ran out of output space");
   });
 
+  it("preserves prior-turn citations on follow-ups and clamps maxOutputTokens on multi-turn history to fit 8K TPM", async () => {
+    const noSearchOutcome: ResearchOutcome = {
+      searched: false,
+      evidenceBlock: "",
+      totalSources: 0,
+      sources: [],
+      steps: [],
+    };
+    const h = makeHarness({
+      outcome: noSearchOutcome,
+      generateResult: {
+        text: "Summary table citing [Prior Stripe](https://stripe.com/pricing) and [Invented](https://fake.invalid/x).",
+        finishReason: "stop",
+      },
+    });
+
+    const out = await executeTurn({
+      requestId: "req-followup",
+      query: "Put that into a table",
+      effort: effortConfig("medium"),
+      modelMessages: [
+        { role: "user", content: "Compare Stripe pricing" },
+        { role: "assistant", content: "Detailed report. ".repeat(350) },
+        { role: "user", content: "Put that into a table" },
+      ],
+      priorSources: [
+        { url: "https://stripe.com/pricing", title: "Prior Stripe" },
+        { url: "https://unused-prior.com/doc", title: "Unused Prior" },
+      ],
+      signal: new AbortController().signal,
+      deps: {
+        resolveModels: () => ({
+          pools: { reasoning: ["openai/gpt-oss-120b"], summarizer: ["qwen/qwen3.8-27b"] },
+          stages: {
+            synthesis: { lease: async () => ({ model: fakeModel("openai/gpt-oss-120b"), modelId: "openai/gpt-oss-120b" }) },
+            planner: { lease: async () => ({ model: fakeModel("openai/gpt-oss-120b"), modelId: "openai/gpt-oss-120b" }) },
+            summary: { lease: async () => ({ model: fakeModel("qwen/qwen3.8-27b"), modelId: "qwen/qwen3.8-27b" }) },
+          },
+        }),
+        runResearch: async () => noSearchOutcome,
+        generateText: (async (input: Parameters<typeof generateText>[0]) => {
+          h.calls.push(input);
+          return {
+            text: "Summary table citing [Prior Stripe](https://stripe.com/pricing) and [Invented](https://fake.invalid/x).",
+            finishReason: "stop",
+            usage: { inputTokens: 1_500, outputTokens: 80, totalTokens: 1_580 },
+          };
+        }) as unknown as typeof generateText,
+      },
+    });
+    if ("error" in out) throw new Error(out.error);
+
+    // Preserved valid prior-turn link, stripped invented URL, and surfaced only cited prior sources!
+    expect(out.message.text).toContain("[Prior Stripe](https://stripe.com/pricing)");
+    expect(out.message.text).not.toContain("fake.invalid");
+    expect(out.message.sources).toEqual([
+      { url: "https://stripe.com/pricing", title: "Prior Stripe" },
+    ]);
+  });
+
   it("aborts immediately when signal is already aborted", async () => {
     const h = makeHarness();
     const ctrl = new AbortController();

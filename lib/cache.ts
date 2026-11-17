@@ -1,6 +1,6 @@
 import "server-only";
 import { createHash } from "node:crypto";
-import { createAbortError } from "./errors";
+import { createAbortError, isAbortError } from "./errors";
 import { decodeStoredJson } from "./json";
 import { redis } from "./redis";
 import { logDebug, logError } from "./logger";
@@ -36,30 +36,62 @@ export type RequestCache = {
     namespace: string,
     parts: unknown,
     ttlSeconds: number,
-    loader: () => Promise<T>,
+    loader: (signal: AbortSignal) => Promise<T>,
     opts?: { bypass?: boolean; requestId?: string; signal?: AbortSignal },
   ): Promise<T>;
 };
 
+type InflightEntry = {
+  task: Promise<unknown>;
+  controller: AbortController;
+  waiters: number;
+};
+
 /**
- * Await a shared task, rejecting promptly if *this* caller's signal aborts
- * without cancelling the underlying shared work for other waiters.
+ * Await a shared task with reference-counted cancellation:
+ * - Rejects promptly if *this* caller's `signal` aborts.
+ * - Keeps the underlying `loader` alive while at least one other waiter is
+ *   still attached, and aborts `entry.controller` immediately once *all*
+ *   waiters have aborted so cancelled turns never leak background LLM/Exa calls.
  */
-function withCallerAbort<T>(task: Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (!signal) return task;
-  if (signal.aborted) {
+function attachWaiter<T>(
+  entry: InflightEntry,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal?.aborted) {
+    if (entry.waiters === 0) entry.controller.abort();
     return Promise.reject(createAbortError());
   }
+  entry.waiters += 1;
+  let detached = false;
+  const release = (aborted: boolean) => {
+    if (detached) return;
+    detached = true;
+    entry.waiters = Math.max(0, entry.waiters - 1);
+    if (aborted && entry.waiters === 0) {
+      entry.controller.abort();
+    }
+  };
+
+  if (!signal) {
+    return (entry.task as Promise<T>).finally(() => release(false));
+  }
+
   return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(createAbortError());
+    const onAbort = () => {
+      release(true);
+      reject(createAbortError());
+    };
     signal.addEventListener("abort", onAbort, { once: true });
-    task.then(
+    (entry.task as Promise<T>).then(
       (value) => {
         signal.removeEventListener("abort", onAbort);
+        release(false);
         resolve(value);
       },
       (error) => {
         signal.removeEventListener("abort", onAbort);
+        release(false);
         reject(error);
       },
     );
@@ -67,26 +99,40 @@ function withCallerAbort<T>(task: Promise<T>, signal?: AbortSignal): Promise<T> 
 }
 
 /**
- * Fail-open Redis cache with in-process in-flight coalescing.
- *
- * Loaders must be signal-free: the same in-flight task may serve several
- * callers, so one caller's cancellation must not fail the others. Callers
- * pass their own `signal` via opts instead — it only detaches that caller
- * from the shared task (which keeps running and still populates the cache).
+ * Fail-open Redis cache with reference-counted in-flight coalescing.
  */
 export function createRequestCache(store?: CacheStore): RequestCache {
-  const inflight = new Map<string, Promise<unknown>>();
+  const inflight = new Map<string, InflightEntry>();
   return {
     async wrap(namespace, parts, ttlSeconds, loader, opts) {
-      if (opts?.bypass || ttlSeconds <= 0) return withCallerAbort(loader(), opts?.signal);
+      if (opts?.signal?.aborted) {
+        throw createAbortError();
+      }
+      if (opts?.bypass || ttlSeconds <= 0) {
+        const directController = new AbortController();
+        const directEntry: InflightEntry = {
+          task: Promise.resolve().then(() => loader(directController.signal)),
+          controller: directController,
+          waiters: 0,
+        };
+        return attachWaiter(directEntry, opts?.signal);
+      }
+
       const key = cacheKey(namespace, parts);
       const pending = inflight.get(key);
-      if (pending) {
-        return withCallerAbort(
-          pending as Promise<Awaited<ReturnType<typeof loader>>>,
+      if (pending && !pending.controller.signal.aborted) {
+        return attachWaiter<Awaited<ReturnType<typeof loader>>>(
+          pending,
           opts?.signal,
         );
       }
+
+      const controller = new AbortController();
+      const entry: InflightEntry = {
+        controller,
+        waiters: 0,
+        task: Promise.resolve(),
+      };
 
       const task = (async () => {
         let cache: CacheStore | undefined;
@@ -101,9 +147,12 @@ export function createRequestCache(store?: CacheStore): RequestCache {
         } catch (error) {
           logError("cache-get", error, { requestId: opts?.requestId, namespace });
         }
+        if (controller.signal.aborted) {
+          throw createAbortError();
+        }
         logDebug("cache-miss", { requestId: opts?.requestId, namespace });
-        const value = await loader();
-        if (cache) {
+        const value = await loader(controller.signal);
+        if (cache && !controller.signal.aborted) {
           try {
             await cache.set(key, JSON.stringify(value), ttlSeconds);
           } catch (error) {
@@ -113,15 +162,15 @@ export function createRequestCache(store?: CacheStore): RequestCache {
         return value;
       })();
 
-      inflight.set(key, task as Promise<unknown>);
-      // Clean up when the shared task itself settles — not when the first
-      // caller returns, since an aborted first caller detaches early while
-      // the task (and later waiters) are still in flight.
-      const cleanup = () => {
-        if (inflight.get(key) === task) inflight.delete(key);
+      entry.task = task as Promise<unknown>;
+      inflight.set(key, entry);
+      const cleanup = (err?: unknown) => {
+        if (inflight.get(key) === entry) inflight.delete(key);
+        // Swallow unhandled rejection noise when all waiters aborted.
+        if (err && (isAbortError(err) || controller.signal.aborted)) return;
       };
-      task.then(cleanup, cleanup);
-      return withCallerAbort(task, opts?.signal);
+      task.then(() => cleanup(), (err) => cleanup(err));
+      return attachWaiter(entry, opts?.signal);
     },
   };
 }

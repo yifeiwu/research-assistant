@@ -5,23 +5,61 @@ export type CollectedSource = {
   title?: string;
 };
 
-const URL_REGEX = /https?:\/\/[^\s)\]}"'<>]+/g;
+const URL_REGEX =
+  /https?:\/\/[^\s()[\]{}"'<>]+(?:\([^\s()"{}<>]*\)[^\s()[\]{}"'<>]*)*/g;
 
 /**
- * Markdown link `[label](url)` allowing one level of balanced parentheses in
- * the destination (e.g. `https://en.wikipedia.org/wiki/Foo_(bar)`).
+ * Markdown link `[label](url)` allowing balanced parentheses in
+ * the destination (e.g. `https://en.wikipedia.org/wiki/Foo_(bar)_baz`).
  */
 export const MARKDOWN_LINK_REGEX =
-  /\[([^\]]+)\]\((https?:\/\/[^\s)]+(?:\([^\s)]*\)[^\s)]*)*)\)/g;
+  /\[([^\]]+)\]\((https?:\/\/[^\s()]+(?:\([^\s()]*\)[^\s()]*)*)\)/g;
 
-/** Split a candidate URL into the URL itself and trailing sentence punctuation. */
+const SENTENCE_PUNCT = new Set([".", ",", ";", ":", "!", "?", "'", '"']);
+
+function countChar(str: string, ch: string): number {
+  let n = 0;
+  for (let i = 0; i < str.length; i++) {
+    if (str[i] === ch) n += 1;
+  }
+  return n;
+}
+
+/**
+ * Split a candidate URL into the URL itself and trailing sentence punctuation,
+ * preserving balanced closing brackets/parentheses that belong to the URL path
+ * (e.g. `https://en.wikipedia.org/wiki/Rust_(programming_language)`).
+ */
 export function splitTrailingPunctuation(rawUrl: string): {
   url: string;
   suffix: string;
 } {
-  const match = rawUrl.match(/[.,;:!?)\]}'"]+$/);
-  if (!match) return { url: rawUrl, suffix: "" };
-  return { url: rawUrl.slice(0, -match[0].length), suffix: match[0] };
+  let end = rawUrl.length;
+  while (end > 0) {
+    const ch = rawUrl[end - 1];
+    if (SENTENCE_PUNCT.has(ch) || ch === "}") {
+      end -= 1;
+      continue;
+    }
+    if (ch === ")") {
+      const prefix = rawUrl.slice(0, end - 1);
+      if (countChar(prefix, "(") <= countChar(prefix, ")")) {
+        end -= 1;
+        continue;
+      }
+    }
+    if (ch === "]") {
+      const prefix = rawUrl.slice(0, end - 1);
+      if (countChar(prefix, "[") <= countChar(prefix, "]")) {
+        end -= 1;
+        continue;
+      }
+    }
+    break;
+  }
+  return end === rawUrl.length
+    ? { url: rawUrl, suffix: "" }
+    : { url: rawUrl.slice(0, end), suffix: rawUrl.slice(end) };
 }
 
 function stripTrailingPunctuation(url: string): string {
@@ -112,18 +150,19 @@ export function collectSources(message: SourceBearingMessage): CollectedSource[]
   };
 
   for (const s of message.sources ?? []) {
-    add(s.url, s.title);
+    if (s?.url) add(s.url, s.title);
   }
   for (const step of message.steps ?? []) {
-    for (const s of step.sources) {
-      add(s.url, s.title);
+    for (const s of step?.sources ?? []) {
+      if (s?.url) add(s.url, s.title);
     }
   }
   if (message.text) {
     for (const match of message.text.matchAll(MARKDOWN_LINK_REGEX)) {
       add(match[2], match[1]);
     }
-    for (const url of extractUrls(message.text)) {
+    const withoutMarkdownLinks = message.text.replace(MARKDOWN_LINK_REGEX, " ");
+    for (const url of extractUrls(withoutMarkdownLinks)) {
       add(url);
     }
   }
@@ -144,7 +183,8 @@ export function splitSourcesByCitation(
     for (const match of message.text.matchAll(MARKDOWN_LINK_REGEX)) {
       citedKeys.add(normalizeUrlKey(match[2]));
     }
-    for (const url of extractUrls(message.text)) {
+    const withoutMarkdownLinks = message.text.replace(MARKDOWN_LINK_REGEX, " ");
+    for (const url of extractUrls(withoutMarkdownLinks)) {
       citedKeys.add(normalizeUrlKey(url));
     }
   }

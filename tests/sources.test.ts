@@ -49,6 +49,9 @@ describe("collectSources & splitSourcesByCitation", () => {
     };
     const { cited, other } = splitSourcesByCitation(message);
     expect(cited.map((s) => s.title)).toEqual(["Two", "Foo", "Four"]);
+    expect(cited.find((s) => s.title === "Foo")?.url).toBe(
+      "https://en.wikipedia.org/wiki/Foo_(bar)",
+    );
     expect(other.map((s) => s.title)).toEqual(["One"]);
   });
 
@@ -72,8 +75,20 @@ describe("chatRequestSchema id validation", () => {
       chatRequestSchema.safeParse({ ...base, id: "123e4567-e89b-12d3-a456-426614174000" }).success,
     ).toBe(true);
   });
-  it("rejects ids that can never address a Redis key", () => {
+  it("rejects ids that can never address a Redis key or unsafe non-http source URLs", () => {
     expect(chatRequestSchema.safeParse({ ...base, id: "bad id!!" }).success).toBe(false);
     expect(chatRequestSchema.safeParse({ ...base, id: "../etc/passwd" }).success).toBe(false);
+    expect(
+      chatRequestSchema.safeParse({
+        messages: [
+          {
+            id: "a1",
+            role: "assistant",
+            text: "x",
+            sources: [{ url: "javascript:alert(1)" }],
+          },
+        ],
+      }).success,
+    ).toBe(false);
   });
 });

@@ -12,6 +12,7 @@ import type { EffortConfig } from "@/lib/effort";
 import { createAbortError } from "@/lib/errors";
 import { logInfo } from "@/lib/logger";
 import {
+  fitSynthesisOutputTokens,
   groqReasoningOptions,
   maxSynthesisOutputTokens,
 } from "@/lib/models";
@@ -21,6 +22,7 @@ import {
   buildSynthesisPrompt,
 } from "@/lib/prompts";
 import { runResearchPipeline, type ResearchOutcome } from "@/lib/research";
+import { normalizeUrlKey, splitSourcesByCitation } from "@/lib/sources";
 import { estimateTokens } from "@/lib/tokens";
 import type {
   ChatMessage,
@@ -121,6 +123,8 @@ export type ExecuteTurnInput = {
   query: string;
   effort: EffortConfig;
   modelMessages: ModelMessage[];
+  /** Sources retrieved in earlier turns of the same thread (valid for follow-up citations). */
+  priorSources?: ResearchSource[];
   signal: AbortSignal;
   deadlineAt?: number;
   onProgress?: (progress: {
@@ -186,25 +190,33 @@ export async function executeTurn(
     stages: resolved.stages,
     onProgress: input.onProgress,
     signal,
+    deadlineAt: input.deadlineAt,
     requestId,
   });
 
   throwIfAborted(signal);
 
-  const outputTokensFor = (modelId: string) =>
+  const baseOutputCap = (modelId: string) =>
     maxSynthesisOutputTokens(modelId, serverConfig.synthesis.maxOutputTokens);
   const buildSystemFor = (modelId: string) =>
     outcome.searched
       ? buildSynthesisPrompt(outcome.evidenceBlock, outcome.degraded, {
           effort: input.effort.level,
-          maxOutputTokens: outputTokensFor(modelId),
+          maxOutputTokens: baseOutputCap(modelId),
         })
       : buildDirectAnswerPrompt(outcome.degraded, outcome.searchFailed);
   const historyTokens = estimateTokens(JSON.stringify(input.modelMessages));
+  const inputTokensFor = (modelId: string) =>
+    estimateTokens(buildSystemFor(modelId)) + historyTokens;
+  const outputTokensFor = (modelId: string) =>
+    fitSynthesisOutputTokens(
+      modelId,
+      inputTokensFor(modelId),
+      serverConfig.synthesis.maxOutputTokens,
+    );
 
   const leased = await resolved.stages.synthesis.lease({
-    estInputTokens: (modelId) =>
-      estimateTokens(buildSystemFor(modelId)) + historyTokens,
+    estInputTokens: inputTokensFor,
     maxOutputTokens: outputTokensFor,
     signal,
   });
@@ -234,7 +246,11 @@ export async function executeTurn(
   });
 
   const cleanedText = stripThinking(result.text);
-  const verified = verifyCitations(cleanedText, outcome.sources);
+  const allowedSources = [
+    ...outcome.sources,
+    ...(input.priorSources ?? []),
+  ];
+  const verified = verifyCitations(cleanedText, allowedSources);
   if (verified.strippedCount > 0) {
     logInfo("citation-verification", {
       requestId,
@@ -252,12 +268,26 @@ export async function executeTurn(
     : noAnswerMessage(result.finishReason);
   const reasoning = result.reasoningText?.trim() || undefined;
 
+  // Include current-turn sources plus any prior-turn sources explicitly cited in this answer.
+  const currentSourceKeys = new Set(
+    outcome.sources.map((s) => normalizeUrlKey(s.url)),
+  );
+  const citedPrior = (input.priorSources ?? []).length > 0
+    ? splitSourcesByCitation(
+        { text: finalText },
+        (input.priorSources ?? []).filter(
+          (s) => !currentSourceKeys.has(normalizeUrlKey(s.url)),
+        ),
+      ).cited
+    : [];
+  const mergedSources = [...outcome.sources, ...citedPrior].slice(0, 60);
+
   logInfo("finish", {
     requestId,
     model: leased.modelId,
     finishReason: result.finishReason,
     searched: outcome.searched,
-    sources: outcome.totalSources,
+    sources: mergedSources.length,
     usage: result.usage,
   });
 
@@ -267,12 +297,12 @@ export async function executeTurn(
     text: finalText,
     ...(reasoning ? { reasoning } : {}),
     ...(outcome.steps.length > 0 ? { steps: outcome.steps } : {}),
-    ...(outcome.sources.length > 0 ? { sources: outcome.sources } : {}),
+    ...(mergedSources.length > 0 ? { sources: mergedSources } : {}),
   };
 
   return {
     message,
     steps: outcome.steps,
-    sources: outcome.sources,
+    sources: mergedSources,
   };
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 
 export function EditUserMessage({
@@ -13,12 +13,27 @@ export function EditUserMessage({
   onCancel: () => void;
 }) {
   const [value, setValue] = useState(initial);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  }, []);
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [value]);
 
   return (
     <div className="flex justify-end">
       <div className="w-full max-w-[85%] rounded-2xl border border-accent bg-surface p-2">
         <textarea
-          autoFocus
+          ref={textareaRef}
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => {
@@ -28,8 +43,8 @@ export function EditUserMessage({
             }
             if (e.key === "Escape") onCancel();
           }}
-          rows={2}
-          className="max-h-52 w-full resize-none bg-transparent px-2 py-1.5 text-foreground outline-none"
+          rows={1}
+          className="max-h-52 w-full resize-none overflow-y-auto bg-transparent px-2 py-1.5 text-foreground outline-none"
         />
         <div className="mt-1 flex justify-end gap-2">
           <button

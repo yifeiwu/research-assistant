@@ -74,6 +74,7 @@ export type ResearchDeps = {
 const MAX_EXPLICIT_URLS = 4;
 const MAX_QUERY_LENGTH = 240;
 const MAX_BRIEF_LENGTH = 360;
+const SYNTHESIS_DEADLINE_RESERVE_MS = 45_000;
 
 export type ResearchOutcome = {
   searched: boolean;
@@ -117,7 +118,7 @@ export function parsePlainTextQuery(
   }
 
   for (const rawLine of rawLines) {
-    if (rawLine.startsWith("```")) continue;
+    if (rawLine.startsWith("```") || /^#{1,6}\s/.test(rawLine)) continue;
     if (
       /^(here (?:is|are)|search quer(?:y|ies)|follow-up quer(?:y|ies)|quer(?:y|ies))\b.*:$/i.test(
         rawLine,
@@ -127,6 +128,7 @@ export function parsePlainTextQuery(
     }
     const normalized = rawLine
       .replace(/^(?:[-*•]+|\d+[.)])\s*/, "")
+      .replace(/^(?:initial\s+|follow-?up\s+)?(?:search\s+)?query\s*:\s*/i, "")
       .replace(/^["'`]+|["'`]+$/g, "")
       .replace(/\s+/g, " ")
       .trim();
@@ -190,8 +192,8 @@ export function parseQueryPlan(raw: string): {
   const parsed = parsePlainTextQuery(remainingLines.join("\n"), {
     stopToken: "NO_SEARCH",
   });
-  if (parsed.stopped && !brief) {
-    return { stopped: true };
+  if (parsed.stopped) {
+    return { stopped: true, ...(brief ? { brief } : {}) };
   }
   return {
     stopped: false,
@@ -382,13 +384,55 @@ function toResearchSource(doc: ExaDocument): ResearchSource {
   return { url: doc.url, title: doc.title, publishedDate: doc.publishedDate };
 }
 
+function messageContentToString(content: ModelMessage["content"]): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => ("text" in part && typeof part.text === "string" ? part.text : ""))
+    .filter(Boolean)
+    .join("\n");
+}
+
+/**
+ * Format conversation history as a compact reference transcript for Stage 1
+ * query planning so the planner resolves follow-up pronouns ("it", "they",
+ * "those") accurately instead of continuing the prior assistant essay.
+ */
+export function buildPlannerPromptFromMessages(messages: ModelMessage[]): string {
+  const items = messages
+    .map((m) => ({
+      role: m.role,
+      text: messageContentToString(m.content).trim(),
+    }))
+    .filter((m) => m.text.length > 0 && (m.role === "user" || m.role === "assistant"));
+
+  if (items.length === 0) return "";
+  const latest = items[items.length - 1];
+  const prior = items.slice(0, -1).slice(-6);
+
+  if (prior.length === 0) {
+    return `User message:\n${latest.text}`;
+  }
+
+  const transcript = prior
+    .map((m) => {
+      const cap = m.role === "assistant" ? 900 : 500;
+      const snippet =
+        m.text.length > cap ? `${m.text.slice(0, cap).trimEnd()}…` : m.text;
+      return `${m.role === "user" ? "User" : "Assistant"}: ${snippet}`;
+    })
+    .join("\n\n");
+
+  return `Prior conversation context (for resolving pronouns, entities, and baselines only):\n${transcript}\n\nLatest user message (plan search for THIS message):\n${latest.text}`;
+}
+
 function createTextPlanner(stage: StageRunner): Planner {
   return {
     async planQuery({ messages, signal }) {
       const text = await generateAuxiliaryText({
         stage,
         system: buildQueryPlanPrompt(),
-        messages,
+        prompt: buildPlannerPromptFromMessages(messages),
         maxOutputTokens: serverConfig.planner.maxOutputTokens,
         timeoutMs: serverConfig.planner.timeoutMs,
         signal,
@@ -427,6 +471,7 @@ export async function runResearchPipeline(opts: {
     sources: ResearchSource[];
   }) => void | Promise<void>;
   signal?: AbortSignal;
+  deadlineAt?: number;
   requestId: string;
   deps?: Partial<ResearchDeps>;
 }): Promise<ResearchOutcome> {
@@ -650,7 +695,19 @@ export async function runResearchPipeline(opts: {
     const notesText = condensed.notes.join("\n\n");
 
     const gatherFull = estimateTokens(allNotes.join("\n\n")) >= evidenceBudget;
-    const isLastRound = round >= effort.rounds || totalSources >= maxSources || gatherFull;
+    const outOfTimeForFollowUp =
+      opts.deadlineAt != null &&
+      opts.deadlineAt - Date.now() < SYNTHESIS_DEADLINE_RESERVE_MS;
+    if (outOfTimeForFollowUp && round < effort.rounds && !gatherFull && totalSources < maxSources) {
+      failedStages.push(
+        "remaining follow-up rounds were skipped to leave time for final synthesis",
+      );
+    }
+    const isLastRound =
+      round >= effort.rounds ||
+      totalSources >= maxSources ||
+      gatherFull ||
+      outOfTimeForFollowUp;
     if (isLastRound) {
       await emitStep({
         round,

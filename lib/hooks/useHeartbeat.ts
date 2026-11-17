@@ -28,9 +28,11 @@ export function useHeartbeat(active: boolean, startedAt?: number): Heartbeat {
     };
     const initial = window.setTimeout(tick, 0);
     const id = window.setInterval(tick, 1000);
+    document.addEventListener("visibilitychange", tick);
     return () => {
       window.clearTimeout(initial);
       window.clearInterval(id);
+      document.removeEventListener("visibilitychange", tick);
     };
   }, [active, startedAt]);
 

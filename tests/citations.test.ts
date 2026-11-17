@@ -36,10 +36,18 @@ describe("verifyCitations", () => {
     expect(out.text).toContain("https://example.com/a");
     expect(out.strippedCount).toBe(0);
   });
-  it("keeps parenthesised URLs in markdown links", () => {
-    const wiki = [{ url: "https://en.wikipedia.org/wiki/Foo_(bar)" }];
-    const out = verifyCitations("[Wiki](https://en.wikipedia.org/wiki/Foo_(bar))", wiki);
-    expect(out.text).toContain("[Wiki](https://en.wikipedia.org/wiki/Foo_(bar))");
+  it("keeps parenthesised URLs in markdown links including mid-path parentheses", () => {
+    const wiki = [
+      { url: "https://en.wikipedia.org/wiki/Foo_(bar)" },
+      { url: "https://en.wikipedia.org/wiki/Foo_(bar)_baz" },
+    ];
+    const out = verifyCitations(
+      "[Wiki](https://en.wikipedia.org/wiki/Foo_(bar)) and [Mid](https://en.wikipedia.org/wiki/Foo_(bar)_baz) plus (see https://en.wikipedia.org/wiki/Foo_(bar)).",
+      wiki,
+    );
+    expect(out.text).toBe(
+      "[Wiki](https://en.wikipedia.org/wiki/Foo_(bar)) and [Mid](https://en.wikipedia.org/wiki/Foo_(bar)_baz) plus (see https://en.wikipedia.org/wiki/Foo_(bar)).",
+    );
     expect(out.strippedCount).toBe(0);
   });
   it("leaves inline code spans untouched", () => {

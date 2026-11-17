@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   budgetNotesFairly,
+  buildPlannerPromptFromMessages,
   parsePlainTextQuery,
   parseQueryPlan,
   runResearchPipeline,
@@ -48,18 +49,41 @@ describe("parsePlainTextQuery & parseQueryPlan", () => {
     ).toEqual({ stopped: false, query: "beta query" });
   });
 
-  it("extracts BRIEF line and initial query, or NO_SEARCH", () => {
+  it("extracts BRIEF line and initial query, strips QUERY: prefixes, ignores markdown headings, and formats follow-up transcripts", () => {
     const raw = [
       "<think>resolve pronouns</think>",
       "BRIEF: Compare Acme Corp and Beta Inc Q4 2026 operating margins",
-      "Acme Corp vs Beta Inc Q4 2026 operating margin filing",
+      "QUERY: Acme Corp vs Beta Inc Q4 2026 operating margin filing",
     ].join("\n");
     expect(parseQueryPlan(raw)).toEqual({
       stopped: false,
       brief: "Compare Acme Corp and Beta Inc Q4 2026 operating margins",
       query: "Acme Corp vs Beta Inc Q4 2026 operating margin filing",
     });
+    expect(parseQueryPlan("## Accidental Heading\nreal search query 2026")).toEqual({
+      stopped: false,
+      query: "real search query 2026",
+    });
     expect(parseQueryPlan("NO_SEARCH")).toEqual({ stopped: true });
+    expect(
+      parseQueryPlan(
+        "BRIEF: Summarize the prior comparison into 3 bullets\nNO_SEARCH",
+      ),
+    ).toEqual({
+      stopped: true,
+      brief: "Summarize the prior comparison into 3 bullets",
+    });
+
+    const plannerPrompt = buildPlannerPromptFromMessages([
+      { role: "user", content: "Tell me about QuantumScape batteries" },
+      { role: "assistant", content: "QuantumScape's QSE-5 cell uses a ceramic separator." },
+      { role: "user", content: "How fast does it charge in cold weather?" },
+    ]);
+    expect(plannerPrompt).toContain("Prior conversation context");
+    expect(plannerPrompt).toContain("QuantumScape's QSE-5");
+    expect(plannerPrompt).toContain(
+      "Latest user message (plan search for THIS message):\nHow fast does it charge in cold weather?",
+    );
   });
 });
 
@@ -260,5 +284,37 @@ describe("runResearchPipeline", () => {
 
     expect(await runFor("medium")).toEqual({ condenseCalls: 3, gapCall: 2, rounds: 3 });
     expect(await runFor("high")).toEqual({ condenseCalls: 5, gapCall: 4, rounds: 5 });
+  });
+
+  it("stops starting additional follow-up rounds when approaching deadlineAt so synthesis still completes", async () => {
+    let gapCalls = 0;
+    const outcome = await runResearchPipeline({
+      messages: [],
+      query: "deep topic",
+      effort: effortConfig("high"),
+      stages,
+      deadlineAt: Date.now() + 20_000, // < 45s reserve for final synthesis
+      requestId: "deadline-check",
+      deps: {
+        planner: {
+          planQuery: async () => ({ stopped: false, query: "q1" }),
+          planFollowUp: async () => {
+            gapCalls += 1;
+            return { stopped: false, query: "q2" };
+          },
+        },
+        search: {
+          search: async () => ({ docs: [doc("https://a.com/1")] }),
+          fetchContents: async () => ({ docs: [] }),
+        },
+        condenser: {
+          condense: async () => ({ notes: ["round 1 note"], fallbackCount: 0 }),
+        },
+      },
+    });
+    expect(outcome.searched).toBe(true);
+    expect(gapCalls).toBe(0);
+    expect(outcome.steps).toHaveLength(1);
+    expect(outcome.degraded?.join("; ")).toContain("skipped to leave time for final synthesis");
   });
 });

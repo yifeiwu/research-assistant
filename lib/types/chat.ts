@@ -68,10 +68,21 @@ export type DurableTurnState = {
 const MAX_MESSAGES = 200;
 const MAX_TOTAL_MESSAGE_CHARS = 500_000;
 
+const researchSourceSchema = z.object({
+  url: z
+    .string()
+    .min(1)
+    .max(2_048)
+    .regex(/^https?:\/\//i, "Source URL must use http or https"),
+  title: z.string().max(500).optional(),
+  publishedDate: z.string().max(100).optional(),
+});
+
 const chatMessageSchema = z.object({
-  id: z.string().min(1).max(120),
+  id: z.string().regex(/^[\w-]{1,120}$/, "Message id must be 1-120 word characters or hyphens"),
   role: z.enum(["user", "assistant"]),
   text: z.string(),
+  sources: z.array(researchSourceSchema).max(60).optional(),
 });
 
 export const chatRequestSchema = z

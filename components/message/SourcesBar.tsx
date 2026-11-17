@@ -84,14 +84,17 @@ export function SourcesBar({
   cited: CollectedSource[];
   other: CollectedSource[];
 }) {
+  const safeCited = cited.filter((s) => /^https?:\/\//i.test(s.url));
+  const safeOther = other.filter((s) => /^https?:\/\//i.test(s.url));
+  if (safeCited.length === 0 && safeOther.length === 0) return null;
   return (
     <div className="mt-3 space-y-3 border-t border-border/60 pt-3">
-      {cited.length > 0 && <SourceGroup label="Sources" sources={cited} numbered />}
-      {other.length > 0 && (
+      {safeCited.length > 0 && <SourceGroup label="Sources" sources={safeCited} numbered />}
+      {safeOther.length > 0 && (
         <SourceGroup
-          label={cited.length > 0 ? "Also read" : "Sources"}
-          sources={other}
-          numbered={cited.length === 0}
+          label={safeCited.length > 0 ? "Also read" : "Sources"}
+          sources={safeOther}
+          numbered={safeCited.length === 0}
         />
       )}
     </div>

@@ -10,6 +10,7 @@ import {
   condenseSourcesDetailed,
   formatDocExcerpt,
   parseBatchNotes,
+  stripThinking,
 } from "@/lib/pipeline";
 import type { ExaDocument } from "@/lib/exa";
 import type { StageRunner } from "@/lib/agent/stage";
@@ -38,9 +39,16 @@ describe("parseBatchNotes & formatDocExcerpt", () => {
     expect(parseBatchNotes(raw, 3)).toEqual(["- one", "- two", null]);
   });
 
-  it("strips thinking blocks and ignores out-of-range headings", () => {
+  it("strips leading thinking blocks without truncating literal <think> mentions in answers", () => {
     const raw = "<think>plan</think>### Source 9\n- nope\n### Source 1\n- yes";
     expect(parseBatchNotes(raw, 1)).toEqual(["- yes"]);
+    expect(
+      stripThinking(
+        "<think>internal reasoning</think>\nQwen uses `<think>` tokens before answering, followed by the full explanation.",
+      ),
+    ).toBe(
+      "Qwen uses `<think>` tokens before answering, followed by the full explanation.",
+    );
   });
 
   it("formats Exa neural highlights ahead of bounded lead context", () => {

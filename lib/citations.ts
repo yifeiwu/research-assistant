@@ -5,13 +5,11 @@ import {
 } from "./sources";
 import type { ResearchSource } from "./types/chat";
 
-const BARE_URL = /https?:\/\/[^\s<>"')\]]+/g;
-
-function splitSentencePunctuation(rawUrl: string): { url: string; suffix: string } {
-  const match = rawUrl.match(/[.,;:!?]+$/);
-  if (!match) return { url: rawUrl, suffix: "" };
-  return { url: rawUrl.slice(0, -match[0].length), suffix: match[0] };
-}
+const BARE_URL_SOURCE = String.raw`https?:\/\/[^\s<>"'()[\]]+(?:\([^\s<>"'()]*\)[^\s<>"'()[\]]*)*`;
+const CITATION_TOKEN_REGEX = new RegExp(
+  `${MARKDOWN_LINK_REGEX.source}|(${BARE_URL_SOURCE})`,
+  "g",
+);
 
 function canonicalCitationKey(rawUrl: string): string {
   // Candidates scraped from prose often carry trailing sentence punctuation
@@ -25,24 +23,27 @@ function verifySegment(
   allowed: Set<string>,
   stats: { stripped: number },
 ): string {
-  const withoutMarkdown = segment.replace(
-    MARKDOWN_LINK_REGEX,
-    (match, label: string, url: string) => {
-      if (allowed.has(canonicalCitationKey(url))) {
-        return match;
+  return segment.replace(
+    CITATION_TOKEN_REGEX,
+    (match, mdLabel?: string, mdUrl?: string, bareUrl?: string) => {
+      if (mdLabel !== undefined && mdUrl !== undefined) {
+        if (allowed.has(canonicalCitationKey(mdUrl))) {
+          return match;
+        }
+        stats.stripped += 1;
+        return mdLabel;
       }
-      stats.stripped += 1;
-      return label;
+      if (bareUrl !== undefined) {
+        const { url: cleaned, suffix } = splitTrailingPunctuation(bareUrl);
+        if (allowed.has(canonicalCitationKey(cleaned))) {
+          return cleaned + suffix;
+        }
+        stats.stripped += 1;
+        return suffix;
+      }
+      return match;
     },
   );
-  return withoutMarkdown.replace(BARE_URL, (url) => {
-    const { url: cleaned, suffix } = splitSentencePunctuation(url);
-    if (allowed.has(canonicalCitationKey(cleaned))) {
-      return cleaned + suffix;
-    }
-    stats.stripped += 1;
-    return suffix;
-  });
 }
 
 /**

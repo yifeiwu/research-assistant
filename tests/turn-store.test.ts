@@ -86,6 +86,23 @@ describe("durable Redis turn store", () => {
       { db },
     );
     expect(afterLateFinish.status).toBe("stopped");
+
+    // 4. Turn-scoped stop (`stopTurnKey`) prevents late completion even if stop arrived before `chat:active` was set.
+    const third = await startDurableTurn(CHAT, "u3", { db });
+    await db.set(`chat:stop-turn:${CHAT}:u3`, "1", { ex: 120 });
+    expect(await isTurnCancelled(CHAT, third.state.runId, db, "u3")).toBe(true);
+    const stoppedByTurnKey = await finishDurableTurn(
+      CHAT,
+      third.state.runId,
+      {
+        status: "done",
+        steps: [],
+        sources: [],
+        message: { id: "m3", role: "assistant", text: "Should stay stopped" },
+      },
+      { db, turnId: "u3" },
+    );
+    expect(stoppedByTurnKey.status).toBe("stopped");
   });
 
   it("reports abandoned running turns without recent heartbeats as interrupted errors", async () => {

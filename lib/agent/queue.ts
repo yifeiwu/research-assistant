@@ -155,8 +155,8 @@ export function createRequestQueue(opts?: {
           }
 
           const now = nowFn();
-          await evictExpired(db, now);
           await db.zadd(LEASE_KEY, { score: now + leaseMs, member: runId });
+          await evictExpired(db, now);
 
           let rank = await db.zrank(WAITING_KEY, runId);
           if (rank == null) {

@@ -118,4 +118,26 @@ describe("request cache", () => {
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
     expect(loaderSignalAborted).toBe(true);
   });
+  it("skips writing partial results to Redis when shouldCache returns false", async () => {
+    const store = fakeStore();
+    const cache = createRequestCache(store);
+    let call = 0;
+    const loader = vi.fn(async () =>
+      ++call === 1 ? (["note-1", null] as (string | null)[]) : (["note-1", "note-2"] as (string | null)[]),
+    );
+    const shouldCache = (notes: (string | null)[]) => notes.every((n) => n !== null);
+
+    const first = await cache.wrap("notes-batch", { q: "partial" }, 60, loader, {
+      shouldCache,
+    });
+    expect(first).toEqual(["note-1", null]);
+    expect(store.data.size).toBe(0);
+
+    const second = await cache.wrap("notes-batch", { q: "partial" }, 60, loader, {
+      shouldCache,
+    });
+    expect(second).toEqual(["note-1", "note-2"]);
+    expect(store.data.size).toBe(1);
+    expect(loader).toHaveBeenCalledTimes(2);
+  });
 });

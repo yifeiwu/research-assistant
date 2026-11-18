@@ -24,7 +24,15 @@ const longDoc = (url: string, fill = "x", chars = 5_000): ExaDocument => ({
 });
 
 const stageFor = (modelId: string): StageRunner => ({
-  lease: async () => ({ model: {} as never, modelId }),
+  run: async (req) => ({
+    value: (
+      await req.execute(
+        { model: {} as never, modelId },
+        req.signal ?? new AbortController().signal,
+      )
+    ).value,
+    modelId,
+  }),
 });
 
 const opts = { stage: stageFor("summary"), query: "q", disableCache: true as const };
@@ -49,6 +57,31 @@ describe("parseBatchNotes & formatDocExcerpt", () => {
     ).toBe(
       "Qwen uses `<think>` tokens before answering, followed by the full explanation.",
     );
+  });
+
+  it("tolerates common model heading variations and headingless single-source outputs", () => {
+    const varied = [
+      "### Source 1: Official Stripe Docs",
+      "- [Fact] 2.9% + 30c",
+      "## Source 2 — Benchmark",
+      "- [Fact] 14ms p99",
+      "**Source 3:**",
+      "- [Claim] 2x throughput",
+      "<source 4>",
+      "- [Fact] GA in May 2026",
+      "</source 4>",
+    ].join("\n");
+    expect(parseBatchNotes(varied, 4)).toEqual([
+      "- [Fact] 2.9% + 30c",
+      "- [Fact] 14ms p99",
+      "- [Claim] 2x throughput",
+      "- [Fact] GA in May 2026",
+    ]);
+
+    // Single-source batch where the model omits the `### Source 1` heading altogether:
+    expect(
+      parseBatchNotes("- Profile: official-docs | Caveat: none\n- [Fact] 99.95% SLA", 1),
+    ).toEqual(["- Profile: official-docs | Caveat: none\n- [Fact] 99.95% SLA"]);
   });
 
   it("formats Exa neural highlights ahead of bounded lead context", () => {
@@ -92,13 +125,27 @@ describe("condenseSourcesDetailed (batched)", () => {
     expect(out.notes[0]).not.toContain("x".repeat(2_501));
   });
 
-  it("falls back only for sources missing from the batch response", async () => {
+  it("falls back only for sources missing from the batch response when retryMissing is off, and recovers them cleanly when retryMissing is enabled", async () => {
     mockGenerate.mockResolvedValue({ text: "### Source 1\n- only one" } as never);
     const docs = [longDoc("https://a.com"), longDoc("https://b.com", "y")];
     const out = await condenseSourcesDetailed(docs, opts);
     expect(out.fallbackCount).toBe(1);
     expect(out.notes[0]).toContain("- only one");
     expect(out.notes[1]).toContain("y".repeat(100));
+
+    // With retryMissing enabled (used on Medium & High efforts), Source 2 is retried individually and succeeds!
+    mockGenerate.mockReset();
+    mockGenerate
+      .mockResolvedValueOnce({ text: "### Source 1\n- first note" } as never)
+      .mockResolvedValueOnce({ text: "- [Fact] recovered second note" } as never);
+    const recovered = await condenseSourcesDetailed(docs, {
+      ...opts,
+      retryMissing: true,
+    });
+    expect(mockGenerate).toHaveBeenCalledTimes(2);
+    expect(recovered.fallbackCount).toBe(0);
+    expect(recovered.notes[0]).toContain("- first note");
+    expect(recovered.notes[1]).toContain("- [Fact] recovered second note");
   });
 
   it("does not call the model for short highlight-free or empty sources", async () => {
@@ -155,7 +202,7 @@ describe("condenseSourcesDetailed (batched)", () => {
     });
   });
 
-  it("includes deterministic domain/date headers and scales summary maxOutputTokens by model", async () => {
+  it("includes deterministic domain/date headers, scales summary maxOutputTokens by batch size, and avoids false-positive fallback flags on short highlight excerpts", async () => {
     mockGenerate.mockResolvedValue({ text: "### Source 1\n- [Fact] 42% gain" } as never);
     const qwenOut = await condenseSourcesDetailed(
       [
@@ -168,8 +215,19 @@ describe("condenseSourcesDetailed (batched)", () => {
       ],
       { ...opts, stage: stageFor("qwen/qwen3.8-27b") },
     );
-    expect(mockGenerate.mock.calls[0][0].maxOutputTokens).toBe(450);
+    // 1-source batch reserves 400 tokens; 4-source batch scales up to 850 tokens (no 450 choke!):
+    expect(mockGenerate.mock.calls[0][0].maxOutputTokens).toBe(400);
     expect(qwenOut.notes[0]).toContain("Domain: nature.com | Published: 2026-05-10");
+
+    mockGenerate.mockClear();
+    mockGenerate.mockResolvedValue({
+      text: [1, 2, 3, 4].map((n) => `### Source ${n}\n- note ${n}`).join("\n"),
+    } as never);
+    await condenseSourcesDetailed(
+      [longDoc("https://1.com"), longDoc("https://2.com"), longDoc("https://3.com"), longDoc("https://4.com")],
+      { ...opts, stage: stageFor("qwen/qwen3.8-27b") },
+    );
+    expect(mockGenerate.mock.calls[0][0].maxOutputTokens).toBe(850);
 
     mockGenerate.mockClear();
     mockGenerate.mockResolvedValue({ text: "### Source 1\n- [Fact] 42% gain" } as never);
@@ -177,7 +235,25 @@ describe("condenseSourcesDetailed (batched)", () => {
       [{ url: "https://docs.example.org/spec", title: "Spec", text: "y".repeat(4_000) }],
       { ...opts, stage: stageFor("openai/gpt-oss-20b") },
     );
-    expect(mockGenerate.mock.calls[0][0].maxOutputTokens).toBe(650);
+    expect(mockGenerate.mock.calls[0][0].maxOutputTokens).toBe(420);
     expect(gptOut.notes[0]).toContain("Domain: docs.example.org | Published: unlisted");
+
+    // When a compact Exa highlight excerpt (<= 2,500 chars) falls back to raw highlights,
+    // 100% of the excerpt reaches synthesis intact so fallbackCount stays 0:
+    mockGenerate.mockReset();
+    mockGenerate.mockRejectedValue(new Error("Summarizer timeout"));
+    const compactHighlightFallback = await condenseSourcesDetailed(
+      [
+        {
+          url: "https://api.example.org/changelog",
+          title: "Changelog",
+          text: "Short overview.",
+          highlights: ["v3.2 reduced cold start latency from 420ms to 95ms."],
+        },
+      ],
+      opts,
+    );
+    expect(compactHighlightFallback.fallbackCount).toBe(0);
+    expect(compactHighlightFallback.notes[0]).toContain("95ms");
   });
 });

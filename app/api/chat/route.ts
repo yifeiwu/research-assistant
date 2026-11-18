@@ -9,7 +9,6 @@ import {
 } from "@/lib/types/chat";
 import {
   collectPriorSources,
-  findLastUserMessageId,
   latestUserText,
   toModelMessages,
 } from "@/lib/messages";
@@ -63,7 +62,7 @@ export async function POST(req: Request) {
     );
   }
 
-  const { messages, effort: rawEffort, id: rawChatId } = parsed.data;
+  const { messages, effort: rawEffort, id: rawChatId, runId: rawRunId } = parsed.data;
   const chatId = rawChatId ?? crypto.randomUUID();
   const effort = effortConfig(rawEffort);
 
@@ -95,7 +94,6 @@ export async function POST(req: Request) {
 
   const requestId = crypto.randomUUID().slice(0, 8);
   const query = latestUserText(messages);
-  const turnId = findLastUserMessageId(messages);
   const modelMessages = toModelMessages(
     messages,
     serverConfig.synthesis.historyTokenBudget,
@@ -115,7 +113,7 @@ export async function POST(req: Request) {
 
   let started: Awaited<ReturnType<typeof startDurableTurn>>;
   try {
-    started = await startDurableTurn(chatId, turnId);
+    started = await startDurableTurn(chatId, rawRunId);
   } catch (error) {
     logError("turn-start", error, { requestId, chatId });
     return Response.json(
@@ -139,7 +137,7 @@ export async function POST(req: Request) {
 
   after(async () => {
     const abortController = new AbortController();
-    const stopWatching = watchDurableTurn(chatId, runId, abortController, { turnId });
+    const stopWatching = watchDurableTurn(chatId, runId, abortController);
     let releaseQueue: (() => Promise<void>) | undefined;
     let latestSteps: ResearchStepData[] = [];
     let latestSources: ResearchSource[] = [];
@@ -166,7 +164,7 @@ export async function POST(req: Request) {
         onProgress: async (progress) => {
           latestSteps = progress.steps;
           latestSources = progress.sources;
-          if (await isTurnCancelled(chatId, runId, undefined, turnId)) {
+          if (await isTurnCancelled(chatId, runId)) {
             abortController.abort();
             return;
           }
@@ -176,53 +174,37 @@ export async function POST(req: Request) {
       });
 
       if (isResolutionError(outcome)) {
-        await finishDurableTurn(
-          chatId,
-          runId,
-          {
-            status: "error",
-            error: outcome.error,
-            steps: latestSteps,
-            sources: latestSources,
-          },
-          { turnId },
-        );
+        await finishDurableTurn(chatId, runId, {
+          status: "error",
+          error: outcome.error,
+          steps: latestSteps,
+          sources: latestSources,
+        });
         return;
       }
 
-      await finishDurableTurn(
-        chatId,
-        runId,
-        {
-          status: "done",
-          message: outcome.message,
-          steps: outcome.steps,
-          sources: outcome.sources,
-        },
-        { turnId },
-      );
+      await finishDurableTurn(chatId, runId, {
+        status: "done",
+        message: outcome.message,
+        steps: outcome.steps,
+        sources: outcome.sources,
+      });
     } catch (error) {
       if (isAbortError(error) || abortController.signal.aborted) {
-        await finishDurableTurn(
-          chatId,
-          runId,
-          { status: "stopped", steps: latestSteps, sources: latestSources },
-          { turnId },
-        );
+        await finishDurableTurn(chatId, runId, {
+          status: "stopped",
+          steps: latestSteps,
+          sources: latestSources,
+        });
         return;
       }
       logError("turn-execute", error, { requestId, chatId, runId });
-      await finishDurableTurn(
-        chatId,
-        runId,
-        {
-          status: "error",
-          error: clientErrorMessage(error, requestId),
-          steps: latestSteps,
-          sources: latestSources,
-        },
-        { turnId },
-      );
+      await finishDurableTurn(chatId, runId, {
+        status: "error",
+        error: clientErrorMessage(error, requestId),
+        steps: latestSteps,
+        sources: latestSources,
+      });
     } finally {
       stopWatching();
       await releaseQueue?.();

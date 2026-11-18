@@ -12,9 +12,7 @@ export type Conversation = {
   messages: ChatMessage[];
   /** True while a durable server turn is still running or uncollected in Redis. */
   pending?: boolean;
-  /** Unique user message id of the currently pending turn (guards against stale polls). */
-  pendingTurnId?: string;
-  /** Server `runId` of the currently pending turn once `POST /api/chat` has registered it. */
+  /** Unique `runId` of the currently pending turn. */
   pendingRunId?: string;
   /** Epoch ms when the pending turn started; feeds the elapsed timer across reloads. */
   pendingSince?: number;
@@ -209,7 +207,6 @@ function isConversation(value: unknown): value is Conversation {
     Array.isArray(v.messages) &&
     v.messages.every(isChatMessage) &&
     (v.pending === undefined || typeof v.pending === "boolean") &&
-    (v.pendingTurnId === undefined || typeof v.pendingTurnId === "string") &&
     (v.pendingRunId === undefined || typeof v.pendingRunId === "string") &&
     (v.pendingSince === undefined || typeof v.pendingSince === "number") &&
     typeof v.createdAt === "number" &&

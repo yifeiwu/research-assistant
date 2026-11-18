@@ -19,7 +19,7 @@ const doc = (url: string): ExaDocument => ({
 });
 
 const unusedStage = (id: string): StageRunner => ({
-  lease: async () => {
+  run: async () => {
     throw new Error(`unexpected ${id} model lease`);
   },
 });
@@ -174,7 +174,9 @@ describe("runResearchPipeline", () => {
     expect(outcome.sources).toHaveLength(1);
     expect(outcome.degraded?.join("; ")).toContain("1 search query failed");
     expect(outcome.degraded?.join("; ")).toContain("1 source could only be partially read");
-    expect(lastSteps.at(-1)?.degraded).toBeTruthy();
+    // Step degradation is scoped per round: Round 1 has the partial read, Round 2 has the failed query!
+    expect(lastSteps[0]?.degraded).toEqual(["1 source could only be partially read"]);
+    expect(lastSteps[1]?.degraded).toEqual(["1 search query failed"]);
   });
 
   it("flags total retrieval failure as searchFailed, distinct from NO_SEARCH", async () => {

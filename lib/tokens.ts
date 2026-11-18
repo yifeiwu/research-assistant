@@ -1,10 +1,8 @@
 /**
- * Rough token estimation for budget enforcement. Uses the common
- * ~4 characters/token heuristic for English prose — good enough to keep
- * requests comfortably under provider TPM/request-size caps without pulling
- * in a tokenizer dependency. Slightly conservative for code/URLs (which
- * tokenize denser), which is the safe direction for a budget.
+ * Conservative token estimation for budget & rate-limit enforcement. Uses ~3.6
+ * characters/token so URLs, numbers, markdown tables, and chat framing never
+ * undercount against Groq's rolling per-minute TPM/ITPM/OTPM windows.
  */
 export function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
+  return Math.ceil(text.length / 3.6);
 }

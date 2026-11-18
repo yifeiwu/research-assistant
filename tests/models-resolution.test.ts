@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { createGroqBudget } from "@/lib/agent/groq-budget";
-import { isResolutionError, planModels, resolveModels } from "@/lib/agent/models";
+import {
+  isResolutionError,
+  planModels,
+  resolveModels,
+  type ResolvedModels,
+} from "@/lib/agent/models";
 import type { GroqCooldownDb } from "@/lib/agent/groq-rate-limit";
 import {
   REASONING_POOL,
@@ -31,15 +36,18 @@ describe("model pools and stage routing", () => {
     });
     if (isResolutionError(resolved)) throw new Error(resolved.error);
 
-    const sum1 = await resolved.stages.summary.lease();
-    const sum2 = await resolved.stages.summary.lease();
+    const leaseModel = (stage: { run: ResolvedModels["stages"]["summary"]["run"] }) =>
+      stage.run({ execute: async (l) => ({ value: l.modelId }) });
+
+    const sum1 = await leaseModel(resolved.stages.summary);
+    const sum2 = await leaseModel(resolved.stages.summary);
     expect([sum1.modelId, sum2.modelId]).toEqual([
       "qwen/qwen3.8-27b",
       "allam-2-7b",
     ]);
 
-    const synth1 = await resolved.stages.synthesis.lease();
-    const synth2 = await resolved.stages.synthesis.lease();
+    const synth1 = await leaseModel(resolved.stages.synthesis);
+    const synth2 = await leaseModel(resolved.stages.synthesis);
     expect([synth1.modelId, synth2.modelId]).toEqual([
       "openai/gpt-oss-120b",
       "openai/gpt-oss-20b",
@@ -60,7 +68,9 @@ describe("model pools and stage routing", () => {
     });
     if (isResolutionError(resolved)) throw new Error(resolved.error);
 
-    const summaryLease = await resolved.stages.summary.lease();
+    const summaryLease = await resolved.stages.summary.run({
+      execute: async (l) => ({ value: l.modelId }),
+    });
     expect(REASONING_POOL).toContain(summaryLease.modelId);
   });
 
@@ -80,9 +90,9 @@ describe("per-model reasoning options and context/OTPM caps", () => {
     expect(maxSynthesisOutputTokens("qwen/qwen3.8-27b", 4_000)).toBe(900);
     expect(maxSynthesisOutputTokens("allam-2-7b", 4_000)).toBe(900);
 
-    expect(maxSummaryOutputTokens("qwen/qwen3.8-27b", 650)).toBe(450);
-    expect(maxSummaryOutputTokens("allam-2-7b", 650)).toBe(450);
-    expect(maxSummaryOutputTokens("openai/gpt-oss-20b", 650)).toBe(650);
+    expect(maxSummaryOutputTokens("qwen/qwen3.8-27b", 1_000)).toBe(850);
+    expect(maxSummaryOutputTokens("allam-2-7b", 1_000)).toBe(850);
+    expect(maxSummaryOutputTokens("openai/gpt-oss-20b", 1_000)).toBe(1_000);
 
     expect(maxSummaryBatchInputChars("allam-2-7b", 10_000)).toBe(6_000);
     expect(maxSummaryBatchInputChars("openai/gpt-oss-20b", 10_000)).toBe(10_000);

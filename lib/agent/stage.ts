@@ -7,29 +7,39 @@ import {
 import { createAbortError } from "@/lib/errors";
 import { groqReasoningOptions } from "@/lib/models";
 import { estimateTokens } from "@/lib/tokens";
+import type { HeaderBag } from "./groq-rate-limit";
 
 export type StageLease = {
   model: LanguageModel;
   modelId: string;
 };
 
-export type StageLeaseRequest = {
+export type StageRunRequest<T> = {
   estInputTokens?: number | ((modelId: string) => number);
   maxOutputTokens?: number | ((modelId: string) => number);
+  timeoutMs?: number;
   signal?: AbortSignal;
+  execute: (
+    lease: StageLease,
+    attemptSignal: AbortSignal,
+  ) => Promise<{
+    value: T;
+    headers?: HeaderBag;
+  }>;
 };
 
 /**
- * A pipeline stage's handle on its fungible model pool: reserves per-minute
- * tokens and waits patiently if the pool's rolling window is full.
+ * A pipeline stage's unified runner over its fungible model pool: paces
+ * rolling 60s token budgets, builds native per-model prompts/options, and
+ * fails over cleanly across peers on 429s, retirements, context overflows, or timeouts.
  */
 export type StageRunner = {
-  lease(req?: StageLeaseRequest): Promise<StageLease>;
+  run<T>(req: StageRunRequest<T>): Promise<{ value: T; modelId: string }>;
 };
 
 /**
- * Lease tokens from `stage` and execute a non-retried auxiliary `generateText`
- * call with role-appropriate Groq reasoning settings and timeout.
+ * Execute an auxiliary `generateText` call through `stage.run` with native
+ * per-model prompt sizing, output caps, and Groq reasoning options.
  */
 export async function generateAuxiliaryText(req: {
   stage: StageRunner;
@@ -53,29 +63,32 @@ export async function generateAuxiliaryText(req: {
       ? (modelId: string) => sysTokens + estimateTokens(promptArg(modelId))
       : sysTokens + (req.messages ? msgTokens : estimateTokens(promptArg ?? ""));
 
-  const leased = await req.stage.lease({
+  const run = req.generateTextImpl ?? generateText;
+  const { value } = await req.stage.run({
     estInputTokens,
     maxOutputTokens: req.maxOutputTokens,
+    timeoutMs: req.timeoutMs,
     signal: req.signal,
+    execute: async (leased, attemptSignal) => {
+      const resolvedPrompt =
+        typeof promptArg === "function"
+          ? promptArg(leased.modelId)
+          : (promptArg ?? "");
+      const maxOut =
+        typeof req.maxOutputTokens === "function"
+          ? req.maxOutputTokens(leased.modelId)
+          : req.maxOutputTokens;
+      const res = await run({
+        model: leased.model,
+        system: req.system,
+        ...(req.messages ? { messages: req.messages } : { prompt: resolvedPrompt }),
+        maxOutputTokens: maxOut,
+        providerOptions: groqReasoningOptions(leased.modelId, "auxiliary"),
+        abortSignal: attemptSignal,
+        maxRetries: 0,
+      });
+      return { value: res.text, headers: res.response?.headers };
+    },
   });
-  const resolvedPrompt =
-    typeof promptArg === "function"
-      ? promptArg(leased.modelId)
-      : (promptArg ?? "");
-  const maxOut =
-    typeof req.maxOutputTokens === "function"
-      ? req.maxOutputTokens(leased.modelId)
-      : req.maxOutputTokens;
-  const run = req.generateTextImpl ?? generateText;
-  const { text } = await run({
-    model: leased.model,
-    system: req.system,
-    ...(req.messages ? { messages: req.messages } : { prompt: resolvedPrompt }),
-    maxOutputTokens: maxOut,
-    providerOptions: groqReasoningOptions(leased.modelId, "auxiliary"),
-    ...(req.signal ? { abortSignal: req.signal } : {}),
-    timeout: { totalMs: req.timeoutMs },
-    maxRetries: 0,
-  });
-  return text;
+  return value;
 }

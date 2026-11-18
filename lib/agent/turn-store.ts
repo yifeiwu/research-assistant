@@ -5,6 +5,7 @@ import { logError, logInfo } from "@/lib/logger";
 import { redis } from "@/lib/redis";
 import {
   CHAT_ID_REGEX,
+  RUN_ID_REGEX,
   type ChatMessage,
   type DurableTurnState,
   type ResearchSource,
@@ -16,9 +17,8 @@ import {
  * Durable JSON turn store in Upstash Redis.
  *
  * Each generation writes self-contained JSON snapshots to `chat:run:{runId}`
- * (TTL 30m) while `chat:active:{chatId}` points to the latest `runId`.
- * Clients can reload, switch tabs, or switch threads and poll `GET /api/chat/:id`
- * at any point to observe live queue/budget waits, research steps, or the finished answer.
+ * (TTL 30m) addressed directly by client-supplied `runId` (with
+ * `chat:active:{chatId}` tracking the latest run so new turns supersede old ones).
  */
 export type TurnStoreDb = {
   get: <T = unknown>(key: string) => Promise<T | null>;
@@ -26,15 +26,12 @@ export type TurnStoreDb = {
 };
 
 const STOP_TTL_SECONDS = 10 * 60;
-const PRE_STOP_TTL_SECONDS = 2 * 60;
 
 const defaultDb = (): TurnStoreDb => redis() as unknown as TurnStoreDb;
 
 const activeKey = (chatId: string) => `chat:active:${chatId}`;
 const runKey = (runId: string) => `chat:run:${runId}`;
 const stopRunKey = (runId: string) => `chat:stop:${runId}`;
-const stopTurnKey = (chatId: string, turnId: string) =>
-  `chat:stop-turn:${chatId}:${turnId}`;
 
 /** Serialize in-process updates to the same `runId` so heartbeats never clobber completions. */
 const runLocks = new Map<string, Promise<unknown>>();
@@ -58,34 +55,34 @@ export function isChatId(value: string): boolean {
   return CHAT_ID_REGEX.test(value);
 }
 
-export function isTurnId(value: unknown): value is string {
-  return typeof value === "string" && /^[\w-]{1,120}$/.test(value);
+export function isRunId(value: unknown): value is string {
+  return typeof value === "string" && RUN_ID_REGEX.test(value);
 }
 
 export async function startDurableTurn(
   chatId: string,
-  turnId?: string,
+  requestedRunId?: string,
   opts?: { db?: TurnStoreDb; now?: () => number },
 ): Promise<{ state: DurableTurnState; preStopped: boolean }> {
   const db = opts?.db ?? defaultDb();
   const now = (opts?.now ?? Date.now)();
-  const runId = `r_${crypto.randomUUID()}`;
-  const validTurnId = isTurnId(turnId) ? turnId : undefined;
+  const runId = isRunId(requestedRunId)
+    ? requestedRunId
+    : `r_${crypto.randomUUID()}`;
 
-  const [prevRunId, preStopVal] = await Promise.all([
+  const [prevRunId, stopVal] = await Promise.all([
     db.get<string>(activeKey(chatId)),
-    validTurnId ? db.get<string>(stopTurnKey(chatId, validTurnId)) : Promise.resolve(null),
+    db.get<string>(stopRunKey(runId)),
   ]);
-  const preStopped = String(preStopVal ?? "") === "1";
+  const preStopped = String(stopVal ?? "") === "1";
 
-  if (prevRunId) {
+  if (prevRunId && prevRunId !== runId) {
     await db.set(stopRunKey(prevRunId), "1", { ex: STOP_TTL_SECONDS });
   }
 
   const state: DurableTurnState = {
     runId,
     chatId,
-    ...(validTurnId ? { turnId: validTurnId } : {}),
     status: preStopped ? "stopped" : "running",
     steps: [],
     sources: [],
@@ -101,7 +98,7 @@ export async function startDurableTurn(
   logInfo("turn-start", {
     chatId,
     runId,
-    superseded: Boolean(prevRunId),
+    superseded: Boolean(prevRunId && prevRunId !== runId),
     preStopped,
   });
   return { state, preStopped };
@@ -183,25 +180,19 @@ export async function finishDurableTurn(
   chatId: string,
   runId: string,
   completion: TurnCompletion,
-  opts?: { db?: TurnStoreDb; now?: () => number; turnId?: string },
+  opts?: { db?: TurnStoreDb; now?: () => number },
 ): Promise<DurableTurnState> {
   const db = opts?.db ?? defaultDb();
   const now = (opts?.now ?? Date.now)();
 
   return withRunLock(runId, async () => {
-    const existing = decodeStoredJson<DurableTurnState>(await db.get(runKey(runId)));
-
-    const resolvedTurnId = existing?.turnId ?? (isTurnId(opts?.turnId) ? opts?.turnId : undefined);
-    const [runStopped, turnStopped] = await Promise.all([
+    const [rawExisting, runStopped] = await Promise.all([
+      db.get(runKey(runId)),
       db.get<string>(stopRunKey(runId)),
-      resolvedTurnId
-        ? db.get<string>(stopTurnKey(existing?.chatId ?? chatId, resolvedTurnId))
-        : Promise.resolve(null),
     ]);
+    const existing = decodeStoredJson<DurableTurnState>(rawExisting);
     const wasStopped =
-      existing?.status === "stopped" ||
-      String(runStopped ?? "") === "1" ||
-      String(turnStopped ?? "") === "1";
+      existing?.status === "stopped" || String(runStopped ?? "") === "1";
 
     // Never overwrite an explicit user Stop/supersede with a late completion/error.
     if (wasStopped && completion.status !== "stopped") {
@@ -209,7 +200,6 @@ export async function finishDurableTurn(
       const stoppedState: DurableTurnState = {
         runId,
         chatId: existing?.chatId ?? chatId,
-        ...(resolvedTurnId ? { turnId: resolvedTurnId } : {}),
         status: "stopped",
         steps: existing?.steps ?? completion.steps,
         sources: existing?.sources ?? completion.sources,
@@ -224,7 +214,6 @@ export async function finishDurableTurn(
     const base = {
       runId,
       chatId: existing?.chatId ?? chatId,
-      ...(resolvedTurnId ? { turnId: resolvedTurnId } : {}),
       steps: completion.steps,
       sources: completion.sources,
       updatedAt: now,
@@ -247,30 +236,21 @@ export async function finishDurableTurn(
 
 export async function stopDurableTurn(
   chatId: string,
-  turnId?: string,
+  targetRunId?: string,
   opts?: { db?: TurnStoreDb; now?: () => number },
 ): Promise<boolean> {
   const db = opts?.db ?? defaultDb();
   const now = (opts?.now ?? Date.now)();
-  const validTurnId = isTurnId(turnId) ? turnId : undefined;
 
-  if (validTurnId) {
-    await db.set(stopTurnKey(chatId, validTurnId), "1", {
-      ex: PRE_STOP_TTL_SECONDS,
-    });
-  }
-
-  const runId = await db.get<string>(activeKey(chatId));
-  if (!runId) return Boolean(validTurnId);
+  const runId = isRunId(targetRunId)
+    ? targetRunId
+    : await db.get<string>(activeKey(chatId));
+  if (!runId) return false;
 
   return withRunLock(runId, async () => {
-    const existing = decodeStoredJson<DurableTurnState>(await db.get(runKey(runId)));
-    if (validTurnId && existing && existing.turnId !== validTurnId) {
-      return true;
-    }
-
     await db.set(stopRunKey(runId), "1", { ex: STOP_TTL_SECONDS });
-    if (existing && existing.status === "running") {
+    const existing = decodeStoredJson<DurableTurnState>(await db.get(runKey(runId)));
+    if (existing && existing.chatId === chatId && existing.status === "running") {
       const { wait: _cleared, ...rest } = existing;
       await db.set(
         runKey(runId),
@@ -278,7 +258,7 @@ export async function stopDurableTurn(
         { ex: serverConfig.turn.ttlSeconds },
       );
     }
-    logInfo("turn-stop", { chatId, runId, turnId: validTurnId });
+    logInfo("turn-stop", { chatId, runId });
     return true;
   });
 }
@@ -287,20 +267,13 @@ export async function isTurnCancelled(
   chatId: string,
   runId: string,
   db: TurnStoreDb = defaultDb(),
-  turnId?: string,
 ): Promise<boolean> {
   try {
-    const validTurnId = isTurnId(turnId) ? turnId : undefined;
-    const [stopped, active, turnStopped] = await Promise.all([
+    const [stopped, active] = await Promise.all([
       db.get<string>(stopRunKey(runId)),
       db.get<string>(activeKey(chatId)),
-      validTurnId ? db.get<string>(stopTurnKey(chatId, validTurnId)) : Promise.resolve(null),
     ]);
-    return (
-      String(stopped ?? "") === "1" ||
-      String(turnStopped ?? "") === "1" ||
-      Boolean(active && active !== runId)
-    );
+    return String(stopped ?? "") === "1" || Boolean(active && active !== runId);
   } catch (error) {
     logError("turn-cancel-check", error, { chatId, runId });
     return false;
@@ -316,7 +289,7 @@ export function watchDurableTurn(
   chatId: string,
   runId: string,
   controller: AbortController,
-  opts?: { db?: TurnStoreDb; intervalMs?: number; now?: () => number; turnId?: string },
+  opts?: { db?: TurnStoreDb; intervalMs?: number; now?: () => number },
 ): () => void {
   const db = opts?.db ?? defaultDb();
   const nowFn = opts?.now ?? Date.now;
@@ -328,7 +301,7 @@ export function watchDurableTurn(
     busy = true;
     void (async () => {
       try {
-        if (await isTurnCancelled(chatId, runId, db, opts?.turnId)) {
+        if (await isTurnCancelled(chatId, runId, db)) {
           controller.abort();
           return;
         }
@@ -359,15 +332,18 @@ const INTERRUPTED_ERROR =
 
 export async function readDurableTurn(
   chatId: string,
+  requestedRunId?: string,
   opts?: { db?: TurnStoreDb; now?: () => number },
 ): Promise<DurableTurnState | null> {
   const db = opts?.db ?? defaultDb();
   const now = (opts?.now ?? Date.now)();
-  const runId = await db.get<string>(activeKey(chatId));
+  const runId = isRunId(requestedRunId)
+    ? requestedRunId
+    : await db.get<string>(activeKey(chatId));
   if (!runId) return null;
 
   const state = decodeStoredJson<DurableTurnState>(await db.get(runKey(runId)));
-  if (!state) return null;
+  if (!state || state.chatId !== chatId) return null;
 
   if (
     state.status === "running" &&

@@ -54,9 +54,10 @@ export const serverConfig = {
     batchInputCharCap: 10_000,
     perSourceInputCharCap: 3_000,
     deepPerSourceInputCharCap: 4_000,
-    deepBatchSize: 3,
+    batchSize: 2,
+    deepBatchSize: 2,
     fallbackCharCap: 2_500,
-    batchMaxOutputTokens: 650,
+    batchMaxOutputTokens: 1_000,
     timeoutMs: 25_000,
   },
   planner: { timeoutMs: 30_000, maxOutputTokens: 600 },
@@ -69,19 +70,31 @@ export const serverConfig = {
     deepEvidenceTokenBudget: 3_200,
   },
   groqRateLimit: {
-    // Proactive token-budget wait caps (generous so rolling 60s windows always
-    // refill by waiting rather than failing with 429).
-    preferPoolWaitMs: 15_000,
+    // Smooth rate control: book up to 88% of nominal free-tier TPM/ITPM/OTPM
+    // (absorbing tokenizer variance) and pace consecutive calls on the same
+    // model once its rolling window drops below 70% remaining.
+    budgetUtilizationCap: 0.88,
+    paceBelowRatio: 0.7,
+    paceRatio: 0.45,
+    // Prefer waiting on each stage's dedicated pool before borrowing across pools
+    // so summarization doesn't raid reasoning quota needed for synthesis.
+    preferPoolWaitMs: {
+      synthesis: 30_000,
+      planner: 20_000,
+      summary: 25_000,
+    },
     stageMaxWaitMs: {
-      synthesis: 120_000,
-      planner: 75_000,
-      summary: 75_000,
+      synthesis: intFromEnv("GROQ_SYNTHESIS_MAX_WAIT_MS", 150_000),
+      planner: intFromEnv("GROQ_PLANNER_MAX_WAIT_MS", 90_000),
+      summary: intFromEnv("GROQ_SUMMARY_MAX_WAIT_MS", 90_000),
     },
     synthesisReserveTokens: 4_000,
-    // Reactive in-fetch wait caps if an unexpected 429 still slips through.
-    synthesisMaxWaitMs: intFromEnv("GROQ_SYNTHESIS_MAX_WAIT_MS", 65_000),
-    plannerMaxWaitMs: intFromEnv("GROQ_PLANNER_MAX_WAIT_MS", 45_000),
-    summaryMaxWaitMs: intFromEnv("GROQ_SUMMARY_MAX_WAIT_MS", 45_000),
+    // Per-HTTP-attempt network timeouts (decoupled from rate-limit wait sleeps).
+    attemptTimeoutMs: {
+      synthesis: 120_000,
+      planner: 30_000,
+      summary: 30_000,
+    },
     maxCooldownSeconds: 300,
     retiredModelTtlSeconds: 24 * 60 * 60,
   },

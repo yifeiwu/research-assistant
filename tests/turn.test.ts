@@ -37,7 +37,15 @@ function makeHarness(opts?: {
   const calls: Array<Parameters<typeof generateText>[0]> = [];
 
   const runner = (id: string): StageRunner => ({
-    lease: async () => ({ model: fakeModel(id), modelId: id }),
+    run: async (req) => ({
+      value: (
+        await req.execute(
+          { model: fakeModel(id), modelId: id },
+          req.signal ?? new AbortController().signal,
+        )
+      ).value,
+      modelId: id,
+    }),
   });
   const resolved: ResolvedModels = {
     pools: { reasoning: [synthId], summarizer: ["openai/gpt-oss-20b"] },
@@ -162,9 +170,39 @@ describe("executeTurn", () => {
         resolveModels: () => ({
           pools: { reasoning: ["openai/gpt-oss-120b"], summarizer: ["qwen/qwen3.8-27b"] },
           stages: {
-            synthesis: { lease: async () => ({ model: fakeModel("openai/gpt-oss-120b"), modelId: "openai/gpt-oss-120b" }) },
-            planner: { lease: async () => ({ model: fakeModel("openai/gpt-oss-120b"), modelId: "openai/gpt-oss-120b" }) },
-            summary: { lease: async () => ({ model: fakeModel("qwen/qwen3.8-27b"), modelId: "qwen/qwen3.8-27b" }) },
+            synthesis: {
+              run: async (req) => ({
+                value: (
+                  await req.execute(
+                    { model: fakeModel("openai/gpt-oss-120b"), modelId: "openai/gpt-oss-120b" },
+                    req.signal ?? new AbortController().signal,
+                  )
+                ).value,
+                modelId: "openai/gpt-oss-120b",
+              }),
+            },
+            planner: {
+              run: async (req) => ({
+                value: (
+                  await req.execute(
+                    { model: fakeModel("openai/gpt-oss-120b"), modelId: "openai/gpt-oss-120b" },
+                    req.signal ?? new AbortController().signal,
+                  )
+                ).value,
+                modelId: "openai/gpt-oss-120b",
+              }),
+            },
+            summary: {
+              run: async (req) => ({
+                value: (
+                  await req.execute(
+                    { model: fakeModel("qwen/qwen3.8-27b"), modelId: "qwen/qwen3.8-27b" },
+                    req.signal ?? new AbortController().signal,
+                  )
+                ).value,
+                modelId: "qwen/qwen3.8-27b",
+              }),
+            },
           },
         }),
         runResearch: async () => noSearchOutcome,

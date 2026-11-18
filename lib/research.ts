@@ -60,7 +60,10 @@ export interface Condenser {
     input: {
       query: string;
       batchSize?: number;
+      deep?: boolean;
       perSourceCharCap?: number;
+      retryMissing?: boolean;
+      deadlineAt?: number;
     } & StepContext,
   ): Promise<CondenseSourcesOutcome>;
 }
@@ -528,24 +531,37 @@ export async function runResearchPipeline(opts: {
   let fallbackSources = 0;
   const failedStages: string[] = [];
 
-  const currentDegraded = (): DegradedResearch | undefined => {
+  const formatDegraded = (counts: {
+    failedQueries: number;
+    failedUrls: boolean;
+    partialSources: number;
+    stages: string[];
+  }): DegradedResearch | undefined => {
     const reasons: string[] = [];
-    if (failedQueryCount > 0) {
+    if (counts.failedQueries > 0) {
       reasons.push(
-        `${failedQueryCount} search ${failedQueryCount === 1 ? "query" : "queries"} failed`,
+        `${counts.failedQueries} search ${counts.failedQueries === 1 ? "query" : "queries"} failed`,
       );
     }
-    if (failedContents) {
+    if (counts.failedUrls) {
       reasons.push("one or more explicit URLs could not be fetched");
     }
-    if (fallbackSources > 0) {
+    if (counts.partialSources > 0) {
       reasons.push(
-        `${fallbackSources} ${fallbackSources === 1 ? "source" : "sources"} could only be partially read`,
+        `${counts.partialSources} ${counts.partialSources === 1 ? "source" : "sources"} could only be partially read`,
       );
     }
-    reasons.push(...failedStages);
+    reasons.push(...counts.stages);
     return reasons.length > 0 ? reasons : undefined;
   };
+
+  const currentDegraded = (): DegradedResearch | undefined =>
+    formatDegraded({
+      failedQueries: failedQueryCount,
+      failedUrls: failedContents,
+      partialSources: fallbackSources,
+      stages: failedStages,
+    });
 
   const currentSteps = () =>
     [...stepsByRound.entries()]
@@ -613,6 +629,20 @@ export async function runResearchPipeline(opts: {
     allQueries.push(currentQuery);
     await emitStep({ round, phase: "searching", query: currentQuery, sources: [] });
 
+    let roundFailedQueries = 0;
+    let roundFailedUrls = false;
+    let roundFallbacks = 0;
+    const roundStageNotes: string[] =
+      round === 1 ? [...failedStages] : [];
+
+    const roundDegraded = () =>
+      formatDegraded({
+        failedQueries: roundFailedQueries,
+        failedUrls: roundFailedUrls,
+        partialSources: roundFallbacks,
+        stages: roundStageNotes,
+      });
+
     const directOutcome =
       round === 1 && explicitUrls.length > 0
         ? await search.fetchContents(explicitUrls, {
@@ -628,13 +658,18 @@ export async function runResearchPipeline(opts: {
     });
 
     if (round === 1) {
-      if (directOutcome.error) failedContents = true;
+      if (directOutcome.error) {
+        failedContents = true;
+        roundFailedUrls = true;
+      }
       if (explicitUrls.length > 0 && directOutcome.docs.length < explicitUrls.length) {
         failedContents = true;
+        roundFailedUrls = true;
       }
     }
     if (searchOutcome.error) {
       failedQueryCount += 1;
+      roundFailedQueries += 1;
     }
 
     const roundCap = Math.min(perRoundCap, maxSources - totalSources);
@@ -653,7 +688,7 @@ export async function runResearchPipeline(opts: {
           query: currentQuery,
           sources: [],
           error: "No web sources could be retrieved for this query.",
-          degraded: currentDegraded(),
+          degraded: roundDegraded(),
         });
         return {
           searched: false,
@@ -671,7 +706,7 @@ export async function runResearchPipeline(opts: {
         query: currentQuery,
         sources: [],
         notes: "_Follow-up query did not surface any additional unseen sources._",
-        degraded: currentDegraded(),
+        degraded: roundDegraded(),
       });
       break;
     }
@@ -682,14 +717,20 @@ export async function runResearchPipeline(opts: {
 
     const condensed = await condenser.condense(roundDocs, {
       query: effectiveQuery,
-      batchSize: isDeep ? serverConfig.summary.deepBatchSize : undefined,
+      batchSize: isDeep
+        ? serverConfig.summary.deepBatchSize
+        : serverConfig.summary.batchSize,
+      deep: isDeep,
       perSourceCharCap: isDeep
         ? serverConfig.summary.deepPerSourceInputCharCap
         : undefined,
+      retryMissing: true,
+      deadlineAt: opts.deadlineAt,
       signal,
       requestId,
     });
     fallbackSources += condensed.fallbackCount;
+    roundFallbacks += condensed.fallbackCount;
     allNotes.push(...condensed.notes);
     totalSources += roundDocs.length;
     const notesText = condensed.notes.join("\n\n");
@@ -699,9 +740,10 @@ export async function runResearchPipeline(opts: {
       opts.deadlineAt != null &&
       opts.deadlineAt - Date.now() < SYNTHESIS_DEADLINE_RESERVE_MS;
     if (outOfTimeForFollowUp && round < effort.rounds && !gatherFull && totalSources < maxSources) {
-      failedStages.push(
-        "remaining follow-up rounds were skipped to leave time for final synthesis",
-      );
+      const skipMsg =
+        "remaining follow-up rounds were skipped to leave time for final synthesis";
+      failedStages.push(skipMsg);
+      roundStageNotes.push(skipMsg);
     }
     const isLastRound =
       round >= effort.rounds ||
@@ -715,7 +757,7 @@ export async function runResearchPipeline(opts: {
         query: currentQuery,
         sources: roundSources,
         notes: notesText,
-        degraded: currentDegraded(),
+        degraded: roundDegraded(),
       });
       break;
     }
@@ -726,7 +768,7 @@ export async function runResearchPipeline(opts: {
       query: currentQuery,
       sources: roundSources,
       notes: notesText,
-      degraded: currentDegraded(),
+      degraded: roundDegraded(),
     });
 
     let nextFollowUp: string | undefined;
@@ -754,9 +796,11 @@ export async function runResearchPipeline(opts: {
     } catch (error) {
       if (isAbortError(error) || signal?.aborted) throw error;
       logError("gap-check", error, { requestId });
-      if (!failedStages.includes("the gap check could not be completed")) {
-        failedStages.push("the gap check could not be completed");
+      const gapMsg = "the gap check could not be completed";
+      if (!failedStages.includes(gapMsg)) {
+        failedStages.push(gapMsg);
       }
+      roundStageNotes.push(gapMsg);
     }
 
     await emitStep({
@@ -765,7 +809,7 @@ export async function runResearchPipeline(opts: {
       query: currentQuery,
       sources: roundSources,
       notes: notesText,
-      degraded: currentDegraded(),
+      degraded: roundDegraded(),
     });
     logDebug("gap-check", { requestId, round, followUpQuery: nextFollowUp });
 

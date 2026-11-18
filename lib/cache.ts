@@ -37,7 +37,12 @@ export type RequestCache = {
     parts: unknown,
     ttlSeconds: number,
     loader: (signal: AbortSignal) => Promise<T>,
-    opts?: { bypass?: boolean; requestId?: string; signal?: AbortSignal },
+    opts?: {
+      bypass?: boolean;
+      requestId?: string;
+      signal?: AbortSignal;
+      shouldCache?: (value: T) => boolean;
+    },
   ): Promise<T>;
 };
 
@@ -152,7 +157,8 @@ export function createRequestCache(store?: CacheStore): RequestCache {
         }
         logDebug("cache-miss", { requestId: opts?.requestId, namespace });
         const value = await loader(controller.signal);
-        if (cache && !controller.signal.aborted) {
+        const allowCache = opts?.shouldCache ? opts.shouldCache(value) : true;
+        if (cache && !controller.signal.aborted && allowCache) {
           try {
             await cache.set(key, JSON.stringify(value), ttlSeconds);
           } catch (error) {

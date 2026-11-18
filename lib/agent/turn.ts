@@ -215,35 +215,34 @@ export async function executeTurn(
       serverConfig.synthesis.maxOutputTokens,
     );
 
-  const leased = await resolved.stages.synthesis.lease({
-    estInputTokens: inputTokensFor,
-    maxOutputTokens: outputTokensFor,
-    signal,
-  });
-
-  const maxOut = outputTokensFor(leased.modelId);
-  const system = buildSystemFor(leased.modelId);
   const remainingMs =
     input.deadlineAt != null
       ? Math.max(15_000, input.deadlineAt - Date.now())
       : serverConfig.synthesis.totalTimeoutMs;
 
-  const result = await deps.generateText({
-    model: leased.model,
-    system,
-    messages: input.modelMessages,
-    providerOptions: groqReasoningOptions(
-      leased.modelId,
-      "synthesis",
-      input.effort.level,
-    ),
-    maxOutputTokens: maxOut,
-    maxRetries: 0,
-    timeout: {
-      totalMs: Math.min(serverConfig.synthesis.totalTimeoutMs, remainingMs),
-    },
-    abortSignal: signal,
-  });
+  const { value: result, modelId: synthesisModelId } =
+    await resolved.stages.synthesis.run({
+      estInputTokens: inputTokensFor,
+      maxOutputTokens: outputTokensFor,
+      timeoutMs: Math.min(serverConfig.synthesis.totalTimeoutMs, remainingMs),
+      signal,
+      execute: async (leased, attemptSignal) => {
+        const res = await deps.generateText({
+          model: leased.model,
+          system: buildSystemFor(leased.modelId),
+          messages: input.modelMessages,
+          providerOptions: groqReasoningOptions(
+            leased.modelId,
+            "synthesis",
+            input.effort.level,
+          ),
+          maxOutputTokens: outputTokensFor(leased.modelId),
+          maxRetries: 0,
+          abortSignal: attemptSignal,
+        });
+        return { value: res, headers: res.response?.headers };
+      },
+    });
 
   const cleanedText = stripThinking(result.text);
   const allowedSources = [
@@ -284,7 +283,7 @@ export async function executeTurn(
 
   logInfo("finish", {
     requestId,
-    model: leased.modelId,
+    model: synthesisModelId,
     finishReason: result.finishReason,
     searched: outcome.searched,
     sources: mergedSources.length,

@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 export const CHAT_ID_REGEX = /^[\w-]{8,80}$/;
+export const RUN_ID_REGEX = /^[\w-]{8,120}$/;
 
 /** A single web source retrieved during deterministic research. */
 export type ResearchSource = {
@@ -55,7 +56,6 @@ export type TurnWaitState =
 export type DurableTurnState = {
   runId: string;
   chatId: string;
-  turnId?: string;
   status: "running" | "done" | "stopped" | "error";
   steps: ResearchStepData[];
   sources: ResearchSource[];
@@ -91,6 +91,10 @@ export const chatRequestSchema = z
     id: z
       .string()
       .regex(CHAT_ID_REGEX, "id must be 8-80 word characters or hyphens")
+      .optional(),
+    runId: z
+      .string()
+      .regex(RUN_ID_REGEX, "runId must be 8-120 word characters or hyphens")
       .optional(),
     effort: z.unknown().optional(),
   })

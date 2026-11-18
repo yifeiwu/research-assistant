@@ -4,8 +4,8 @@ import type { ExaDocument } from "./exa";
 import { logDebug, logError } from "./logger";
 import { serverConfig } from "./config";
 import {
+  fitSummaryOutputTokens,
   maxSummaryBatchInputChars,
-  maxSummaryOutputTokens,
 } from "./models";
 import { normalizeCacheText, requestCache, type RequestCache } from "./cache";
 import { domainOf } from "./sources";
@@ -87,30 +87,48 @@ export type CondenseOpts = {
   stage: StageRunner;
   query: string;
   batchSize?: number;
+  deep?: boolean;
   perSourceCharCap?: number;
+  /** Spend extra time budget to retry any missed/failed sources individually after pacing. */
+  retryMissing?: boolean;
+  deadlineAt?: number;
   signal?: AbortSignal;
   requestId?: string;
   cache?: RequestCache;
   disableCache?: boolean;
 };
 
+const BATCH_SOURCE_HEADING_RE =
+  /^(?:#{1,6}[ \t]*(?:\*{1,2})?Source[ \t]+(\d+):?(?:\*{1,2})?(?:[ \t]*[:—–\-([][^\r\n]*|[ \t]*)|(?:\*{1,2}Source[ \t]+(\d+):?\*{1,2}|Source[ \t]+(\d+):)[^\r\n]*|<source[ \t]+(\d+)>[^\r\n]*)$/gim;
+
 /**
  * Split a batched summarizer response into per-source notes. Sections are
- * headed `### Source N` (1-based, matching the order sources were sent);
- * a missing or empty section yields `null` so the caller falls back to a raw
- * excerpt for just that source instead of failing the whole batch.
+ * headed `### Source N` (tolerating minor model formatting drift such as
+ * `### Source 1: Title`, `## Source 1`, `**Source 1**`, or `<source 1>`);
+ * single-source calls that omit the heading altogether are also accepted.
  */
 export function parseBatchNotes(raw: string, count: number): (string | null)[] {
   const cleaned = stripThinking(raw);
+  if (!cleaned) return Array.from({ length: count }, () => null);
+
   const sections = new Map<number, string>();
-  const headingRe = /^### Source (\d+)[^\S\r\n]*$/gm;
-  const matches = [...cleaned.matchAll(headingRe)];
+  const matches = [...cleaned.matchAll(BATCH_SOURCE_HEADING_RE)];
+
+  if (matches.length === 0 && count === 1) {
+    const body = cleaned.replace(/<\/?source\s+\d+>/gi, "").trim();
+    return [body || null];
+  }
+
   for (const [i, match] of matches.entries()) {
-    const n = Number.parseInt(match[1], 10);
+    const numRaw = match[1] ?? match[2] ?? match[3] ?? match[4];
+    const n = Number.parseInt(numRaw, 10);
     if (!Number.isFinite(n) || n < 1 || n > count || sections.has(n)) continue;
     const start = (match.index ?? 0) + match[0].length;
     const end = i + 1 < matches.length ? (matches[i + 1].index ?? cleaned.length) : cleaned.length;
-    const body = cleaned.slice(start, end).trim();
+    const body = cleaned
+      .slice(start, end)
+      .replace(/<\/source\s+\d+>\s*$/i, "")
+      .trim();
     if (body) sections.set(n, body);
   }
   return Array.from({ length: count }, (_, i) => sections.get(i + 1) ?? null);
@@ -176,13 +194,24 @@ export async function condenseSourcesDetailed(
       opts.batchSize && opts.batchSize > 0
         ? Math.max(1, Math.floor(opts.batchSize))
         : pending.length;
-    const isDeepBatch = Boolean(opts.batchSize && opts.batchSize <= 3);
-    const summaryTokensFor = (modelId: string) =>
-      maxSummaryOutputTokens(modelId, serverConfig.summary.batchMaxOutputTokens);
+    const isDeepBatch = opts.deep ?? Boolean(opts.batchSize && opts.batchSize <= 3);
     const cache = opts.cache ?? requestCache;
+    const missedForRetry: typeof pending = [];
 
-    for (let offset = 0; offset < pending.length; offset += chunkSize) {
-      const chunk = pending.slice(offset, offset + chunkSize);
+    const fallbackForItem = (
+      item: (typeof pending)[number],
+      inputText: string,
+    ): CondenseSourceOutcome => ({
+      note: `${item.header}\n${inputText.slice(0, FALLBACK_CHAR_CAP)}`,
+      usedFallback: item.excerpt.length > FALLBACK_CHAR_CAP,
+    });
+
+    const condenseChunk = async (chunk: typeof pending): Promise<(string | null)[]> => {
+      const summaryTokensFor = (modelId: string) =>
+        fitSummaryOutputTokens(modelId, chunk.length, {
+          deep: isDeepBatch,
+          defaultMax: serverConfig.summary.batchMaxOutputTokens,
+        });
       const perSourceCap = Math.min(
         maxSourceCap,
         Math.floor(BATCH_INPUT_CHAR_CAP / chunk.length),
@@ -191,10 +220,6 @@ export async function condenseSourcesDetailed(
         doc: p.doc,
         input: p.excerpt.slice(0, perSourceCap),
       }));
-      const fallbackFor = (i: number): CondenseSourceOutcome => ({
-        note: `${chunk[i].header}\n${entries[i].input.slice(0, FALLBACK_CHAR_CAP)}`,
-        usedFallback: true,
-      });
 
       const runBatchCall = async (batchSignal: AbortSignal): Promise<(string | null)[]> => {
         const promptForModel = (modelId: string) => {
@@ -230,18 +255,32 @@ export async function condenseSourcesDetailed(
         return notes;
       };
 
+      return cache.wrap(
+        "notes-batch",
+        {
+          sources: entries.map((e) => ({ url: e.doc.url, content: e.input })),
+          q: normalizeCacheText(opts.query),
+          ...(isDeepBatch ? { deep: true } : {}),
+        },
+        serverConfig.cache.notesTtlSeconds,
+        runBatchCall,
+        {
+          bypass: opts.disableCache,
+          requestId: opts.requestId,
+          signal: opts.signal,
+          shouldCache: (notes) => notes.every((n) => n !== null),
+        },
+      );
+    };
+
+    for (let offset = 0; offset < pending.length; offset += chunkSize) {
+      const chunk = pending.slice(offset, offset + chunkSize);
+      const perSourceCap = Math.min(
+        maxSourceCap,
+        Math.floor(BATCH_INPUT_CHAR_CAP / chunk.length),
+      );
       try {
-        const parsed = await cache.wrap(
-          "notes-batch",
-          {
-            sources: entries.map((e) => ({ url: e.doc.url, content: e.input })),
-            q: normalizeCacheText(opts.query),
-            ...(isDeepBatch ? { deep: true } : {}),
-          },
-          serverConfig.cache.notesTtlSeconds,
-          runBatchCall,
-          { bypass: opts.disableCache, requestId: opts.requestId, signal: opts.signal },
-        );
+        const parsed = await condenseChunk(chunk);
         chunk.forEach((p, i) => {
           const rawNote = parsed[i];
           if (rawNote) {
@@ -251,8 +290,10 @@ export async function condenseSourcesDetailed(
               notesChars: rawNote.length,
             });
             outcomes[p.index] = { note: `${p.header}\n${rawNote}`, usedFallback: false };
+          } else if (opts.retryMissing) {
+            missedForRetry.push(p);
           } else {
-            outcomes[p.index] = fallbackFor(i);
+            outcomes[p.index] = fallbackForItem(p, p.excerpt.slice(0, perSourceCap));
           }
         });
       } catch (error) {
@@ -263,9 +304,49 @@ export async function condenseSourcesDetailed(
           requestId: opts.requestId,
           urls: chunk.map((p) => p.doc.url),
         });
-        chunk.forEach((p, i) => {
-          outcomes[p.index] = fallbackFor(i);
+        if (opts.retryMissing) {
+          missedForRetry.push(...chunk);
+        } else {
+          chunk.forEach((p) => {
+            outcomes[p.index] = fallbackForItem(p, p.excerpt.slice(0, perSourceCap));
+          });
+        }
+      }
+    }
+
+    // Spend remaining time budget to condense any missed sources individually
+    // through paced token leasing so partial-read fallbacks are eliminated.
+    for (const item of missedForRetry) {
+      const hasTimeBudget =
+        opts.deadlineAt == null || opts.deadlineAt - Date.now() > 55_000;
+      if (!hasTimeBudget) {
+        outcomes[item.index] = fallbackForItem(item, item.excerpt);
+        continue;
+      }
+      try {
+        const [retriedNote] = await condenseChunk([item]);
+        if (retriedNote) {
+          logDebug("summarize-retry", {
+            requestId: opts.requestId,
+            url: item.doc.url,
+            notesChars: retriedNote.length,
+          });
+          outcomes[item.index] = {
+            note: `${item.header}\n${retriedNote}`,
+            usedFallback: false,
+          };
+        } else {
+          outcomes[item.index] = fallbackForItem(item, item.excerpt);
+        }
+      } catch (error) {
+        if (isAbortError(error) || opts.signal?.aborted) {
+          throw createAbortError();
+        }
+        logError("summarize-retry", error, {
+          requestId: opts.requestId,
+          url: item.doc.url,
         });
+        outcomes[item.index] = fallbackForItem(item, item.excerpt);
       }
     }
   }

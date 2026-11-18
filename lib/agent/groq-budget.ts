@@ -6,7 +6,8 @@ import { logError, logInfo } from "@/lib/logger";
 import { groqModelLimits, type GroqModelLimits } from "@/lib/models";
 import { redis } from "@/lib/redis";
 import {
-  readCooldowns,
+  createCooldownStore,
+  type CooldownStore,
   type GroqCooldownDb,
   type GroqStage,
 } from "./groq-rate-limit";
@@ -29,6 +30,8 @@ type StoredBudget = {
   itpm?: number;
   otpm?: number;
   limitTpm?: number;
+  /** Earliest epoch ms when the next request on this model should start (smooth pacing). */
+  paceUntil?: number;
   ts: number;
 };
 
@@ -69,9 +72,18 @@ export function createGroqBudget(opts?: {
   db?: BudgetStoreDb | null;
   now?: () => number;
   seedLimits?: (model: string) => GroqModelLimits | undefined;
+  /** Fraction (`0`..`1`] of nominal per-minute limits to book against (safety cushion). */
+  utilizationCap?: number;
+  /** Smoothly pace calls on a model once its remaining window drops below this ratio (`0`..`1`). */
+  paceBelowRatio?: number;
+  /** Fraction (`0`..`1`) of consumed minute-share to space subsequent calls by. */
+  paceRatio?: number;
 }): GroqBudget {
   const nowFn = opts?.now ?? Date.now;
   const seedLimits = opts?.seedLimits ?? groqModelLimits;
+  const utilizationCap = Math.min(1, Math.max(0.2, opts?.utilizationCap ?? 1));
+  const paceBelowRatio = Math.min(1, Math.max(0, opts?.paceBelowRatio ?? 0));
+  const paceRatio = Math.min(1, Math.max(0, opts?.paceRatio ?? 0));
   const memoryFallback = new Map<string, string>();
   const learnedTpm = new Map<string, number>();
   const keyLocks = new Map<string, Promise<unknown>>();
@@ -128,19 +140,32 @@ export function createGroqBudget(opts?: {
     }
   };
 
-  const limitsFor = (model: string): GroqModelLimits | undefined => {
+  const scaleLimit = (raw: number | undefined): number | undefined =>
+    raw != null && raw > 0 ? Math.max(100, Math.floor(raw * utilizationCap)) : undefined;
+
+  const rawLimitsFor = (model: string): GroqModelLimits | undefined => {
     const seed = seedLimits(model);
     const tpm = learnedTpm.get(model) ?? seed?.tpm;
     if (tpm == null && seed?.itpm == null && seed?.otpm == null) return undefined;
     return { ...seed, ...(tpm != null ? { tpm } : {}) };
   };
 
+  const effectiveLimitsFor = (model: string): GroqModelLimits | undefined => {
+    const raw = rawLimitsFor(model);
+    if (!raw) return undefined;
+    return {
+      ...(raw.tpm != null ? { tpm: scaleLimit(raw.tpm) } : {}),
+      ...(raw.itpm != null ? { itpm: scaleLimit(raw.itpm) } : {}),
+      ...(raw.otpm != null ? { otpm: scaleLimit(raw.otpm) } : {}),
+    };
+  };
+
   return {
-    limitsFor,
+    limitsFor: rawLimitsFor,
     reserve(model, cost, reserveOpts) {
       const key = budgetKey(model);
       return withKeyLock(key, async () => {
-        const baseLimits = limitsFor(model);
+        const baseLimits = effectiveLimitsFor(model);
         if (!baseLimits) return { granted: true, waitMs: 0 };
 
         const now = nowFn();
@@ -148,7 +173,7 @@ export function createGroqBudget(opts?: {
         if (stored?.limitTpm && stored.limitTpm > 0) {
           learnedTpm.set(model, stored.limitTpm);
         }
-        const limits = limitsFor(model)!;
+        const limits = effectiveLimitsFor(model)!;
         const elapsed = stored ? Math.max(0, now - stored.ts) : 60_000;
 
         const availTpm = limits.tpm ? refilled(stored?.tpm, limits.tpm, elapsed) : undefined;
@@ -159,7 +184,11 @@ export function createGroqBudget(opts?: {
         const outCost = Math.max(0, Math.ceil(cost.outputTokens));
         const headroom = Math.max(0, reserveOpts?.tpmHeadroom ?? 0);
 
-        let waitMs = 0;
+        let waitMs =
+          stored?.paceUntil && stored.paceUntil > now
+            ? Math.ceil(stored.paceUntil - now)
+            : 0;
+
         const checkDim = (avail: number | undefined, limit: number | undefined, rawCost: number, extra = 0) => {
           if (avail == null || limit == null || limit <= 0) return 0;
           const clampedCost = Math.min(rawCost, limit);
@@ -178,11 +207,42 @@ export function createGroqBudget(opts?: {
           return { granted: false, waitMs };
         }
 
+        const nextTpm = availTpm != null ? availTpm - debitTpm : undefined;
+        const nextItpm = availItpm != null ? availItpm - debitItpm : undefined;
+        const nextOtpm = availOtpm != null ? availOtpm - debitOtpm : undefined;
+
+        let paceUntil: number | undefined;
+        if (paceRatio > 0 && paceBelowRatio > 0) {
+          const shares: number[] = [];
+          const remRatios: number[] = [];
+          if (limits.tpm && nextTpm != null) {
+            shares.push(debitTpm / limits.tpm);
+            remRatios.push(nextTpm / limits.tpm);
+          }
+          if (limits.itpm && nextItpm != null) {
+            shares.push(debitItpm / limits.itpm);
+            remRatios.push(nextItpm / limits.itpm);
+          }
+          if (limits.otpm && nextOtpm != null) {
+            shares.push(debitOtpm / limits.otpm);
+            remRatios.push(nextOtpm / limits.otpm);
+          }
+          const minRemaining = remRatios.length > 0 ? Math.min(...remRatios) : 1;
+          const maxShare = shares.length > 0 ? Math.max(...shares) : 0;
+          if (minRemaining < paceBelowRatio && maxShare > 0) {
+            const delayMs = Math.round(maxShare * 60_000 * paceRatio);
+            if (delayMs >= 250) {
+              paceUntil = now + delayMs;
+            }
+          }
+        }
+
         await writeState(key, {
-          ...(availTpm != null ? { tpm: availTpm - debitTpm } : {}),
-          ...(availItpm != null ? { itpm: availItpm - debitItpm } : {}),
-          ...(availOtpm != null ? { otpm: availOtpm - debitOtpm } : {}),
+          ...(nextTpm != null ? { tpm: nextTpm } : {}),
+          ...(nextItpm != null ? { itpm: nextItpm } : {}),
+          ...(nextOtpm != null ? { otpm: nextOtpm } : {}),
           ...(learnedTpm.has(model) ? { limitTpm: learnedTpm.get(model) } : {}),
+          ...(paceUntil != null ? { paceUntil } : {}),
           ts: now,
         });
         return { granted: true, waitMs: 0 };
@@ -194,8 +254,9 @@ export function createGroqBudget(opts?: {
         if (obs.limitTokens != null && Number.isFinite(obs.limitTokens) && obs.limitTokens > 0) {
           learnedTpm.set(model, obs.limitTokens);
         }
-        const limits = limitsFor(model);
-        if (!limits) return;
+        const rawLimits = rawLimitsFor(model);
+        const limits = effectiveLimitsFor(model);
+        if (!limits || !rawLimits) return;
 
         const now = nowFn();
         const stored = await readState(key);
@@ -206,7 +267,9 @@ export function createGroqBudget(opts?: {
         let otpm = limits.otpm ? refilled(stored?.otpm, limits.otpm, elapsed) : undefined;
 
         if (tpm != null && obs.remainingTokens != null && Number.isFinite(obs.remainingTokens)) {
-          tpm = Math.min(tpm, Math.max(0, obs.remainingTokens));
+          const reserveCushion = Math.max(0, (rawLimits.tpm ?? limits.tpm!) - limits.tpm!);
+          const usableRemaining = Math.max(0, obs.remainingTokens - reserveCushion);
+          tpm = Math.min(tpm, usableRemaining);
         }
         if (obs.exhausted === "tpm" && tpm != null) tpm = 0;
         if (obs.exhausted === "itpm" && itpm != null) itpm = 0;
@@ -217,6 +280,9 @@ export function createGroqBudget(opts?: {
           ...(itpm != null ? { itpm } : {}),
           ...(otpm != null ? { otpm } : {}),
           ...(learnedTpm.has(model) ? { limitTpm: learnedTpm.get(model) } : {}),
+          ...(stored?.paceUntil && stored.paceUntil > now
+            ? { paceUntil: stored.paceUntil }
+            : {}),
           ts: now,
         });
       });
@@ -227,7 +293,11 @@ export function createGroqBudget(opts?: {
 let sharedBudget: GroqBudget | undefined;
 
 export function sharedGroqBudget(): GroqBudget {
-  sharedBudget ??= createGroqBudget();
+  sharedBudget ??= createGroqBudget({
+    utilizationCap: serverConfig.groqRateLimit.budgetUtilizationCap,
+    paceBelowRatio: serverConfig.groqRateLimit.paceBelowRatio,
+    paceRatio: serverConfig.groqRateLimit.paceRatio,
+  });
   return sharedBudget;
 }
 
@@ -236,6 +306,15 @@ function rotate<T>(items: readonly T[], offset: number): T[] {
   const idx = ((offset % items.length) + items.length) % items.length;
   return idx === 0 ? [...items] : [...items.slice(idx), ...items.slice(0, idx)];
 }
+
+export type AcquiredPoolModel = {
+  modelId: string;
+  waitedMs: number;
+  /** True when every candidate across both pools is quarantined as retired. */
+  allRetired?: boolean;
+  /** Remaining ms of the shortest non-retired cooldown when `latestStart` stopped waiting. */
+  blockedCooldownMs?: number;
+};
 
 /**
  * Acquire a model from a stage's fungible `pool`, waiting patiently for a
@@ -249,7 +328,8 @@ export async function acquirePoolModel(req: {
   estInputTokens: number | ((model: string) => number);
   maxOutputTokens: number | ((model: string) => number);
   budget: GroqBudget;
-  cooldownDb: () => GroqCooldownDb | undefined;
+  cooldownStore?: CooldownStore;
+  cooldownDb?: () => GroqCooldownDb | undefined;
   cursors: Map<string, number>;
   deadlineAt?: number;
   maxWaitMs?: number;
@@ -260,10 +340,16 @@ export async function acquirePoolModel(req: {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
-}): Promise<{ modelId: string; waitedMs: number }> {
+}): Promise<AcquiredPoolModel> {
   const nowFn = req.now ?? Date.now;
   const random = req.random ?? Math.random;
   const startedAt = nowFn();
+  let virtualNow = startedAt;
+  const currentTime = () => Math.max(nowFn(), virtualNow);
+
+  const cooldownStore =
+    req.cooldownStore ??
+    createCooldownStore(req.cooldownDb ? (req.cooldownDb() ?? null) : undefined, req.stage);
 
   const defaultWait = serverConfig.groqRateLimit.stageMaxWaitMs[req.stage];
   const remainingUntilDeadline =
@@ -273,9 +359,7 @@ export async function acquirePoolModel(req: {
 
   const preferPoolWaitMs =
     req.preferPoolWaitMs ??
-    (req.stage === "synthesis"
-      ? serverConfig.groqRateLimit.preferPoolWaitMs
-      : 5_000);
+    serverConfig.groqRateLimit.preferPoolWaitMs[req.stage];
   const reserveTokens =
     req.synthesisReserveTokens ?? serverConfig.groqRateLimit.synthesisReserveTokens;
 
@@ -297,7 +381,10 @@ export async function acquirePoolModel(req: {
     typeof req.maxOutputTokens === "function" ? req.maxOutputTokens(m) : req.maxOutputTokens;
 
   let announced = false;
-  const finish = async (modelId: string) => {
+  const finish = async (
+    modelId: string,
+    extra?: Pick<AcquiredPoolModel, "allRetired" | "blockedCooldownMs">,
+  ): Promise<AcquiredPoolModel> => {
     if (announced) {
       try {
         await req.onWait?.(req.stage, null);
@@ -305,16 +392,15 @@ export async function acquirePoolModel(req: {
         // ignore status callback errors
       }
     }
-    return { modelId, waitedMs: nowFn() - startedAt };
+    return { modelId, waitedMs: currentTime() - startedAt, ...extra };
   };
 
   for (;;) {
     if (req.signal?.aborted) throw createAbortError();
-    const now = nowFn();
-    const cooldowns = await readCooldowns(
+    const now = currentTime();
+    const cooldowns = await cooldownStore.read(
       [...primaryPool, ...overflowPool],
       now,
-      req.cooldownDb,
     );
 
     const tryCandidate = async (
@@ -357,9 +443,8 @@ export async function acquirePoolModel(req: {
     //    check `overflowPool` (keeping synthesis headroom free for auxiliary stages).
     let soonest = primarySoonest;
     const primaryFitsBriefly =
-      now === startedAt &&
       primarySoonest != null &&
-      primarySoonest.waitMs <= preferPoolWaitMs &&
+      now - startedAt + primarySoonest.waitMs <= preferPoolWaitMs &&
       now + primarySoonest.waitMs <= latestStart;
 
     if (!primaryFitsBriefly) {
@@ -386,14 +471,32 @@ export async function acquirePoolModel(req: {
         // ignore status callback errors
       }
       const jitter = JITTER_MIN_MS + Math.floor(random() * JITTER_SPREAD_MS);
-      await abortableSleep(soonest.waitMs + jitter, req.signal, req.sleep);
+      const sleepMs = soonest.waitMs + jitter;
+      await abortableSleep(sleepMs, req.signal, req.sleep);
+      virtualNow = Math.max(nowFn(), now + sleepMs);
       continue;
     }
 
-    // 4. Deadline reached (or all models on daily/retired limits): pick the best
-    //    non-retired candidate and let `createResilientGroqFetch` execute or surface a clean error.
+    // 4. Deadline reached (or all models on daily/retired limits): surface status to StageRunner.
     const candidates = [...primaryPool, ...overflowPool];
     const nonRetired = candidates.filter((m) => !cooldowns.get(m)?.retired);
-    return finish(nonRetired[0] ?? primaryPool[0]);
+    if (nonRetired.length === 0) {
+      return finish(candidates[0] ?? "", { allRetired: true });
+    }
+    const activeCooldownWaits = nonRetired
+      .map((m) => cooldowns.get(m))
+      .filter((cd): cd is NonNullable<typeof cd> => cd != null)
+      .map((cd) => Math.max(100, cd.untilMs - now))
+      .sort((a, b) => a - b);
+    const ranked = [...nonRetired].sort((a, b) => {
+      const wa = cooldowns.get(a)?.untilMs ?? 0;
+      const wb = cooldowns.get(b)?.untilMs ?? 0;
+      return wa - wb;
+    });
+    return finish(ranked[0], {
+      ...(activeCooldownWaits.length === nonRetired.length
+        ? { blockedCooldownMs: activeCooldownWaits[0] }
+        : {}),
+    });
   }
 }

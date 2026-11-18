@@ -1,6 +1,6 @@
 import {
   isChatId,
-  isTurnId,
+  isRunId,
   stopDurableTurn,
 } from "@/lib/agent/turn-store";
 
@@ -16,16 +16,16 @@ export async function POST(
     return Response.json({ ok: false }, { status: 400 });
   }
 
-  let turnId: string | undefined;
+  let runId: string | undefined;
   try {
-    const body = (await req.json()) as { turnId?: unknown };
-    if (isTurnId(body?.turnId)) {
-      turnId = body.turnId;
+    const body = (await req.json()) as { runId?: unknown };
+    if (isRunId(body?.runId)) {
+      runId = body.runId;
     }
   } catch {
     // Empty body is valid.
   }
 
-  await stopDurableTurn(id, turnId);
+  await stopDurableTurn(id, runId);
   return Response.json({ ok: true });
 }

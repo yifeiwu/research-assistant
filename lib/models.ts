@@ -47,7 +47,7 @@ type GroqModel = {
 export type GroqModelRole = "synthesis" | "auxiliary";
 
 const DEFAULT_SYNTHESIS_MAX_TOKENS = 4_000;
-const DEFAULT_SUMMARY_MAX_TOKENS = 650;
+const DEFAULT_SUMMARY_MAX_TOKENS = 1_000;
 const TPM_SAFETY_MARGIN = 500;
 const HARD_MIN_SYNTHESIS_TOKENS = 256;
 
@@ -80,14 +80,14 @@ const GROQ_MODELS: GroqModel[] = [
     supportsReasoningFormat: true,
     supportsZeroReasoning: true,
     maxSynthesisTokens: 900,
-    maxSummaryTokens: 450,
+    maxSummaryTokens: 850,
     limits: { tpm: 8_000, itpm: 7_000, otpm: 1_000 },
   },
   {
     id: "allam-2-7b",
     pool: "summarizer",
     maxSynthesisTokens: 900,
-    maxSummaryTokens: 450,
+    maxSummaryTokens: 850,
     maxSummaryInputChars: 6_000,
     limits: { tpm: 6_000 },
   },
@@ -192,7 +192,28 @@ export function fitSynthesisOutputTokens(
   return Math.max(floor, Math.min(modelMax, available));
 }
 
-/** Safe `maxOutputTokens` reservation for batched source condensation on `id`. */
+/**
+ * Compute `maxOutputTokens` for condensing a batch of `sourceCount` sources on
+ * `id`, scaling with batch size and adding headroom when `id` spends tokens on
+ * `low` reasoning (e.g. GPT-OSS spillover) while respecting per-model OTPM caps.
+ */
+export function fitSummaryOutputTokens(
+  id: string | undefined | null,
+  sourceCount: number,
+  opts?: { deep?: boolean; defaultMax?: number },
+): number {
+  const modelCap = maxSummaryOutputTokens(
+    id,
+    opts?.defaultMax ?? DEFAULT_SUMMARY_MAX_TOKENS,
+  );
+  const count = Math.max(1, sourceCount);
+  const perSource = opts?.deep ? 280 : 220;
+  const known = findModel(id);
+  const reasoningOverhead =
+    known?.reasoning && !known.supportsZeroReasoning ? 200 : 60;
+  const desired = Math.max(400, count * perSource + reasoningOverhead);
+  return Math.min(modelCap, desired);
+}
 export function maxSummaryOutputTokens(
   id: string | undefined | null,
   defaultMax: number = DEFAULT_SUMMARY_MAX_TOKENS,

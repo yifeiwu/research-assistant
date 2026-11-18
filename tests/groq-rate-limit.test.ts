@@ -1,19 +1,41 @@
+import { APICallError, generateText } from "ai";
 import { describe, expect, it } from "vitest";
+import { createGroqBudget } from "@/lib/agent/groq-budget";
 import {
-  createResilientGroqFetch,
+  isContextOverflowResponse,
   isModelRetiredResponse,
+  normalizeGroqCompletionBody,
   parseGroqDurationMs,
   parseGroqRateLimitResponse,
-  rewriteGroqRequestBody,
   type GroqCooldownDb,
 } from "@/lib/agent/groq-rate-limit";
+import { isResolutionError, resolveModels } from "@/lib/agent/models";
+import { generateAuxiliaryText } from "@/lib/agent/stage";
+import {
+  fitSynthesisOutputTokens,
+  groqReasoningOptions,
+  maxSummaryBatchInputChars,
+  maxSummaryOutputTokens,
+} from "@/lib/models";
 import { FakeRedis } from "./fake-redis";
 
 const asDb = (fake: FakeRedis) => fake as unknown as GroqCooldownDb;
 
 function jsonOk(model: string): Response {
   return new Response(
-    JSON.stringify({ id: "cmpl_1", model, choices: [{ message: { content: "ok" }, finish_reason: "stop" }] }),
+    JSON.stringify({
+      id: "cmpl_1",
+      created: 1_700_000_000,
+      model,
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: "ok" },
+          finish_reason: "stop",
+        },
+      ],
+      usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 },
+    }),
     { status: 200, headers: { "content-type": "application/json" } },
   );
 }
@@ -52,7 +74,7 @@ function json429(opts: {
   );
 }
 
-describe("parseGroqDurationMs, parseGroqRateLimitResponse & isModelRetiredResponse", () => {
+describe("parseGroqDurationMs, parseGroqRateLimitResponse & error classifiers", () => {
   it("parses plain seconds and compound Groq reset durations", () => {
     expect(parseGroqDurationMs("8")).toBe(8_000);
     expect(parseGroqDurationMs("7.66s")).toBe(7_660);
@@ -69,13 +91,13 @@ describe("parseGroqDurationMs, parseGroqRateLimitResponse & isModelRetiredRespon
     expect(fromBody.waitMs).toBe(900_000);
 
     const fromHeader = parseGroqRateLimitResponse(
-      new Headers({ "x-ratelimit-remaining-requests": "0", "retry-after": "4" }),
+      { "x-ratelimit-remaining-requests": "0", "retry-after": "4" },
       "Rate limit reached",
     );
     expect(fromHeader.daily).toBe(true);
   });
 
-  it("distinguishes model retirement / 404 / decommission errors from generic 400 validation errors", () => {
+  it("distinguishes model retirement / 404 / decommission errors and 413 context overflows from generic 400 validation errors", () => {
     expect(isModelRetiredResponse(404, '{"error":{"message":"The model `foo` does not exist"}}')).toBe(true);
     expect(
       isModelRetiredResponse(
@@ -92,104 +114,47 @@ describe("parseGroqDurationMs, parseGroqRateLimitResponse & isModelRetiredRespon
     expect(
       isModelRetiredResponse(400, '{"error":{"message":"messages[0].content must be a string"}}'),
     ).toBe(false);
+
+    expect(isContextOverflowResponse(413, "Request too large")).toBe(true);
+    expect(isContextOverflowResponse(400, "context_length_exceeded")).toBe(true);
+    expect(isContextOverflowResponse(400, "invalid parameter")).toBe(false);
+  });
+
+  it("normalizes deprecated max_tokens to max_completion_tokens without touching model or messages", () => {
+    const normalized = JSON.parse(
+      normalizeGroqCompletionBody(
+        JSON.stringify({
+          model: "openai/gpt-oss-120b",
+          max_tokens: 4_000,
+          reasoning_effort: "medium",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      ),
+    );
+    expect(normalized.max_tokens).toBeUndefined();
+    expect(normalized.max_completion_tokens).toBe(4_000);
+    expect(normalized.model).toBe("openai/gpt-oss-120b");
+    expect(normalized.reasoning_effort).toBe("medium");
   });
 });
 
-describe("rewriteGroqRequestBody", () => {
-  it("converts deprecated max_tokens to max_completion_tokens and normalizes reasoning fields across GPT-OSS, Qwen, and ALLaM", () => {
-    const gptSynthesis = JSON.stringify({
-      model: "openai/gpt-oss-120b",
-      max_tokens: 4_000,
-      reasoning_effort: "medium",
-      messages: [{ role: "user", content: "hi" }],
-    });
-    const normalizedGpt = JSON.parse(
-      rewriteGroqRequestBody(gptSynthesis, "openai/gpt-oss-120b", "synthesis", 4_000),
-    );
-    expect(normalizedGpt.max_tokens).toBeUndefined();
-    expect(normalizedGpt.max_completion_tokens).toBe(4_000);
-    expect(normalizedGpt.reasoning_effort).toBe("medium");
-    expect(normalizedGpt.reasoning_format).toBeUndefined();
-
-    const toQwen = JSON.parse(
-      rewriteGroqRequestBody(gptSynthesis, "qwen/qwen3.8-27b", "synthesis", 4_000),
-    );
-    expect(toQwen.model).toBe("qwen/qwen3.8-27b");
-    expect(toQwen.max_tokens).toBeUndefined();
-    expect(toQwen.max_completion_tokens).toBe(900);
-    expect(toQwen.reasoning_effort).toBe("none");
-    expect(toQwen.reasoning_format).toBe("hidden");
-
-    const toAllam = JSON.parse(
-      rewriteGroqRequestBody(gptSynthesis, "allam-2-7b", "synthesis", 4_000),
-    );
-    expect(toAllam.model).toBe("allam-2-7b");
-    expect(toAllam.max_completion_tokens).toBe(900);
-    expect(toAllam.reasoning_format).toBeUndefined();
-    expect(toAllam.reasoning_effort).toBeUndefined();
-
-    const backToGpt = JSON.parse(
-      rewriteGroqRequestBody(JSON.stringify(toQwen), "openai/gpt-oss-20b", "synthesis", 4_000),
-    );
-    expect(backToGpt.model).toBe("openai/gpt-oss-20b");
-    expect(backToGpt.max_completion_tokens).toBe(4_000);
-
-    // Multi-turn failover from Qwen (900) to GPT-OSS with ~5,000 input tokens clamps below 8,000 TPM!
-    const heavyQwen = JSON.stringify({
-      model: "qwen/qwen3.8-27b",
-      max_completion_tokens: 900,
-      messages: [{ role: "system", content: "x".repeat(20_000) }],
-    });
-    const clampedGpt = JSON.parse(
-      rewriteGroqRequestBody(heavyQwen, "openai/gpt-oss-120b", "synthesis", 4_000),
-    );
-    expect(clampedGpt.max_completion_tokens).toBeLessThanOrEqual(2_500);
-    expect(clampedGpt.max_completion_tokens).toBeGreaterThanOrEqual(256);
-  });
-
-  it("rewrites auxiliary reasoning fields and trims summary source excerpts when switching onto 4k-context allam-2-7b", () => {
-    const gptSummary = JSON.stringify({
-      model: "openai/gpt-oss-20b",
-      max_tokens: 650,
-      reasoning_effort: "low",
-      messages: [
-        {
-          role: "user",
-          content: [
-            "Research question:\ntest",
-            `<source 1>\nTitle: A\nURL: https://a.com\nContent:\n"""\n${"a".repeat(4_500)}\n"""\n</source 1>`,
-            `<source 2>\nTitle: B\nURL: https://b.com\nContent:\n"""\n${"b".repeat(4_500)}\n"""\n</source 2>`,
-          ].join("\n\n"),
-        },
-      ],
-    });
-    const toAllam = JSON.parse(
-      rewriteGroqRequestBody(gptSummary, "allam-2-7b", "summary"),
-    );
-    expect(toAllam.model).toBe("allam-2-7b");
-    expect(toAllam.reasoning_effort).toBeUndefined();
-    expect(toAllam.reasoning_format).toBeUndefined();
-    expect(toAllam.max_tokens).toBeUndefined();
-    expect(toAllam.max_completion_tokens).toBe(450);
-    expect(String(toAllam.messages[0].content).length).toBeLessThan(6_200);
-    expect(String(toAllam.messages[0].content)).toContain("<source 1>");
-    expect(String(toAllam.messages[0].content)).toContain("<source 2>");
-  });
-});
-
-describe("createResilientGroqFetch", () => {
-  it("switches immediately to a healthy pool peer on 429 without sleeping, and skips cooled peers next call", async () => {
+describe("StageRunner unified failover & rate-limit resilience", () => {
+  it("switches immediately to a healthy pool peer on 429 with native per-model prompts/caps, and skips cooled peers next call", async () => {
     const fake = new FakeRedis();
     const now = 2_000_000;
     const sleeps: number[] = [];
     const seenBodies: Record<string, unknown>[] = [];
 
-    const makeFetch = () =>
-      createResilientGroqFetch({
-        stage: "synthesis",
-        primaryModel: "openai/gpt-oss-120b",
-        fallbackModels: ["qwen/qwen3.8-27b"],
+    const makeResolved = () => {
+      const r = resolveModels({
+        apiKey: "gsk_test",
+        pools: {
+          reasoning: ["openai/gpt-oss-120b"],
+          summarizer: ["qwen/qwen3.8-27b"],
+        },
+        preferPoolWaitMs: { synthesis: 0 },
         db: asDb(fake),
+        budget: createGroqBudget({ db: null }),
         now: () => now,
         sleep: async (ms) => {
           sleeps.push(ms);
@@ -206,35 +171,45 @@ describe("createResilientGroqFetch", () => {
           return jsonOk(String(body.model));
         },
       });
+      if (isResolutionError(r)) throw new Error(r.error);
+      return r;
+    };
 
-    const res1 = await makeFetch()("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      body: JSON.stringify({
-        model: "openai/gpt-oss-120b",
-        max_tokens: 3_500,
-        reasoning_format: "parsed",
-        messages: [],
-      }),
-    });
-    expect(res1.status).toBe(200);
+    const runSynthesis = (resolved: ReturnType<typeof makeResolved>) =>
+      resolved.stages.synthesis.run({
+        execute: async (leased, attemptSignal) => {
+          const res = await generateText({
+            model: leased.model,
+            prompt: "Explain Rust",
+            maxOutputTokens: fitSynthesisOutputTokens(leased.modelId, 200, 3_500),
+            providerOptions: groqReasoningOptions(leased.modelId, "synthesis", "high"),
+            abortSignal: attemptSignal,
+            maxRetries: 0,
+          });
+          return { value: res.text, headers: res.response.headers };
+        },
+      });
+
+    const out1 = await runSynthesis(makeResolved());
+    expect(out1.value).toBe("ok");
+    expect(out1.modelId).toBe("qwen/qwen3.8-27b");
     expect(sleeps).toHaveLength(0);
     expect(seenBodies.map((b) => b.model)).toEqual([
       "openai/gpt-oss-120b",
       "qwen/qwen3.8-27b",
     ]);
+    // Native per-model caps and reasoning options without JSON rewriting!
+    expect(seenBodies[0].max_tokens).toBeUndefined();
     expect(seenBodies[0].max_completion_tokens).toBe(3_500);
+    expect(seenBodies[0].reasoning_effort).toBe("medium");
     expect(seenBodies[1].max_completion_tokens).toBe(900);
+    expect(seenBodies[1].reasoning_effort).toBe("none");
+    expect(seenBodies[1].reasoning_format).toBe("hidden");
 
+    // Second call skips cooled openai/gpt-oss-120b immediately!
     seenBodies.length = 0;
-    const res2 = await makeFetch()("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      body: JSON.stringify({
-        model: "openai/gpt-oss-120b",
-        max_tokens: 3_500,
-        messages: [],
-      }),
-    });
-    expect(res2.status).toBe(200);
+    const out2 = await runSynthesis(makeResolved());
+    expect(out2.modelId).toBe("qwen/qwen3.8-27b");
     expect(seenBodies.map((b) => b.model)).toEqual(["qwen/qwen3.8-27b"]);
   });
 
@@ -243,12 +218,15 @@ describe("createResilientGroqFetch", () => {
     const now = 5_000_000;
     const seenModels: string[] = [];
 
-    const makeFetch = () =>
-      createResilientGroqFetch({
-        stage: "summary",
-        primaryModel: "allam-2-7b",
-        fallbackModels: ["openai/gpt-oss-20b", "qwen/qwen3.8-27b"],
+    const makeResolved = () => {
+      const r = resolveModels({
+        apiKey: "gsk_test",
+        pools: {
+          summarizer: ["allam-2-7b", "qwen/qwen3.8-27b"],
+          reasoning: ["openai/gpt-oss-20b"],
+        },
         db: asDb(fake),
+        budget: createGroqBudget({ db: null }),
         now: () => now,
         baseFetch: async (_url, init) => {
           const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -260,85 +238,112 @@ describe("createResilientGroqFetch", () => {
               "model_decommissioned",
             );
           }
-          if (body.model === "openai/gpt-oss-20b") {
-            return jsonError(404, "The model `openai/gpt-oss-20b` does not exist");
+          if (body.model === "qwen/qwen3.8-27b") {
+            return jsonError(404, "The model `qwen/qwen3.8-27b` does not exist");
           }
           return jsonOk(String(body.model));
         },
       });
+      if (isResolutionError(r)) throw new Error(r.error);
+      return r;
+    };
 
-    // First call hits retired allam-2-7b -> 404 gpt-oss-20b -> succeeds on cross-pool qwen3.8-27b!
-    const res1 = await makeFetch()("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      body: JSON.stringify({ model: "allam-2-7b", max_tokens: 450, messages: [] }),
+    const text1 = await generateAuxiliaryText({
+      stage: makeResolved().stages.summary,
+      system: "Summarize",
+      prompt: (modelId) => "x".repeat(maxSummaryBatchInputChars(modelId, 9_000)),
+      maxOutputTokens: (modelId) => maxSummaryOutputTokens(modelId, 1_000),
+      timeoutMs: 10_000,
     });
-    expect(res1.status).toBe(200);
+    expect(text1).toBe("ok");
     expect(seenModels).toEqual([
       "allam-2-7b",
-      "openai/gpt-oss-20b",
       "qwen/qwen3.8-27b",
+      "openai/gpt-oss-20b",
     ]);
     expect(fake.strings.get("ratelimit:groq:cooldown:allam-2-7b")).toMatch(/^retired:/);
-    expect(fake.strings.get("ratelimit:groq:cooldown:openai/gpt-oss-20b")).toMatch(/^retired:/);
+    expect(fake.strings.get("ratelimit:groq:cooldown:qwen/qwen3.8-27b")).toMatch(/^retired:/);
 
     // Second call skips both retired models immediately with zero wasted requests!
     seenModels.length = 0;
-    const res2 = await makeFetch()("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      body: JSON.stringify({ model: "allam-2-7b", max_tokens: 450, messages: [] }),
+    const text2 = await generateAuxiliaryText({
+      stage: makeResolved().stages.summary,
+      system: "Summarize",
+      prompt: "short",
+      maxOutputTokens: 500,
+      timeoutMs: 10_000,
     });
-    expect(res2.status).toBe(200);
-    expect(seenModels).toEqual(["qwen/qwen3.8-27b"]);
+    expect(text2).toBe("ok");
+    expect(seenModels).toEqual(["openai/gpt-oss-20b"]);
   });
 
-  it("switches to a larger-context peer on HTTP 413 / context_length_exceeded without retiring the smaller model", async () => {
+  it("switches to a larger-context peer on HTTP 413 / context_length_exceeded with native per-model prompt sizing", async () => {
     const fake = new FakeRedis();
-    const seenModels: string[] = [];
+    const seenPrompts: Array<{ model: string; chars: number }> = [];
 
-    const wrapped = createResilientGroqFetch({
-      stage: "summary",
-      primaryModel: "allam-2-7b",
-      fallbackModels: ["openai/gpt-oss-20b"],
+    const r = resolveModels({
+      apiKey: "gsk_test",
+      pools: {
+        summarizer: ["allam-2-7b"],
+        reasoning: ["openai/gpt-oss-20b"],
+      },
       db: asDb(fake),
+      budget: createGroqBudget({ db: null }),
       baseFetch: async (_url, init) => {
-        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-        seenModels.push(String(body.model));
+        const body = JSON.parse(String(init?.body)) as {
+          model: string;
+          messages: Array<{ role: string; content: string }>;
+        };
+        const userMsg = body.messages.find((m) => m.role === "user")?.content ?? "";
+        seenPrompts.push({ model: body.model, chars: userMsg.length });
         if (body.model === "allam-2-7b") {
           return jsonError(413, "Request too large for model `allam-2-7b`: context_length_exceeded");
         }
-        return jsonOk(String(body.model));
+        return jsonOk(body.model);
       },
     });
+    if (isResolutionError(r)) throw new Error(r.error);
 
-    const res = await wrapped("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      body: JSON.stringify({ model: "allam-2-7b", max_tokens: 450, messages: [] }),
+    const text = await generateAuxiliaryText({
+      stage: r.stages.summary,
+      system: "Summarize",
+      prompt: (modelId) => "x".repeat(maxSummaryBatchInputChars(modelId, 9_000)),
+      maxOutputTokens: 500,
+      timeoutMs: 10_000,
     });
-    expect(res.status).toBe(200);
-    expect(seenModels).toEqual(["allam-2-7b", "openai/gpt-oss-20b"]);
+    expect(text).toBe("ok");
+    expect(seenPrompts).toEqual([
+      { model: "allam-2-7b", chars: 6_000 },
+      { model: "openai/gpt-oss-20b", chars: 9_000 },
+    ]);
     // Not retired in Redis so normal-sized batches can still use it.
     expect(fake.strings.has("ratelimit:groq:cooldown:allam-2-7b")).toBe(false);
   });
 
-  it("sleeps for the soonest cooldown <= maxWaitMs when every candidate is cooling down", async () => {
+  it("sleeps for the soonest cooldown <= stageMaxWaitMs when every candidate is cooling down", async () => {
     const fake = new FakeRedis();
     let now = 1_000_000;
     const sleeps: number[] = [];
     const seenModels: string[] = [];
     let call = 0;
 
-    const wrapped = createResilientGroqFetch({
-      stage: "synthesis",
-      primaryModel: "openai/gpt-oss-120b",
-      fallbackModels: ["qwen/qwen3.8-27b"],
+    const r = resolveModels({
+      apiKey: "gsk_test",
+      pools: {
+        reasoning: ["openai/gpt-oss-120b"],
+        summarizer: ["qwen/qwen3.8-27b"],
+      },
+      preferPoolWaitMs: { synthesis: 0 },
       db: asDb(fake),
+      budget: createGroqBudget({ db: null }),
       now: () => now,
+      random: () => 0,
       sleep: async (ms) => {
         sleeps.push(ms);
         now += ms;
       },
       baseFetch: async (_url, init) => {
-        const body = JSON.parse(String(init?.body));
+        const body = JSON.parse(String(init?.body)) as { model: string };
         seenModels.push(body.model);
         call += 1;
         if (call === 1) return json429({ retryAfter: "8" });
@@ -346,38 +351,59 @@ describe("createResilientGroqFetch", () => {
         return jsonOk(body.model);
       },
     });
+    if (isResolutionError(r)) throw new Error(r.error);
 
-    const res = await wrapped("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      body: JSON.stringify({ model: "openai/gpt-oss-120b", max_tokens: 3_500, messages: [] }),
+    const out = await r.stages.synthesis.run({
+      execute: async (leased, attemptSignal) => {
+        const res = await generateText({
+          model: leased.model,
+          prompt: "test",
+          maxOutputTokens: 500,
+          abortSignal: attemptSignal,
+          maxRetries: 0,
+        });
+        return { value: res.text, headers: res.response.headers };
+      },
     });
-    expect(res.status).toBe(200);
+    expect(out.value).toBe("ok");
     expect(seenModels).toEqual([
       "openai/gpt-oss-120b",
       "qwen/qwen3.8-27b",
       "qwen/qwen3.8-27b",
     ]);
-    expect(sleeps).toEqual([4_150]);
+    expect(sleeps).toEqual([4_080]);
   });
 
   it("aborts promptly during a Retry-After sleep when the caller cancels", async () => {
     const controller = new AbortController();
-    const wrapped = createResilientGroqFetch({
-      stage: "synthesis",
-      primaryModel: "openai/gpt-oss-120b",
+    const r = resolveModels({
+      apiKey: "gsk_test",
+      pools: {
+        reasoning: ["openai/gpt-oss-120b"],
+        summarizer: ["allam-2-7b"],
+      },
       db: null,
+      budget: createGroqBudget({ db: null }),
       sleep: () => new Promise(() => {}),
       baseFetch: async () => {
         setTimeout(() => controller.abort(), 5);
         return json429({ retryAfter: "5" });
       },
     });
+    if (isResolutionError(r)) throw new Error(r.error);
 
     await expect(
-      wrapped("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
+      r.stages.synthesis.run({
         signal: controller.signal,
-        body: JSON.stringify({ model: "openai/gpt-oss-120b", max_tokens: 3_500, messages: [] }),
+        execute: async (leased, attemptSignal) => {
+          const res = await generateText({
+            model: leased.model,
+            prompt: "test",
+            abortSignal: attemptSignal,
+            maxRetries: 0,
+          });
+          return { value: res.text };
+        },
       }),
     ).rejects.toMatchObject({ name: "AbortError" });
   });
@@ -385,15 +411,19 @@ describe("createResilientGroqFetch", () => {
   it("does not sleep on daily RPD exhaustion even when retry-after is short", async () => {
     const sleeps: number[] = [];
     const seenModels: string[] = [];
-    const wrapped = createResilientGroqFetch({
-      stage: "synthesis",
-      primaryModel: "openai/gpt-oss-120b",
+    const r = resolveModels({
+      apiKey: "gsk_test",
+      pools: {
+        reasoning: ["openai/gpt-oss-120b"],
+        summarizer: ["allam-2-7b"], // excluded from synthesis fallbackPool
+      },
       db: null,
+      budget: createGroqBudget({ db: null }),
       sleep: async (ms) => {
         sleeps.push(ms);
       },
       baseFetch: async (_url, init) => {
-        const body = JSON.parse(String(init?.body));
+        const body = JSON.parse(String(init?.body)) as { model: string };
         seenModels.push(body.model);
         return json429({
           retryAfter: "2",
@@ -402,12 +432,23 @@ describe("createResilientGroqFetch", () => {
         });
       },
     });
+    if (isResolutionError(r)) throw new Error(r.error);
 
-    const res = await wrapped("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      body: JSON.stringify({ model: "openai/gpt-oss-120b", max_tokens: 3_500, messages: [] }),
-    });
-    expect(res.status).toBe(429);
+    await expect(
+      r.stages.synthesis.run({
+        execute: async (leased, attemptSignal) => {
+          const res = await generateText({
+            model: leased.model,
+            prompt: "test",
+            abortSignal: attemptSignal,
+            maxRetries: 0,
+          });
+          return { value: res.text };
+        },
+      }),
+    ).rejects.toSatisfy(
+      (err: unknown) => APICallError.isInstance(err) && err.statusCode === 429,
+    );
     expect(sleeps).toHaveLength(0);
     expect(seenModels).toEqual(["openai/gpt-oss-120b"]);
   });
@@ -425,29 +466,75 @@ describe("createResilientGroqFetch", () => {
       }),
     };
 
-    const wrapped = createResilientGroqFetch({
-      stage: "planner",
-      primaryModel: "openai/gpt-oss-20b",
-      fallbackModels: ["qwen/qwen3.8-27b"],
+    const r = resolveModels({
+      apiKey: "gsk_test",
+      pools: {
+        reasoning: ["openai/gpt-oss-20b"],
+        summarizer: ["qwen/qwen3.8-27b"],
+      },
+      preferPoolWaitMs: { planner: 0 },
       db: brokenDb,
+      budget: createGroqBudget({ db: null }),
       baseFetch: async (_url, init) => {
-        const body = JSON.parse(String(init?.body));
+        const body = JSON.parse(String(init?.body)) as { model: string };
         if (body.model === "openai/gpt-oss-20b") {
           return json429({ retryAfter: "15" });
         }
         return jsonOk(body.model);
       },
     });
+    if (isResolutionError(r)) throw new Error(r.error);
 
-    const res = await wrapped("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      body: JSON.stringify({
-        model: "openai/gpt-oss-20b",
-        reasoning_effort: "low",
-        reasoning_format: "parsed",
-        messages: [],
-      }),
+    const text = await generateAuxiliaryText({
+      stage: r.stages.planner,
+      system: "Plan",
+      prompt: "query",
+      maxOutputTokens: 200,
+      timeoutMs: 10_000,
     });
-    expect(res.status).toBe(200);
+    expect(text).toBe("ok");
+  });
+
+  it("switches to a healthy peer when an individual HTTP attempt exceeds attemptTimeoutMs", async () => {
+    const seenModels: string[] = [];
+    const r = resolveModels({
+      apiKey: "gsk_test",
+      pools: {
+        summarizer: ["qwen/qwen3.8-27b", "allam-2-7b"],
+        reasoning: ["openai/gpt-oss-20b"],
+      },
+      attemptTimeoutMs: { summary: 25 },
+      db: null,
+      budget: createGroqBudget({ db: null }),
+      baseFetch: async (_url, init) => {
+        const body = JSON.parse(String(init?.body)) as { model: string };
+        seenModels.push(body.model);
+        if (body.model === "qwen/qwen3.8-27b") {
+          return new Promise<Response>((_, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => {
+                const err = new Error("Aborted");
+                err.name = "AbortError";
+                reject(err);
+              },
+              { once: true },
+            );
+          });
+        }
+        return jsonOk(body.model);
+      },
+    });
+    if (isResolutionError(r)) throw new Error(r.error);
+
+    const text = await generateAuxiliaryText({
+      stage: r.stages.summary,
+      system: "Summarize",
+      prompt: "excerpt",
+      maxOutputTokens: 500,
+      timeoutMs: 10_000,
+    });
+    expect(text).toBe("ok");
+    expect(seenModels).toEqual(["qwen/qwen3.8-27b", "allam-2-7b"]);
   });
 });

@@ -81,25 +81,24 @@ describe("conversations persistence & multi-turn message helpers", () => {
     }
   });
 
-  it("rejects stale DurableTurnState snapshots from earlier turns via matchesPendingTurn", () => {
+  it("rejects stale DurableTurnState snapshots from earlier runs via matchesPendingTurn", () => {
     const pendingFollowUp = {
       pending: true,
-      pendingTurnId: "u2",
-      pendingRunId: undefined,
+      pendingRunId: "r_turn_2",
     };
-    // Stale Turn 1 snapshot still sitting in Redis before POST /api/chat registers Turn 2:
-    expect(matchesPendingTurn(pendingFollowUp, { runId: "r_1", turnId: "u1" })).toBe(
+    // Stale Turn 1 snapshot:
+    expect(matchesPendingTurn(pendingFollowUp, { runId: "r_turn_1" })).toBe(
       false,
     );
     // Matching Turn 2 snapshot:
-    expect(matchesPendingTurn(pendingFollowUp, { runId: "r_2", turnId: "u2" })).toBe(
+    expect(matchesPendingTurn(pendingFollowUp, { runId: "r_turn_2" })).toBe(
       true,
     );
     // Superseded runId on the same chat:
     expect(
       matchesPendingTurn(
-        { pending: true, pendingTurnId: "u2", pendingRunId: "r_2b" },
-        { runId: "r_2a", turnId: "u2" },
+        { pending: true, pendingRunId: "r_2b" },
+        { runId: "r_2a" },
       ),
     ).toBe(false);
   });
@@ -259,33 +258,32 @@ describe("useConversations follow-up, edit & resend integration", () => {
   it("never clobbers follow-up questions or edits with Turn 1's stale Redis snapshot, updates title on Q1 edit, and supports editing while pending", async () => {
     const dom = installMinimalDom();
     try {
-      let redisActiveState: DurableTurnState | null = null;
-      let runSeq = 0;
-      const seenPostTurnIds: string[] = [];
+      const redisRuns = new Map<string, DurableTurnState>();
+      let latestRunId: string | null = null;
+      const seenPostRunIds: string[] = [];
 
       globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
         const method = (init?.method ?? "GET").toUpperCase();
 
         if (method === "POST" && url === "/api/chat") {
-          // Simulate 40ms network latency BEFORE Redis overwrites `chat:active:{id}`!
           await new Promise((r) => setTimeout(r, 40));
           const body = JSON.parse(String(init?.body)) as {
             id: string;
+            runId: string;
             messages: Array<{ id: string; role: string; text: string }>;
           };
-          const turnId = body.messages.at(-1)?.id;
-          if (turnId) seenPostTurnIds.push(turnId);
+          seenPostRunIds.push(body.runId);
           const state: DurableTurnState = {
-            runId: `r_${++runSeq}`,
+            runId: body.runId,
             chatId: body.id,
-            turnId,
             status: "running",
             steps: [],
             sources: [],
             updatedAt: Date.now(),
           };
-          redisActiveState = state;
+          redisRuns.set(body.runId, state);
+          latestRunId = body.runId;
           return new Response(JSON.stringify(state), {
             status: 202,
             headers: { "content-type": "application/json" },
@@ -293,15 +291,20 @@ describe("useConversations follow-up, edit & resend integration", () => {
         }
 
         if (method === "POST" && url.endsWith("/stop")) {
-          if (redisActiveState) {
-            redisActiveState = { ...redisActiveState, status: "stopped" };
+          const body = JSON.parse(String(init?.body ?? "{}")) as { runId?: string };
+          const targetId = body.runId ?? latestRunId;
+          if (targetId && redisRuns.has(targetId)) {
+            redisRuns.set(targetId, { ...redisRuns.get(targetId)!, status: "stopped" });
           }
           return new Response(JSON.stringify({ ok: true }), { status: 200 });
         }
 
         if (method === "GET" && url.startsWith("/api/chat/")) {
-          if (!redisActiveState) return new Response(null, { status: 204 });
-          return new Response(JSON.stringify(redisActiveState), {
+          const parsed = new URL(url, "http://localhost");
+          const requestedRunId = parsed.searchParams.get("runId") ?? latestRunId;
+          const state = requestedRunId ? redisRuns.get(requestedRunId) : undefined;
+          if (!state) return new Response(null, { status: 204 });
+          return new Response(JSON.stringify(state), {
             status: 200,
             headers: { "content-type": "application/json" },
           });
@@ -326,11 +329,11 @@ describe("useConversations follow-up, edit & resend integration", () => {
       expect(api.pending).toBe(true);
       expect(api.conversations[0].title).toBe("Initial question about Rust");
 
-      redisActiveState = {
-        ...redisActiveState!,
+      redisRuns.set(latestRunId!, {
+        ...redisRuns.get(latestRunId!)!,
         status: "done",
         message: { id: "a1", role: "assistant", text: "Answer 1 about Rust." },
-      };
+      });
       await new Promise((r) => setTimeout(r, 1_100));
       expect(api.pending).toBe(false);
       expect(api.messages.map((m) => m.text)).toEqual([
@@ -350,11 +353,11 @@ describe("useConversations follow-up, edit & resend integration", () => {
       ]);
 
       // Complete Turn 2:
-      redisActiveState = {
-        ...redisActiveState!,
+      redisRuns.set(latestRunId!, {
+        ...redisRuns.get(latestRunId!)!,
         status: "done",
         message: { id: "a2", role: "assistant", text: "Answer 2 about compile speed." },
-      };
+      });
       await new Promise((r) => setTimeout(r, 1_100));
       expect(api.pending).toBe(false);
       expect(api.messages.map((m) => m.text)).toEqual([
@@ -386,14 +389,14 @@ describe("useConversations follow-up, edit & resend integration", () => {
         "Refined question about Go generics",
       ]);
 
-      // --- 4. Stop and Retry assigns a brand-new turnId ---
+      // --- 4. Stop and Retry assigns a brand-new runId ---
       flushSync(() => api.stopGeneration());
       expect(api.pending).toBe(false);
-      const countBeforeRetry = seenPostTurnIds.length;
+      const countBeforeRetry = seenPostRunIds.length;
       flushSync(() => api.retryLastTurn("medium"));
       await new Promise((r) => setTimeout(r, 60));
-      expect(seenPostTurnIds.length).toBe(countBeforeRetry + 1);
-      expect(new Set(seenPostTurnIds).size).toBe(seenPostTurnIds.length);
+      expect(seenPostRunIds.length).toBe(countBeforeRetry + 1);
+      expect(new Set(seenPostRunIds).size).toBe(seenPostRunIds.length);
 
       root.unmount();
       await new Promise((r) => setTimeout(r, 15));

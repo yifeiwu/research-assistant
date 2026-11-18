@@ -118,6 +118,7 @@ describe("createGroqBudget & acquirePoolModel", () => {
       budget,
       cooldownDb: () => fake as unknown as GroqCooldownDb,
       cursors,
+      preferPoolWaitMs: 5_000,
       synthesisReserveTokens: 4_000,
       now: () => now,
       sleep: async (ms) => {
@@ -140,6 +141,7 @@ describe("createGroqBudget & acquirePoolModel", () => {
       budget,
       cooldownDb: () => fake as unknown as GroqCooldownDb,
       cursors,
+      preferPoolWaitMs: 5_000,
       synthesisReserveTokens: 4_000,
       now: () => now,
       sleep: async (ms) => {
@@ -150,6 +152,54 @@ describe("createGroqBudget & acquirePoolModel", () => {
     });
     expect(waitedOwn.modelId).toBe("sum/20b");
     expect(sleeps).toEqual([11_330]);
+  });
+
+  it("smoothly paces token usage across rounds with utilization cushions and stays on the summarizer pool within preferPoolWaitMs", async () => {
+    const fake = new FakeRedis();
+    let now = 50_000;
+    const sleeps: number[] = [];
+    const budget = createGroqBudget({
+      db: fake as unknown as BudgetStoreDb,
+      now: () => now,
+      seedLimits: (m) =>
+        m === "qwen/qwen3.8-27b"
+          ? { tpm: 8_000, otpm: 1_000 }
+          : { tpm: 6_000 },
+      utilizationCap: 0.88,
+      paceBelowRatio: 0.7,
+      paceRatio: 0.45,
+    });
+    const cursors = new Map<string, number>();
+    const leaseSummary = () =>
+      acquirePoolModel({
+        stage: "summary",
+        pool: ["qwen/qwen3.8-27b", "allam-2-7b"],
+        fallbackPool: ["openai/gpt-oss-20b"],
+        estInputTokens: 1_400,
+        maxOutputTokens: 500,
+        budget,
+        cooldownDb: () => fake as unknown as GroqCooldownDb,
+        cursors,
+        now: () => now,
+        sleep: async (ms) => {
+          sleeps.push(ms);
+          now += ms;
+        },
+        random: () => 0,
+      });
+
+    // Round 1: Batch 1 hits Qwen (0ms wait), Batch 2 hits ALLaM (0ms wait):
+    const b1 = await leaseSummary();
+    const b2 = await leaseSummary();
+    expect([b1.modelId, b2.modelId]).toEqual(["qwen/qwen3.8-27b", "allam-2-7b"]);
+    expect(sleeps).toEqual([]);
+
+    // Immediate Batch 3 (High effort): both summarizer models have pace timers <= 25s,
+    // so it waits smoothly (~9.7s) on SUMMARIZER_POOL instead of raiding REASONING_POOL!
+    const b3 = await leaseSummary();
+    expect(["qwen/qwen3.8-27b", "allam-2-7b"]).toContain(b3.modelId);
+    expect(b3.waitedMs).toBeGreaterThan(8_000);
+    expect(b3.waitedMs).toBeLessThan(20_000);
   });
 });
 

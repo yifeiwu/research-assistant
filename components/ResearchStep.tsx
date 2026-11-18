@@ -161,8 +161,9 @@ export function ResearchStep({ data }: { data: ResearchStepData }) {
           <div className="flex items-start gap-1.5 border-t border-border px-3 py-2 text-xs text-amber-300">
             <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
             <span>
-              Some sources couldn&apos;t be retrieved — the answer may be
-              incomplete. ({data.degraded.join("; ")})
+              {data.degraded.some((d) => /query failed|queries failed|could not be fetched/i.test(d))
+                ? `Some sources couldn't be retrieved (${data.degraded.join("; ")}).`
+                : `Partial research (${data.degraded.join("; ")}).`}
             </span>
           </div>
         )}

@@ -11,7 +11,6 @@ import {
   saveConversations,
 } from "@/lib/conversations";
 import type { EffortLevel } from "@/lib/effort";
-import { findLastUserMessageId } from "@/lib/messages";
 import { fetchWithRetryAfter } from "@/lib/retry-fetch";
 import type {
   ChatMessage,
@@ -50,30 +49,30 @@ export type UseConversations = {
   stopGeneration: () => void;
 };
 
-function stopServerTurn(chatId: string, turnId?: string): void {
+function createRunId(): string {
+  return `r_${createConversationId()}`;
+}
+
+function stopServerTurn(chatId: string, runId?: string): void {
   void fetch(`/api/chat/${chatId}/stop`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(turnId ? { turnId } : {}),
+    body: JSON.stringify(runId ? { runId } : {}),
     keepalive: true,
   }).catch(() => {});
 }
 
 /**
  * Pure turn-state reconciliation helper (exported for unit tests): ensures a
- * stale Redis snapshot from an earlier turn (`state.turnId !== conv.pendingTurnId`
- * or `state.runId !== conv.pendingRunId`) can never overwrite or settle a
+ * stale Redis snapshot from an earlier `runId` can never overwrite or settle a
  * follow-up or edited prompt.
  */
 export function matchesPendingTurn(
-  conv: Pick<Conversation, "pending" | "pendingTurnId" | "pendingRunId"> | undefined,
-  state: Pick<DurableTurnState, "runId" | "turnId">,
+  conv: Pick<Conversation, "pending" | "pendingRunId"> | undefined,
+  state: Pick<DurableTurnState, "runId">,
 ): boolean {
   if (!conv?.pending) return false;
   if (conv.pendingRunId && state.runId !== conv.pendingRunId) return false;
-  if (conv.pendingTurnId && state.turnId && state.turnId !== conv.pendingTurnId) {
-    return false;
-  }
   return true;
 }
 
@@ -134,9 +133,6 @@ export function useConversations(opts?: {
     onFinishedRef.current = opts?.onTurnFinished;
   }, [opts?.onTurnFinished]);
 
-  // Maps `chatId -> turnId` while `POST /api/chat` is still in flight so early
-  // polls never read the *previous* turn's finished snapshot from Redis.
-  const startingTurnsRef = useRef<Map<string, string>>(new Map());
   const inFlightPollsRef = useRef<Map<string, AbortController>>(new Map());
   const postControllersRef = useRef<Map<string, AbortController>>(new Map());
 
@@ -191,7 +187,6 @@ export function useConversations(opts?: {
   const clearPendingMeta = (c: Conversation): Conversation => ({
     ...c,
     pending: false,
-    pendingTurnId: undefined,
     pendingRunId: undefined,
     pendingSince: undefined,
   });
@@ -201,18 +196,13 @@ export function useConversations(opts?: {
       const current = conversationsRef.current.find((c) => c.id === chatId);
       if (!current?.pending) return;
 
-      // Guard against stale snapshots from an earlier turn on the same chat.
       if (state && !matchesPendingTurn(current, state)) {
-        if (startingTurnsRef.current.has(chatId)) {
-          return;
-        }
-        // Page reloaded before POST /api/chat ever reached Redis: only the old
-        // turn exists in Redis, so mark the unsubmitted turn as expired/unanswered.
+        if (postControllersRef.current.has(chatId)) return;
         state = null;
       }
 
       if (!state) {
-        if (startingTurnsRef.current.has(chatId)) return;
+        if (postControllersRef.current.has(chatId)) return;
         setLiveByChat((prev) => {
           if (!(chatId in prev)) return prev;
           const next = { ...prev };
@@ -325,14 +315,18 @@ export function useConversations(opts?: {
 
   const pollChat = useCallback(
     (chatId: string) => {
-      // Never poll GET /api/chat/:id while POST /api/chat is still registering
-      // the new turn in Redis (otherwise GET sees the previous turn's runId).
-      if (startingTurnsRef.current.has(chatId)) return;
+      const current = conversationsRef.current.find((c) => c.id === chatId);
+      if (!current?.pending) return;
+      if (postControllersRef.current.has(chatId)) return;
       if (inFlightPollsRef.current.has(chatId)) return;
+
       const ctrl = new AbortController();
       inFlightPollsRef.current.set(chatId, ctrl);
+      const query = current.pendingRunId
+        ? `?runId=${encodeURIComponent(current.pendingRunId)}`
+        : "";
 
-      void fetch(`/api/chat/${chatId}`, {
+      void fetch(`/api/chat/${chatId}${query}`, {
         method: "GET",
         signal: ctrl.signal,
       })
@@ -411,13 +405,11 @@ export function useConversations(opts?: {
   const dispatchPrompt = useCallback(
     (chatId: string, promptMessages: ChatMessage[], effort: EffortLevel) => {
       const now = Date.now();
-      const turnId = findLastUserMessageId(promptMessages) ?? createConversationId();
+      const runId = createRunId();
 
-      // Cancel any in-flight POST or GET poll for this chat before starting the new turn.
       postControllersRef.current.get(chatId)?.abort();
       inFlightPollsRef.current.get(chatId)?.abort();
       inFlightPollsRef.current.delete(chatId);
-      startingTurnsRef.current.set(chatId, turnId);
 
       setErrorsByChat((prev) => {
         if (!(chatId in prev)) return prev;
@@ -437,8 +429,7 @@ export function useConversations(opts?: {
           title: deriveTitle(promptMessages),
           messages: promptMessages,
           pending: true,
-          pendingTurnId: turnId,
-          pendingRunId: undefined,
+          pendingRunId: runId,
           pendingSince: now,
           unansweredReason: undefined,
           createdAt: existing?.createdAt ?? now,
@@ -455,18 +446,14 @@ export function useConversations(opts?: {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           id: chatId,
+          runId,
           messages: toWireMessages(promptMessages),
           effort,
         }),
         signal: postCtrl.signal,
       })
         .then(async (res) => {
-          if (postCtrl.signal.aborted) {
-            if (startingTurnsRef.current.get(chatId) === turnId) {
-              startingTurnsRef.current.delete(chatId);
-            }
-            return;
-          }
+          if (postCtrl.signal.aborted) return;
           if (!res.ok) {
             const payload = (await res.json().catch(() => null)) as {
               error?: string;
@@ -476,17 +463,17 @@ export function useConversations(opts?: {
             );
           }
           const initial = (await res.json()) as DurableTurnState;
-          if (startingTurnsRef.current.get(chatId) === turnId) {
-            startingTurnsRef.current.delete(chatId);
-          }
           if (postCtrl.signal.aborted) return;
+          if (postControllersRef.current.get(chatId) === postCtrl) {
+            postControllersRef.current.delete(chatId);
+          }
           applyTurnState(chatId, initial);
         })
         .catch((err) => {
-          if (startingTurnsRef.current.get(chatId) === turnId) {
-            startingTurnsRef.current.delete(chatId);
-          }
           if (postCtrl.signal.aborted) return;
+          if (postControllersRef.current.get(chatId) === postCtrl) {
+            postControllersRef.current.delete(chatId);
+          }
           setLiveByChat((prev) => {
             const next = { ...prev };
             delete next[chatId];
@@ -498,7 +485,7 @@ export function useConversations(opts?: {
           }));
           persistConversations((prev) =>
             prev.map((c) =>
-              c.id === chatId && c.pendingTurnId === turnId
+              c.id === chatId && c.pendingRunId === runId
                 ? { ...clearPendingMeta(c), updatedAt: Date.now() }
                 : c,
             ),
@@ -540,7 +527,7 @@ export function useConversations(opts?: {
       if (idx === -1) return;
 
       if (current.pending) {
-        stopServerTurn(id, current.pendingTurnId ?? findLastUserMessageId(current.messages));
+        stopServerTurn(id, current.pendingRunId);
       }
 
       const userMsg: ChatMessage = {
@@ -563,7 +550,7 @@ export function useConversations(opts?: {
       for (let i = idx - 1; i >= 0; i--) {
         if (current.messages[i].role === "user") {
           if (current.pending) {
-            stopServerTurn(id, current.pendingTurnId ?? findLastUserMessageId(current.messages));
+            stopServerTurn(id, current.pendingRunId);
           }
           const freshUserMsg: ChatMessage = {
             ...current.messages[i],
@@ -599,15 +586,12 @@ export function useConversations(opts?: {
   const stopGeneration = useCallback(() => {
     const id = activeIdRef.current;
     const current = conversationsRef.current.find((c) => c.id === id);
-    startingTurnsRef.current.delete(id);
     postControllersRef.current.get(id)?.abort();
+    postControllersRef.current.delete(id);
     inFlightPollsRef.current.get(id)?.abort();
     inFlightPollsRef.current.delete(id);
 
-    stopServerTurn(
-      id,
-      current?.pendingTurnId ?? findLastUserMessageId(current?.messages ?? []),
-    );
+    stopServerTurn(id, current?.pendingRunId);
 
     setLiveByChat((prev) => {
       if (!(id in prev)) return prev;
@@ -645,16 +629,13 @@ export function useConversations(opts?: {
   const deleteConversation = useCallback(
     (id: string) => {
       const target = conversationsRef.current.find((c) => c.id === id);
-      startingTurnsRef.current.delete(id);
       postControllersRef.current.get(id)?.abort();
+      postControllersRef.current.delete(id);
       inFlightPollsRef.current.get(id)?.abort();
       inFlightPollsRef.current.delete(id);
 
       if (target?.pending) {
-        stopServerTurn(
-          id,
-          target.pendingTurnId ?? findLastUserMessageId(target.messages),
-        );
+        stopServerTurn(id, target.pendingRunId);
       }
 
       setLiveByChat((prev) => {
